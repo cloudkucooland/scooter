@@ -8,10 +8,10 @@ import (
 const MaxBufferSize = 4096
 
 type RkToolParser struct {
-	buffer       string
-	inToolCall   bool
-	currentTool  string
-	params       map[string]string
+	buffer      string
+	inToolCall  bool
+	currentTool string
+	params      map[string]string
 }
 
 func NewRkToolParser() *RkToolParser {
@@ -20,7 +20,6 @@ func NewRkToolParser() *RkToolParser {
 	}
 }
 
-// Reset clears the parser state
 func (p *RkToolParser) Reset() {
 	p.buffer = ""
 	p.inToolCall = false
@@ -28,41 +27,41 @@ func (p *RkToolParser) Reset() {
 	p.params = make(map[string]string)
 }
 
-// ProcessChunk scans incoming raw text streams for custom RKLLM tags.
-// Returns (textToDisplay, toolIsReady, structuredPayload)
 func (p *RkToolParser) ProcessChunk(text string) (string, bool, ToolCall) {
 	if len(p.buffer)+len(text) > MaxBufferSize {
-		logDebug("Parser buffer exceeded limit (%d), resetting.", MaxBufferSize)
+		logDebug("Parser buffer limit reached (%d), resetting.", MaxBufferSize)
 		p.Reset()
 	}
-	
-	p.buffer += text
-	logDebug("ProcessChunk received: %d bytes, buffer size: %d", len(text), len(p.buffer))
-	
-	visibleText := text
 
-	// 1. Detect tool call initiation block
+	p.buffer += text
+	visibleText := ""
+
+	// 1. Detect start of tool call tag sequence
 	if !p.inToolCall {
 		if idx := strings.Index(p.buffer, "<tool_call>"); idx != -1 {
 			p.inToolCall = true
 			p.params = make(map[string]string)
 			p.currentTool = ""
-			
-			if idxText := strings.Index(text, "<tool_call>"); idxText != -1 {
-				visibleText = text[:idxText]
+
+			// Render visible text that appeared prior to <tool_call>
+			visibleText = p.buffer[:idx]
+			p.buffer = p.buffer[idx:]
+		} else {
+			// Hold back trailing '<' to avoid leaking partial opening tags to the UI
+			if lastLt := strings.LastIndex(p.buffer, "<"); lastLt != -1 && len(p.buffer)-lastLt < 11 {
+				visibleText = p.buffer[:lastLt]
+				p.buffer = p.buffer[lastLt:]
 			} else {
-				visibleText = ""
+				visibleText = p.buffer
+				p.buffer = ""
 			}
+			return visibleText, false, ToolCall{}
 		}
-	} else {
-		visibleText = ""
 	}
 
-	// 2. Isolate processing state while tokens unroll over the channel
+	// 2. Process tool call parameters while inside <tool_call> block
 	if p.inToolCall {
-		// ... existing logic ...
-		
-		// 3. Extract Function Name if not already locked in
+		// Extract function name
 		if p.currentTool == "" {
 			if start := strings.Index(p.buffer, "<function="); start != -1 {
 				if end := strings.Index(p.buffer[start:], ">"); end != -1 {
@@ -72,7 +71,7 @@ func (p *RkToolParser) ProcessChunk(text string) (string, bool, ToolCall) {
 			}
 		}
 
-		// 4. Iteratively scan and extract complete parameter value payloads
+		// Iteratively scan and extract complete parameter value payloads
 		for {
 			pStart := strings.Index(p.buffer, "<parameter=")
 			if pStart == -1 {
@@ -82,30 +81,30 @@ func (p *RkToolParser) ProcessChunk(text string) (string, bool, ToolCall) {
 			if pEnd == -1 {
 				break
 			}
-			paramName := p.buffer[pStart+11 : pStart+pEnd]
 
+			paramName := p.buffer[pStart+11 : pStart+pEnd]
 			closeTag := "</parameter>"
-			valEnd := strings.Index(p.buffer, closeTag)
+			valEnd := strings.Index(p.buffer[pStart+pEnd:], closeTag)
 			if valEnd == -1 {
-				break // Content block is still arriving over the socket loop
+				break // Incomplete chunk, await next stream token
 			}
 
 			valStart := pStart + pEnd + 1
-			paramValue := strings.TrimSpace(p.buffer[valStart:valEnd])
+			absoluteValEnd := pStart + pEnd + valEnd
+			paramValue := strings.TrimSpace(p.buffer[valStart:absoluteValEnd])
 			p.params[paramName] = paramValue
 			logDebug("Parameter extracted: %s = %s", paramName, paramValue)
 
-			// Discard the processed parameter segment from our scratchpad buffer
-			p.buffer = p.buffer[valEnd+len(closeTag):]
+			// Safely remove parsed parameter from scratchpad
+			p.buffer = p.buffer[:pStart] + p.buffer[absoluteValEnd+len(closeTag):]
 		}
 
-		// 5. Detect definitive closure sequence
-		if strings.Contains(p.buffer, "</tool_call>") {
+		// 3. Detect tool call termination block
+		if closeIdx := strings.Index(p.buffer, "</tool_call>"); closeIdx != -1 {
 			logDebug("Tool call closure detected")
 			p.inToolCall = false
 
-			// Compile the parsed parameter string map directly into structural raw JSON bytes
-			jsonMap := make(map[string]interface{})
+			jsonMap := make(map[string]interface{}, len(p.params))
 			for k, v := range p.params {
 				jsonMap[k] = v
 			}
@@ -116,8 +115,8 @@ func (p *RkToolParser) ProcessChunk(text string) (string, bool, ToolCall) {
 			tc.Function.Arguments = json.RawMessage(rawArgs)
 			logDebug("Tool call parsed: %s, Args: %s", tc.Function.Name, string(rawArgs))
 
-			// Completely flush out the structure manager
-			p.buffer = strings.Split(p.buffer, "</tool_call>")[1] // Keep remainder
+			// Clean remaining buffer past the closing tag
+			p.buffer = p.buffer[closeIdx+len("</tool_call>"):]
 			p.currentTool = ""
 
 			return visibleText, true, tc

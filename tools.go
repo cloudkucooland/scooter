@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"os"
+	"path/filepath"
 	"strings"
 	"time"
 
@@ -44,8 +45,8 @@ func getSystemTools() []Tool {
 				Parameters: Parameters{
 					Type: "object",
 					Properties: map[string]Property{
-						"file_path":    {Type: "string", Description: "Absolute output file path location."},
-						"content": {Type: "string", Description: "Raw text or code contents for the file."},
+						"file_path": {Type: "string", Description: "Absolute output file path location."},
+						"content":   {Type: "string", Description: "Raw text or code contents for the file."},
 					},
 					Required: []string{"file_path", "content"},
 				},
@@ -73,15 +74,58 @@ func getSystemTools() []Tool {
 				},
 			},
 		},
+		{
+			Type: "function",
+			Function: FunctionDefinition{
+				Name:        "set_brightness",
+				Description: "Sets the brightness of a dimmable smart light or switch (1-100).",
+				Parameters: Parameters{
+					Type: "object",
+					Properties: map[string]Property{
+						"ip":         {Type: "string", Description: "IP address of the device."},
+						"brightness": {Type: "string", Description: "Brightness level from 1 to 100."},
+					},
+					Required: []string{"ip", "brightness"},
+				},
+			},
+		},
+		{
+			Type: "function",
+			Function: FunctionDefinition{
+				Name:        "get_sysinfo",
+				Description: "Retrieves detailed system parameters and status from a specific device.",
+				Parameters: Parameters{
+					Type: "object",
+					Properties: map[string]Property{
+						"ip": {Type: "string", Description: "IP address of the device."},
+					},
+					Required: []string{"ip"},
+				},
+			},
+		},
 	}
 }
 
 type WriteFileArgs struct {
-	FilePath    string `json:"file_path"`
-	Content string `json:"content"`
+	FilePath string `json:"file_path"`
+	Content  string `json:"content"`
 }
 
 type SetDeviceStateArgs struct {
+	IP    string `json:"ip"`
+	State string `json:"state"`
+}
+
+type SetBrightnessArgs struct {
+	IP         string `json:"ip"`
+	Brightness string `json:"brightness"`
+}
+
+type DeviceIPOnlyArgs struct {
+	IP string `json:"ip"`
+}
+
+type SetLEDStateArgs struct {
 	IP    string `json:"ip"`
 	State string `json:"state"`
 }
@@ -94,60 +138,123 @@ func dispatchToolCall(name string, rawArgs json.RawMessage) string {
 		if err := json.Unmarshal(rawArgs, &args); err != nil {
 			return fmt.Sprintf("System Error parsing arguments: %v", err)
 		}
+
+		// Ensure target directory tree exists prior to writing
+		dir := filepath.Dir(args.FilePath)
+		if err := os.MkdirAll(dir, 0755); err != nil {
+			return fmt.Sprintf("System Error creating directory %s: %v", dir, err)
+		}
+
 		if err := os.WriteFile(args.FilePath, []byte(args.Content), 0644); err != nil {
 			return fmt.Sprintf("System Error writing path: %v", err)
 		}
 		res := fmt.Sprintf("Success: Intercepted text stream and wrote file directly to %s", args.FilePath)
 		logDebug("dispatchToolCall success: %s", res)
 		return res
+
 	case "get_devices":
 		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 		defer cancel()
-		d, err := kasa.BroadcastDiscovery(ctx, 2) 
+
+		d, err := kasa.BroadcastDiscovery(ctx, 2)
 		if err != nil {
 			return fmt.Sprintf("System Error doing kasa discovery: %v", err)
 		}
+
 		var sb strings.Builder
 		fmt.Fprintf(&sb, "Device\tIP/ID:\tState\tBrightness\n")
 
 		for k, v := range d {
 			if len(v.Children) == 0 {
 				fmt.Fprintf(&sb, "%s\t%s\t%d\t\t%3d\n", v.Alias, k, v.RelayState, v.Brightness)
-			} else {
-				/* fmt.Fprintf(&sb, "%s\t%s\t\t\n", v.Alias, k)
-				for _, c := range v.Children {
-					fmt.Fprintf(&sb, "%s/%s\t%s%s\t\t%d\t\n", v.Alias, c.Alias, v.DeviceID, c.ID, c.RelayState)
-				} */
-				continue	
 			}
+			// restore child logic, but exceeds the context size
 		}
+
+		if sb.Len() == 0 {
+			return "No Kasa smart home devices discovered on the local network."
+		}
+
 		return sb.String()
+
 	case "set_device_state":
 		var args SetDeviceStateArgs
 		if err := json.Unmarshal(rawArgs, &args); err != nil {
 			return fmt.Sprintf("System Error parsing arguments: %v", err)
 		}
-		
-		state := 0
-		if strings.ToLower(args.State) == "on" {
-			state = 1
-		} else if strings.ToLower(args.State) == "off" {
-			state = 0
+
+		targetState := strings.ToLower(strings.TrimSpace(args.State))
+		var turnOn bool
+		if targetState == "on" || targetState == "1" || targetState == "true" {
+			turnOn = true
+		} else if targetState == "off" || targetState == "0" || targetState == "false" {
+			turnOn = false
 		} else {
-			return "System Error: Invalid state, use 'on' or 'off'."
+			return fmt.Sprintf("System Error: Invalid state '%s', use 'on' or 'off'.", args.State)
 		}
-		
+
 		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 		defer cancel()
-	
-		k, _ := kasa.NewDevice(args.IP)	
-		if err := k.SetRelayStateCtx(ctx, state == 1); err != nil {
+
+		dev, err := kasa.NewDevice(args.IP)
+		if err != nil || dev == nil {
+			return fmt.Sprintf("System Error creating Kasa device instance for IP %s: %v", args.IP, err)
+		}
+
+		if err := dev.SetRelayStateCtx(ctx, turnOn); err != nil {
 			return fmt.Sprintf("System Error setting device state: %v", err)
 		}
-		
-		return fmt.Sprintf("Success: Set device %s to %s.", args.IP, args.State)
+
+		return fmt.Sprintf("Success: Set device %s to %s.", args.IP, targetState)
+
+	case "set_brightness":
+		var args SetBrightnessArgs
+		if err := json.Unmarshal(rawArgs, &args); err != nil {
+			return fmt.Sprintf("System Error parsing arguments: %v", err)
+		}
+
+		var brightness int
+		if _, err := fmt.Sscanf(args.Brightness, "%d", &brightness); err != nil || brightness < 1 || brightness > 100 {
+			return fmt.Sprintf("System Error: Brightness must be a number between 1 and 100, got '%s'", args.Brightness)
+		}
+
+		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+		defer cancel()
+
+		dev, err := kasa.NewDevice(args.IP)
+		if err != nil || dev == nil {
+			return fmt.Sprintf("System Error creating Kasa instance for IP %s: %v", args.IP, err)
+		}
+
+		if err := dev.SetBrightnessCtx(ctx, brightness); err != nil {
+			return fmt.Sprintf("System Error setting brightness: %v", err)
+		}
+
+		return fmt.Sprintf("Success: Set brightness for %s to %d%%.", args.IP, brightness)
+
+	case "get_sysinfo":
+		var args DeviceIPOnlyArgs
+		if err := json.Unmarshal(rawArgs, &args); err != nil {
+			return fmt.Sprintf("System Error parsing arguments: %v", err)
+		}
+
+		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+		defer cancel()
+
+		dev, err := kasa.NewDevice(args.IP)
+		if err != nil || dev == nil {
+			return fmt.Sprintf("System Error creating Kasa instance for IP %s: %v", args.IP, err)
+		}
+
+		sysInfo, err := dev.GetSettingsCtx(ctx)
+		if err != nil {
+			return fmt.Sprintf("System Error fetching sysinfo: %v", err)
+		}
+
+		infoJSON, _ := json.MarshalIndent(sysInfo, "", "  ")
+		return string(infoJSON)
 	}
+
 	logDebug("dispatchToolCall failed for: %s", name)
 	return fmt.Sprintf("System Error: Tool %s not implemented.", name)
 }
-

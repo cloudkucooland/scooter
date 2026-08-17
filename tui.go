@@ -14,11 +14,10 @@ import (
 
 const (
 	DefaultModelName = "qwen3.5-4b"
-	PlaceholderText  = "Send a message..."
+	PlaceholderText  = "Send a message... (Shift+Enter for newline)"
 	MaxHistorySize   = 30
 )
 
-// Styling
 var (
 	titleStyle = lipgloss.NewStyle().
 			Foreground(lipgloss.Color("205")).
@@ -36,7 +35,7 @@ type model struct {
 	isStreaming   bool
 	currentBuffer *strings.Builder
 	streamChan    chan StreamMessage
-	pendingTools   []ToolCall 
+	pendingTools  []ToolCall
 }
 
 func initialModel() model {
@@ -46,7 +45,6 @@ func initialModel() model {
 	ta.SetHeight(3)
 
 	vp := viewport.New(80, 0)
-	vp.Style = vp.Style.Width(80)
 
 	chatHist := loadHistoryObjects()
 
@@ -70,7 +68,9 @@ func initialModel() model {
 }
 
 func (m model) View() string {
-	statusBar := statusBarStyle.Render(fmt.Sprintf(" Model: %s | /model <name> | /quit | /compress | /clear | /file <path>", m.modelName))
+	statusBar := statusBarStyle.Render(
+		fmt.Sprintf(" Model: %s | /model <name> | /compress | /clear | /file <path> | /quit", m.modelName),
+	)
 	return fmt.Sprintf(
 		"%s\n%s\n%s\n%s",
 		titleStyle.Render("AI Agent TUI"),
@@ -80,27 +80,35 @@ func (m model) View() string {
 	)
 }
 
-func (m *model) renderDisplayLines() []string {
-	var lines []string
+func (m *model) buildDisplayString() string {
+	var sb strings.Builder
 	for _, msg := range m.chatHistory {
 		switch msg.Role {
 		case "user":
-			lines = append(lines, "User: "+msg.Content)
+			sb.WriteString("User: " + msg.Content + "\n")
 		case "assistant":
-			lines = append(lines, "AI: "+msg.Content)
+			sb.WriteString("AI: " + msg.Content + "\n")
 		case "system":
-			lines = append(lines, "System: "+msg.Content)
+			sb.WriteString("System: " + msg.Content + "\n")
 		case "tool":
-			lines = append(lines, "Tool: "+msg.Content)
+			sb.WriteString("Tool: " + msg.Content + "\n")
 		}
 	}
-	return lines
+	if m.currentBuffer.Len() > 0 {
+		sb.WriteString("AI: " + m.currentBuffer.String())
+	}
+	return sb.String()
 }
 
 func (m *model) refreshViewport() {
-	lines := m.renderDisplayLines()
-	content := strings.Join(lines, "\n")
-	m.viewport.SetContent(content)
+	if m.viewport.Width > 0 {
+		wrapped := lipgloss.NewStyle().
+			Width(m.viewport.Width).
+			Render(m.buildDisplayString())
+		m.viewport.SetContent(wrapped)
+	} else {
+		m.viewport.SetContent(m.buildDisplayString())
+	}
 	m.viewport.GotoBottom()
 }
 
@@ -114,22 +122,47 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		vpCmd tea.Cmd
 	)
 
-	m.textarea, tiCmd = m.textarea.Update(msg)
-	m.viewport, vpCmd = m.viewport.Update(msg)
-
 	switch msg := msg.(type) {
 	case tea.WindowSizeMsg:
-		// Viewport takes remaining space: total height - title (1) - status bar (1) - textarea (3)
 		headerHeight := 1
 		statusBarHeight := 1
 		textAreaHeight := 3
+
 		m.viewport.Width = msg.Width
 		m.viewport.Height = msg.Height - headerHeight - statusBarHeight - textAreaHeight
-		m.textarea.SetWidth(msg.Width)
 		m.viewport.Style = m.viewport.Style.Width(msg.Width)
-		m.textarea.SetWidth(msg.Width)
 
-		case StreamMessage:
+		m.textarea.SetWidth(msg.Width)
+		m.refreshViewport()
+		return m, nil
+
+	case tea.KeyMsg:
+		switch msg.Type {
+		case tea.KeyCtrlC:
+			return m, tea.Quit
+		case tea.KeyEnter:
+			// Prevent submission while model is outputting
+			if m.isStreaming {
+				return m, nil
+			}
+
+			// Allow Shift+Enter for multiline inputs
+			if msg.Alt {
+				m.textarea, tiCmd = m.textarea.Update(msg)
+				return m, tiCmd
+			}
+
+			input := strings.TrimSpace(m.textarea.Value())
+			if input == "" {
+				m.textarea.Reset()
+				return m, nil
+			}
+
+			m.textarea.Reset()
+			return m, m.handleCommand(input)
+		}
+
+	case StreamMessage:
 		if msg.Err != nil {
 			m.chatHistory = append(m.chatHistory, Message{Role: "system", Content: "Error: " + msg.Err.Error()})
 			m.refreshViewport()
@@ -138,34 +171,29 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		}
 
 		if msg.Done {
-			// Save the final text assistant response if any text accompanied the payload
-			aiResponse := Message{Role: "assistant", Content: m.currentBuffer.String()}
-			m.chatHistory = append(m.chatHistory, aiResponse)
-			saveMessageObject(aiResponse)
-			m.currentBuffer.Reset()
+			if m.currentBuffer.Len() > 0 {
+				aiResponse := Message{Role: "assistant", Content: m.currentBuffer.String()}
+				m.chatHistory = append(m.chatHistory, aiResponse)
+				saveMessageObject(aiResponse)
+				m.currentBuffer.Reset()
+			}
 			m.isStreaming = false
 
-			logDebug("Checking pending tools: %d", len(m.pendingTools))
-
-			// CORE AGENT LOOP ROUTER: Check if rkllama requested any tool executions
+			// Execute tool calls sequentially
 			if len(m.pendingTools) > 0 {
 				toolsToRun := m.pendingTools
-				m.pendingTools = nil // Flush the buffer state immediately
+				m.pendingTools = nil
 
-				// Process the stacked tool execution calls sequentially in Go
 				for _, call := range toolsToRun {
-					logDebug("Executing tool: %s", call.Function.Name)
 					toolOutcomeText := dispatchToolCall(call.Function.Name, call.Function.Arguments)
-					
-					// Append the outcome log message using the proper 'tool' context role tag
 					toolMsg := Message{Role: "tool", Content: toolOutcomeText}
 					m.chatHistory = append(m.chatHistory, toolMsg)
 					saveMessageObject(toolMsg)
 				}
-				
+
 				m.refreshViewport()
 
-				// Auto-trigger a clean recursive loop back to rkllama with the new tool output
+				// Loop tool result back to LLM context
 				m.isStreaming = true
 				m.streamChan = make(chan StreamMessage, 10)
 				go streamOllama(context.Background(), m.modelName, m.chatHistory, m.streamChan)
@@ -174,28 +202,19 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 
 			m.refreshViewport()
 
-			if len(m.chatHistory) >= 30 {
+			if len(m.chatHistory) >= MaxHistorySize {
 				return m, summarizeCmd(m.modelName, m.chatHistory)
 			}
 			return m, nil
 		}
 
-		// Keep aggregating regular markdown chat body output
+		// Stream content accumulation
 		m.currentBuffer.WriteString(msg.Content)
-		
-		// Add new tool calls to pending queue
-		for _, tc := range msg.ToolCalls {
-			logDebug("Tool call received in stream: %s", tc.Function.Name)
-			m.pendingTools = append(m.pendingTools, tc)
+		if len(msg.ToolCalls) > 0 {
+			m.pendingTools = append(m.pendingTools, msg.ToolCalls...)
 		}
 
-		// Render streaming terminal preview live
-		displayLines := m.renderDisplayLines()
-		if m.currentBuffer.Len() > 0 {
-			displayLines = append(displayLines, "AI: "+m.currentBuffer.String())
-		}
-		m.viewport.SetContent(strings.Join(displayLines, "\n"))
-		m.viewport.GotoBottom()
+		m.refreshViewport()
 		return m, waitForStream(m.streamChan)
 
 	case SummaryMessage:
@@ -227,38 +246,10 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		}
 		m.refreshViewport()
 		return m, nil
-
-	case ToolCall:
-			logDebug("Tool call received: %s", msg.Function.Name)
-			m.pendingTools = append(m.pendingTools, msg)
-			switch msg.Function.Name {
-			case "write_file":
-				m.chatHistory = append(m.chatHistory, Message{Role: "tool_call", Content: "write_file"})
-				// do something
-			case "set_smart_device":
-				m.chatHistory = append(m.chatHistory, Message{Role: "tool_call", Content: "set_smart_device"})
-				// do something
-			default:
-				m.chatHistory = append(m.chatHistory, Message{Role: "tool_call", Content: msg.Function.Name})
-			}
-
-	case tea.KeyMsg:
-		switch msg.Type {
-		case tea.KeyCtrlC:
-			return m, tea.Quit
-		case tea.KeyEnter:
-			if m.isStreaming {
-				return m, nil
-			}
-
-			input := strings.TrimSpace(m.textarea.Value())
-			if input == "" {
-				return m, nil
-			}
-			return m, m.handleCommand(input)
-		}
 	}
 
+	m.textarea, tiCmd = m.textarea.Update(msg)
+	m.viewport, vpCmd = m.viewport.Update(msg)
 	return m, tea.Batch(tiCmd, vpCmd)
 }
 
@@ -268,18 +259,15 @@ func (m *model) handleCommand(input string) tea.Cmd {
 	}
 
 	if strings.HasPrefix(input, "/models") {
-		m.textarea.Reset()
 		return listModelsCmd()
 	}
 
 	if strings.HasPrefix(input, "/status") {
-		m.textarea.Reset()
 		return statusCmd()
 	}
 
 	if strings.HasPrefix(input, "/model ") {
 		m.modelName = strings.TrimSpace(strings.TrimPrefix(input, "/model "))
-		m.textarea.Reset()
 		return nil
 	}
 
@@ -287,14 +275,12 @@ func (m *model) handleCommand(input string) tea.Cmd {
 		m.chatHistory = nil
 		clearCache()
 
-		// Re-hydrate if system context file is present
 		if hydration := loadHydrationContext(); hydration != nil {
 			m.chatHistory = append(m.chatHistory, *hydration)
 			saveMessageObject(*hydration)
 		}
 
 		m.refreshViewport()
-		m.textarea.Reset()
 		return nil
 	}
 
@@ -309,22 +295,19 @@ func (m *model) handleCommand(input string) tea.Cmd {
 			saveMessageObject(fileMsg)
 		}
 		m.refreshViewport()
-		m.textarea.Reset()
 		return nil
 	}
 
 	if strings.HasPrefix(input, "/compress") {
-		m.textarea.Reset()
 		return summarizeCmd(m.modelName, m.chatHistory)
 	}
 
-	// Process normal prompt
+	// Submit user input message
 	userMsg := Message{Role: "user", Content: input}
 	m.chatHistory = append(m.chatHistory, userMsg)
 	saveMessageObject(userMsg)
 
 	m.refreshViewport()
-	m.textarea.Reset()
 
 	m.isStreaming = true
 	m.currentBuffer.Reset()
