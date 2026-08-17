@@ -9,45 +9,37 @@ import (
 	"net/http"
 	"os"
 	"strings"
-	"time"
 
-	"github.com/charmbracelet/bubbles/textarea"
-	"github.com/charmbracelet/bubbles/viewport"
 	tea "github.com/charmbracelet/bubbletea"
-	"github.com/charmbracelet/lipgloss"
-)
-
-// Styling
-var (
-	titleStyle = lipgloss.NewStyle().
-			Foreground(lipgloss.Color("205")).
-			Bold(true)
-	statusBarStyle = lipgloss.NewStyle().
-			Foreground(lipgloss.AdaptiveColor{Light: "#343433", Dark: "#C7C6C5"}).
-			Background(lipgloss.AdaptiveColor{Light: "#D9DCCF", Dark: "#353533"})
 )
 
 // Message matches the Ollama JSON wire protocol and is used for session persistence
 type Message struct {
-	Role    string `json:"role"` // "system", "user", "assistant"
+	Role    string `json:"role"` // "system", "user", "assistant", "tool"
 	Content string `json:"content"`
 }
 
 type ChatRequest struct {
 	Model    string    `json:"model"`
 	Messages []Message `json:"messages"`
+	Tools    []Tool    `json:"tools,omitempty"`
 	Stream   bool      `json:"stream"`
 }
 
 type ChatResponseChunk struct {
-	Message Message `json:"message"`
-	Done    bool    `json:"done"`
+	Message struct {
+		Role      string     `json:"role"`
+		Content   string     `json:"content"`
+		ToolCalls []ToolCall `json:"tool_calls,omitempty"`
+	} `json:"message"`
+	Done bool `json:"done"`
 }
 
 type StreamMessage struct {
-	Content string
-	Done    bool
-	Err     error
+	Content   string
+	ToolCalls []ToolCall // Threaded here to pass out of goroutine safely
+	Done      bool
+	Err       error
 }
 
 type SummaryMessage struct {
@@ -55,21 +47,28 @@ type SummaryMessage struct {
 	Err     error
 }
 
+type ModelsMessage struct {
+	Models []string
+	Err    error
+}
+
+type StatusMessage struct {
+	Status string
+	Err    error
+}
+
+type ToolCall struct {
+	Function struct {
+		Name      string          `json:"name"`
+		Arguments json.RawMessage `json:"arguments"`
+	} `json:"function"`
+}
+
 func getOllamaHost() string {
 	if host := os.Getenv("OLLAMA_HOST"); host != "" {
 		return strings.TrimRight(host, "/")
 	}
 	return "http://localhost:11434"
-}
-
-func waitForStream(ch chan StreamMessage) tea.Cmd {
-	return func() tea.Msg {
-		msg, ok := <-ch
-		if !ok {
-			return StreamMessage{Done: true}
-		}
-		return msg
-	}
 }
 
 // Session Persistence using JSON Lines (.jsonl)
@@ -155,56 +154,55 @@ func loadHydrationContext() *Message {
 	return nil
 }
 
-func summarizeCmd(modelName string, messages []Message) tea.Cmd {
-	return func() tea.Msg {
-		ctx, cancel := context.WithTimeout(context.Background(), 60*time.Minute)
-		defer cancel()
-
-		var sb strings.Builder
-		for _, m := range messages {
-			sb.WriteString(fmt.Sprintf("[%s]: %s\n", m.Role, m.Content))
-		}
-
-		fullURL := getOllamaHost() + "/api/generate"
-		prompt := fmt.Sprintf("Summarize the following conversation concisely:\n%s", sb.String())
-		reqBody := map[string]interface{}{
-			"model":  modelName,
-			"prompt": prompt,
-			"stream": false,
-		}
-
-		jsonData, _ := json.Marshal(reqBody)
-		req, err := http.NewRequestWithContext(ctx, "POST", fullURL, bytes.NewBuffer(jsonData))
-		if err != nil {
-			return SummaryMessage{Err: err}
-		}
-		req.Header.Set("Content-Type", "application/json")
-
-		client := &http.Client{}
-		resp, err := client.Do(req)
-		if err != nil {
-			return SummaryMessage{Err: err}
-		}
-		defer resp.Body.Close()
-
-		var response struct {
-			Response string `json:"response"`
-		}
-		if err := json.NewDecoder(resp.Body).Decode(&response); err != nil {
-			return SummaryMessage{Err: err}
-		}
-		return SummaryMessage{Summary: response.Response}
-	}
-}
-
 func streamOllama(ctx context.Context, modelName string, history []Message, channel chan<- StreamMessage) {
 	defer close(channel)
 
-	fullURL := getOllamaHost() + "/api/chat"
-	reqBody := ChatRequest{
-		Model:    modelName,
-		Messages: history,
-		Stream:   true,
+	fullURL := getOllamaHost() + "/api/generate"
+
+	// Prepare tools definition for the system prompt
+	tools := getSystemTools()
+	var toolDesc strings.Builder
+	toolDesc.WriteString("\n\nYou have access to the following tools:\n")
+	for _, t := range tools {
+		toolDesc.WriteString(fmt.Sprintf("- %s: %s\n", t.Function.Name, t.Function.Description))
+		toolDesc.WriteString("  Parameters:\n")
+		for pName, pDef := range t.Function.Parameters.Properties {
+			toolDesc.WriteString(fmt.Sprintf("    - %s (%s): %s\n", pName, pDef.Type, pDef.Description))
+		}
+	}
+	toolDesc.WriteString("\nIf you need to call a tool, you MUST respond EXACTLY in this format:\n")
+	toolDesc.WriteString("<tool_call><function=TOOL_NAME><parameter=PARAM1>VALUE1</parameter><parameter=PARAM2>VALUE2</parameter></tool_call>\n")
+	toolDesc.WriteString("Example:\n")
+	toolDesc.WriteString("<tool_call><function=write_file><parameter=file_path>/tmp/test.md</parameter><parameter=content>Hello World</parameter></tool_call>\n")
+	toolDesc.WriteString("<tool_call><function=get_devices></tool_call>\n")
+	toolDesc.WriteString("\nIMPORTANT: Only use tools when strictly necessary to achieve a task (e.g., saving data to a file, checking device status, updating device status). For standard conversational responses, answer directly in plain text without using tool call tags. Do not use tools to document the conversation history.\n")
+	toolInfo := toolDesc.String()
+
+	// Construct raw prompt using standard conversational template
+	var sb strings.Builder
+	for i, msg := range history {
+		content := msg.Content
+		if i == 0 && msg.Role == "system" {
+			content += toolInfo
+		}
+		
+		switch msg.Role {
+		case "system":
+			sb.WriteString("System: " + content + "\n")
+		case "user":
+			sb.WriteString("User: " + content + "\n")
+		case "assistant":
+			sb.WriteString("Assistant: " + content + "\n")
+		case "tool":
+			sb.WriteString("Tool Result: " + content + "\n")
+		}
+	}
+	sb.WriteString("Assistant: ") // Prompt LLM to continue
+
+	reqBody := map[string]interface{}{
+		"model":  modelName,
+		"prompt": sb.String(),
+		"stream": true,
 	}
 
 	jsonData, err := json.Marshal(reqBody)
@@ -212,6 +210,7 @@ func streamOllama(ctx context.Context, modelName string, history []Message, chan
 		channel <- StreamMessage{Err: err}
 		return
 	}
+	logDebug("Sending request to Ollama: %s", string(jsonData))
 
 	req, err := http.NewRequestWithContext(ctx, "POST", fullURL, bytes.NewBuffer(jsonData))
 	if err != nil {
@@ -228,225 +227,44 @@ func streamOllama(ctx context.Context, modelName string, history []Message, chan
 	}
 	defer resp.Body.Close()
 
+	// Instantiate our custom rkllm structural parser
+	rkParser := NewRkToolParser()
 	reader := bufio.NewReader(resp.Body)
+	
 	for {
 		line, err := reader.ReadBytes('\n')
 		if err != nil {
+			logDebug("Error reading stream: %v", err)
 			break
 		}
-		var chunk ChatResponseChunk
+		logDebug("Raw line: %s", string(line))
+		
+		var chunk struct {
+			Response string `json:"response"`
+			Done     bool   `json:"done"`
+		}
 		if err := json.Unmarshal(line, &chunk); err == nil {
-			channel <- StreamMessage{Content: chunk.Message.Content, Done: chunk.Done}
+			rawText := chunk.Response
+			logDebug("Chunk text (raw): %s", rawText)
+			
+			// Process incoming chunk text through the tag extractor
+			cleanText, toolReady, parsedCall := rkParser.ProcessChunk(rawText)
+
+			var calls []ToolCall
+			if toolReady {
+				calls = append(calls, parsedCall)
+			}
+			
+			channel <- StreamMessage{
+				Content:   cleanText,
+				ToolCalls: calls, 
+				Done:      chunk.Done,
+			}
 			if chunk.Done {
 				break
 			}
 		}
 	}
-}
-
-type model struct {
-	viewport      viewport.Model
-	textarea      textarea.Model
-	modelName     string
-	chatHistory   []Message
-	isStreaming   bool
-	currentBuffer strings.Builder
-	streamChan    chan StreamMessage
-}
-
-func initialModel() model {
-	ta := textarea.New()
-	ta.Placeholder = "Send a message..."
-	ta.Focus()
-	ta.SetHeight(3)
-
-	vp := viewport.New(0, 0)
-
-	// Restore deterministic JSON session
-	chatHist := loadHistoryObjects()
-
-	// If no prior session, attempt default hydration file load
-	if len(chatHist) == 0 {
-		if hydration := loadHydrationContext(); hydration != nil {
-			chatHist = append(chatHist, *hydration)
-			saveMessageObject(*hydration)
-		}
-	}
-
-	m := model{
-		textarea:    ta,
-		viewport:    vp,
-		modelName:   "qwen3.5-4b",
-		chatHistory: chatHist,
-	}
-
-	m.refreshViewport()
-	return m
-}
-
-func (m *model) renderDisplayLines() []string {
-	var lines []string
-	for _, msg := range m.chatHistory {
-		switch msg.Role {
-		case "user":
-			lines = append(lines, "User: "+msg.Content)
-		case "assistant":
-			lines = append(lines, "AI: "+msg.Content)
-		case "system":
-			lines = append(lines, "System: "+msg.Content)
-		}
-	}
-	return lines
-}
-
-func (m *model) refreshViewport() {
-	lines := m.renderDisplayLines()
-	m.viewport.SetContent(strings.Join(lines, "\n"))
-	m.viewport.GotoBottom()
-}
-
-func (m model) Init() tea.Cmd {
-	return textarea.Blink
-}
-
-func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
-	var (
-		tiCmd tea.Cmd
-		vpCmd tea.Cmd
-	)
-
-	m.textarea, tiCmd = m.textarea.Update(msg)
-	m.viewport, vpCmd = m.viewport.Update(msg)
-
-	switch msg := msg.(type) {
-	case tea.WindowSizeMsg:
-		m.viewport.Width = msg.Width
-		m.viewport.Height = msg.Height - 6
-		m.textarea.SetWidth(msg.Width)
-
-	case StreamMessage:
-		if msg.Err != nil {
-			m.chatHistory = append(m.chatHistory, Message{Role: "system", Content: "Error: " + msg.Err.Error()})
-			m.refreshViewport()
-			m.isStreaming = false
-			return m, nil
-		}
-
-		if msg.Done {
-			aiResponse := Message{Role: "assistant", Content: m.currentBuffer.String()}
-			m.chatHistory = append(m.chatHistory, aiResponse)
-			saveMessageObject(aiResponse)
-			m.currentBuffer.Reset()
-			m.isStreaming = false
-			m.refreshViewport()
-			return m, nil
-		}
-
-		m.currentBuffer.WriteString(msg.Content)
-
-		// Render live buffer dynamically
-		displayLines := m.renderDisplayLines()
-		displayLines = append(displayLines, "AI: "+m.currentBuffer.String())
-		m.viewport.SetContent(strings.Join(displayLines, "\n"))
-		m.viewport.GotoBottom()
-		return m, waitForStream(m.streamChan)
-
-	case SummaryMessage:
-		if msg.Err != nil {
-			m.chatHistory = append(m.chatHistory, Message{Role: "system", Content: "Summary Error: " + msg.Err.Error()})
-		} else {
-			summaryMsg := Message{Role: "assistant", Content: "Summary: " + msg.Summary}
-			m.chatHistory = []Message{summaryMsg}
-			clearCache()
-			saveMessageObject(summaryMsg)
-		}
-		m.refreshViewport()
-		return m, nil
-
-	case tea.KeyMsg:
-		switch msg.Type {
-		case tea.KeyCtrlC:
-			return m, tea.Quit
-		case tea.KeyEnter:
-			if m.isStreaming {
-				return m, nil
-			}
-
-			input := strings.TrimSpace(m.textarea.Value())
-			if input == "" {
-				return m, nil
-			}
-
-			if strings.HasPrefix(input, "/quit") {
-				return m, tea.Quit
-			}
-			if strings.HasPrefix(input, "/model ") {
-				m.modelName = strings.TrimSpace(strings.TrimPrefix(input, "/model "))
-				m.textarea.Reset()
-				return m, nil
-			}
-			if strings.HasPrefix(input, "/clear") {
-				m.chatHistory = nil
-				clearCache()
-
-				// Re-hydrate if system context file is present
-				if hydration := loadHydrationContext(); hydration != nil {
-					m.chatHistory = append(m.chatHistory, *hydration)
-					saveMessageObject(*hydration)
-				}
-
-				m.refreshViewport()
-				m.textarea.Reset()
-				return m, nil
-			}
-			if strings.HasPrefix(input, "/file ") {
-				filePath := strings.TrimSpace(strings.TrimPrefix(input, "/file "))
-				content, err := os.ReadFile(filePath)
-				if err != nil {
-					m.chatHistory = append(m.chatHistory, Message{Role: "system", Content: "Error reading file " + filePath + ": " + err.Error()})
-				} else {
-					fileMsg := Message{Role: "user", Content: fmt.Sprintf("File content (%s):\n%s", filePath, string(content))}
-					m.chatHistory = append(m.chatHistory, fileMsg)
-					saveMessageObject(fileMsg)
-				}
-				m.refreshViewport()
-				m.textarea.Reset()
-				return m, nil
-			}
-			if strings.HasPrefix(input, "/compress") {
-				m.textarea.Reset()
-				return m, summarizeCmd(m.modelName, m.chatHistory)
-			}
-
-			// Process normal prompt
-			userMsg := Message{Role: "user", Content: input}
-			m.chatHistory = append(m.chatHistory, userMsg)
-			saveMessageObject(userMsg)
-
-			m.refreshViewport()
-			m.textarea.Reset()
-
-			m.isStreaming = true
-			m.currentBuffer.Reset()
-			m.streamChan = make(chan StreamMessage, 10)
-
-			go streamOllama(context.Background(), m.modelName, m.chatHistory, m.streamChan)
-			return m, waitForStream(m.streamChan)
-		}
-	}
-
-	return m, tea.Batch(tiCmd, vpCmd)
-}
-
-func (m model) View() string {
-	statusBar := statusBarStyle.Render(fmt.Sprintf(" Model: %s | /model <name> | /quit | /compress | /clear | /file <path>", m.modelName))
-	return fmt.Sprintf(
-		"%s\n%s\n%s\n%s",
-		titleStyle.Render("AI Agent TUI"),
-		m.viewport.View(),
-		statusBar,
-		m.textarea.View(),
-	)
 }
 
 func main() {
@@ -456,3 +274,4 @@ func main() {
 		os.Exit(1)
 	}
 }
+
