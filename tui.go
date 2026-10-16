@@ -13,9 +13,8 @@ import (
 )
 
 const (
-	DefaultModelName = "qwen3.5-4b"
+	DefaultModelName = "/home/scot/rkllama-models/qwen3-4b-16k/qwen3-4b.rkllm"
 	PlaceholderText  = "Send a message... (Shift+Enter for newline)"
-	MaxHistorySize   = 30
 )
 
 var (
@@ -73,7 +72,7 @@ func (m model) View() string {
 	)
 	return fmt.Sprintf(
 		"%s\n%s\n%s\n%s",
-		titleStyle.Render("AI Agent TUI"),
+		titleStyle.Render("Scooter Agent"),
 		m.viewport.View(),
 		statusBar,
 		m.textarea.View(),
@@ -163,6 +162,7 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		}
 
 	case StreamMessage:
+		logDebug("Received StreamMessage: Content='%s', ToolCallsLen=%d, Done=%v", msg.Content, len(msg.ToolCalls), msg.Done)
 		if msg.Err != nil {
 			m.chatHistory = append(m.chatHistory, Message{Role: "system", Content: "Error: " + msg.Err.Error()})
 			m.refreshViewport()
@@ -181,11 +181,14 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 
 			// Execute tool calls sequentially
 			if len(m.pendingTools) > 0 {
+				logDebug("Executing %d pending tool calls", len(m.pendingTools))
 				toolsToRun := m.pendingTools
 				m.pendingTools = nil
 
 				for _, call := range toolsToRun {
+					logDebug("Dispatching tool: %s", call.Function.Name)
 					toolOutcomeText := dispatchToolCall(call.Function.Name, call.Function.Arguments)
+					logDebug("Tool outcome: %s", toolOutcomeText)
 					toolMsg := Message{Role: "tool", Content: toolOutcomeText}
 					m.chatHistory = append(m.chatHistory, toolMsg)
 					saveMessageObject(toolMsg)
@@ -202,8 +205,8 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 
 			m.refreshViewport()
 
-			if len(m.chatHistory) >= MaxHistorySize {
-				return m, summarizeCmd(m.modelName, m.chatHistory)
+			if historyNeedsCompression(m.chatHistory) {
+				return m, compressHistoryCmd(m.modelName, m.chatHistory, false)
 			}
 			return m, nil
 		}
@@ -221,10 +224,15 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		if msg.Err != nil {
 			m.chatHistory = append(m.chatHistory, Message{Role: "system", Content: "Summary Error: " + msg.Err.Error()})
 		} else {
-			summaryMsg := Message{Role: "assistant", Content: "Summary: " + msg.Summary}
-			m.chatHistory = []Message{summaryMsg}
+			m.chatHistory = msg.Retained
+			if msg.Summary != "" {
+				summaryMsg := Message{Role: "system", Content: conversationSummaryLabel + msg.Summary}
+				m.chatHistory = append([]Message{summaryMsg}, m.chatHistory...)
+			}
 			clearCache()
-			saveMessageObject(summaryMsg)
+			for _, historyMsg := range m.chatHistory {
+				saveMessageObject(historyMsg)
+			}
 		}
 		m.refreshViewport()
 		return m, nil
@@ -255,6 +263,7 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 
 func (m *model) handleCommand(input string) tea.Cmd {
 	if strings.HasPrefix(input, "/quit") {
+		closeRKLLMSession()
 		return tea.Quit
 	}
 
@@ -299,7 +308,7 @@ func (m *model) handleCommand(input string) tea.Cmd {
 	}
 
 	if strings.HasPrefix(input, "/compress") {
-		return summarizeCmd(m.modelName, m.chatHistory)
+		return compressHistoryCmd(m.modelName, m.chatHistory, true)
 	}
 
 	// Submit user input message

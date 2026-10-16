@@ -5,8 +5,9 @@ import (
 )
 
 type SummaryMessage struct {
-	Summary string
-	Err     error
+	Summary  string
+	Retained []Message
+	Err      error
 }
 
 type ModelsMessage struct {

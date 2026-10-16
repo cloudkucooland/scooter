@@ -1,128 +1,168 @@
 package main
 
 import (
+	"bytes"
 	"encoding/json"
+	"fmt"
+	"io"
 	"strings"
 )
 
-const MaxBufferSize = 4096
+const (
+	toolCallStartTag = "[TOOL_CALL]"
+	toolCallEndTag   = "[/TOOL_CALL]"
+	// Tool calls may contain a source file, but must still be bounded so a
+	// malformed model response cannot grow memory without limit.
+	MaxToolCallSize = 256 * 1024
+)
 
 type RkToolParser struct {
-	buffer      string
-	inToolCall  bool
-	currentTool string
-	params      map[string]string
+	buffer     strings.Builder
+	inToolCall bool
 }
 
 func NewRkToolParser() *RkToolParser {
-	return &RkToolParser{
-		params: make(map[string]string),
-	}
+	return &RkToolParser{}
 }
 
 func (p *RkToolParser) Reset() {
-	p.buffer = ""
+	p.buffer.Reset()
 	p.inToolCall = false
-	p.currentTool = ""
-	p.params = make(map[string]string)
 }
 
-func (p *RkToolParser) ProcessChunk(text string) (string, bool, ToolCall) {
-	if len(p.buffer)+len(text) > MaxBufferSize {
-		logDebug("Parser buffer limit reached (%d), resetting.", MaxBufferSize)
-		p.Reset()
-	}
+// ProcessChunk returns text safe to display and every complete, valid tool call
+// found in the chunk. Invalid calls are returned as ordinary text so they can
+// never be executed accidentally.
+func (p *RkToolParser) ProcessChunk(text string) (string, []ToolCall) {
+	p.buffer.WriteString(text)
 
-	p.buffer += text
-	visibleText := ""
+	var visible strings.Builder
+	var calls []ToolCall
 
-	// 1. Detect start of tool call tag sequence
-	if !p.inToolCall {
-		if idx := strings.Index(p.buffer, "<tool_call>"); idx != -1 {
-			p.inToolCall = true
-			p.params = make(map[string]string)
-			p.currentTool = ""
-
-			// Render visible text that appeared prior to <tool_call>
-			visibleText = p.buffer[:idx]
-			p.buffer = p.buffer[idx:]
-		} else {
-			// Hold back trailing '<' to avoid leaking partial opening tags to the UI
-			if lastLt := strings.LastIndex(p.buffer, "<"); lastLt != -1 && len(p.buffer)-lastLt < 11 {
-				visibleText = p.buffer[:lastLt]
-				p.buffer = p.buffer[lastLt:]
-			} else {
-				visibleText = p.buffer
-				p.buffer = ""
-			}
-			return visibleText, false, ToolCall{}
-		}
-	}
-
-	// 2. Process tool call parameters while inside <tool_call> block
-	if p.inToolCall {
-		// Extract function name
-		if p.currentTool == "" {
-			if start := strings.Index(p.buffer, "<function="); start != -1 {
-				if end := strings.Index(p.buffer[start:], ">"); end != -1 {
-					p.currentTool = p.buffer[start+10 : start+end]
-					logDebug("Function name extracted: %s", p.currentTool)
+	for {
+		content := p.buffer.String()
+		if !p.inToolCall {
+			start := strings.Index(content, toolCallStartTag)
+			if start == -1 {
+				// Keep only a suffix that could become the opening marker in the
+				// next streamed chunk. This prevents leaking split markers.
+				keep := partialTagSuffix(content, toolCallStartTag)
+				visible.WriteString(content[:len(content)-keep])
+				p.buffer.Reset()
+				if keep > 0 {
+					p.buffer.WriteString(content[len(content)-keep:])
 				}
+				return visible.String(), calls
 			}
+
+			visible.WriteString(content[:start])
+			p.inToolCall = true
+			p.buffer.Reset()
+			p.buffer.WriteString(content[start+len(toolCallStartTag):])
+			continue
 		}
 
-		// Iteratively scan and extract complete parameter value payloads
-		for {
-			pStart := strings.Index(p.buffer, "<parameter=")
-			if pStart == -1 {
-				break
+		end := strings.Index(content, toolCallEndTag)
+		if end == -1 {
+			if len(content) > MaxToolCallSize {
+				logDebug("Tool call exceeded %d bytes; rendering it as text.", MaxToolCallSize)
+				visible.WriteString(toolCallStartTag)
+				visible.WriteString(content)
+				p.Reset()
 			}
-			pEnd := strings.Index(p.buffer[pStart:], ">")
-			if pEnd == -1 {
-				break
-			}
-
-			paramName := p.buffer[pStart+11 : pStart+pEnd]
-			closeTag := "</parameter>"
-			valEnd := strings.Index(p.buffer[pStart+pEnd:], closeTag)
-			if valEnd == -1 {
-				break // Incomplete chunk, await next stream token
-			}
-
-			valStart := pStart + pEnd + 1
-			absoluteValEnd := pStart + pEnd + valEnd
-			paramValue := strings.TrimSpace(p.buffer[valStart:absoluteValEnd])
-			p.params[paramName] = paramValue
-			logDebug("Parameter extracted: %s = %s", paramName, paramValue)
-
-			// Safely remove parsed parameter from scratchpad
-			p.buffer = p.buffer[:pStart] + p.buffer[absoluteValEnd+len(closeTag):]
+			return visible.String(), calls
 		}
 
-		// 3. Detect tool call termination block
-		if closeIdx := strings.Index(p.buffer, "</tool_call>"); closeIdx != -1 {
-			logDebug("Tool call closure detected")
-			p.inToolCall = false
+		rawCall := strings.TrimSpace(content[:end])
+		remaining := content[end+len(toolCallEndTag):]
+		p.inToolCall = false
+		p.buffer.Reset()
+		p.buffer.WriteString(remaining)
 
-			jsonMap := make(map[string]interface{}, len(p.params))
-			for k, v := range p.params {
-				jsonMap[k] = v
-			}
-			rawArgs, _ := json.Marshal(jsonMap)
-
-			tc := ToolCall{}
-			tc.Function.Name = p.currentTool
-			tc.Function.Arguments = json.RawMessage(rawArgs)
-			logDebug("Tool call parsed: %s, Args: %s", tc.Function.Name, string(rawArgs))
-
-			// Clean remaining buffer past the closing tag
-			p.buffer = p.buffer[closeIdx+len("</tool_call>"):]
-			p.currentTool = ""
-
-			return visibleText, true, tc
+		call, err := parseToolCall(rawCall)
+		if err != nil {
+			// Do not repair or execute malformed JSON. Returning it to the model
+			// transcript makes the failure observable on its next turn.
+			logDebug("Invalid tool call: %v; payload: %s", err, rawCall)
+			visible.WriteString(toolCallStartTag)
+			visible.WriteString(rawCall)
+			visible.WriteString(toolCallEndTag)
+			continue
 		}
+		calls = append(calls, call)
 	}
-
-	return visibleText, false, ToolCall{}
 }
 
+func partialTagSuffix(text, tag string) int {
+	max := len(tag) - 1
+	if len(text) < max {
+		max = len(text)
+	}
+	for size := max; size > 0; size-- {
+		if strings.HasSuffix(text, tag[:size]) {
+			return size
+		}
+	}
+	return 0
+}
+
+func parseToolCall(raw string) (ToolCall, error) {
+	clean := strings.TrimSpace(raw)
+	clean = strings.TrimPrefix(clean, "```json")
+	clean = strings.TrimPrefix(clean, "```")
+	clean = strings.TrimSuffix(strings.TrimSpace(clean), "```")
+
+	var envelope struct {
+		Function  json.RawMessage `json:"function"`
+		Name      string          `json:"name"`
+		Arguments json.RawMessage `json:"arguments"`
+	}
+	decoder := json.NewDecoder(strings.NewReader(clean))
+	decoder.DisallowUnknownFields()
+	if err := decoder.Decode(&envelope); err != nil {
+		return ToolCall{}, fmt.Errorf("invalid JSON: %w", err)
+	}
+	var trailing any
+	if err := decoder.Decode(&trailing); err != io.EOF {
+		if err == nil {
+			return ToolCall{}, fmt.Errorf("tool call contains multiple JSON values")
+		}
+		return ToolCall{}, fmt.Errorf("invalid trailing JSON: %w", err)
+	}
+
+	name := envelope.Name
+	arguments := envelope.Arguments
+	if len(envelope.Function) > 0 {
+		var function struct {
+			Name      string          `json:"name"`
+			Arguments json.RawMessage `json:"arguments"`
+		}
+		if err := json.Unmarshal(envelope.Function, &function); err != nil {
+			return ToolCall{}, fmt.Errorf("invalid function object: %w", err)
+		}
+		name, arguments = function.Name, function.Arguments
+	}
+	if strings.TrimSpace(name) == "" {
+		return ToolCall{}, fmt.Errorf("missing function name")
+	}
+	arguments = bytes.TrimSpace(arguments)
+	if len(arguments) == 0 || bytes.Equal(arguments, []byte("null")) {
+		arguments = json.RawMessage(`{}`)
+	}
+	if arguments[0] == '"' {
+		var encoded string
+		if err := json.Unmarshal(arguments, &encoded); err != nil {
+			return ToolCall{}, fmt.Errorf("invalid encoded arguments: %w", err)
+		}
+		arguments = json.RawMessage(encoded)
+	}
+	var object map[string]json.RawMessage
+	if err := json.Unmarshal(arguments, &object); err != nil {
+		return ToolCall{}, fmt.Errorf("arguments must be a JSON object: %w", err)
+	}
+
+	var call ToolCall
+	call.Function.Name = name
+	call.Function.Arguments = arguments
+	return call, nil
+}
