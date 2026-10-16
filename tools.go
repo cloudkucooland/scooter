@@ -16,10 +16,8 @@ import (
 	"time"
 
 	"github.com/cloudkucooland/go-kasa"
+	"google.golang.org/genai"
 )
-
-const maxGrepFileSize = 2 * 1024 * 1024 // 2 MB
-const maxShellOutputSize = 64 * 1024
 
 var binaryFileExts = map[string]bool{
 	".rkllm": true,
@@ -73,7 +71,39 @@ type Tool struct {
 	Function FunctionDefinition `json:"function"`
 }
 
-func getSystemTools() []Tool {
+var activeToolset = "all"
+
+func GetActiveToolset() string {
+	if activeToolset == "" {
+		return "all"
+	}
+	return activeToolset
+}
+
+func SetActiveToolset(name string) error {
+	normalized := strings.ToLower(strings.TrimSpace(name))
+	switch normalized {
+	case "dev", "development":
+		activeToolset = "development"
+	case "home", "kasa", "iot":
+		activeToolset = "home"
+	case "all", "every":
+		activeToolset = "all"
+	default:
+		return fmt.Errorf("unknown toolset %q (available: development, home, all)", name)
+	}
+	return nil
+}
+
+func listToolsetsNames() []string {
+	return []string{
+		"development (dev)",
+		"home (kasa, iot)",
+		"all (default)",
+	}
+}
+
+func getDevelopmentTools() []Tool {
 	return []Tool{
 		{
 			Type: "function",
@@ -209,6 +239,20 @@ func getSystemTools() []Tool {
 		{
 			Type: "function",
 			Function: FunctionDefinition{
+				Name:        "outsource",
+				Description: "Outsources a complex task or prompt to Google's Gemini GenAI API when the local model needs advanced cloud capabilities.",
+				Parameters: Parameters{
+					Type: "object",
+					Properties: map[string]Property{
+						"prompt": {Type: "string", Description: "The prompt or instructions to send to Google GenAI."},
+					},
+					Required: []string{"prompt"},
+				},
+			},
+		},
+		{
+			Type: "function",
+			Function: FunctionDefinition{
 				Name:        "grep_search",
 				Description: "Recursively searches for a regex pattern in files within the current directory.",
 				Parameters: Parameters{
@@ -221,6 +265,11 @@ func getSystemTools() []Tool {
 				},
 			},
 		},
+	}
+}
+
+func getHomeTools() []Tool {
+	return []Tool{
 		{
 			Type: "function",
 			Function: FunctionDefinition{
@@ -272,6 +321,19 @@ func getSystemTools() []Tool {
 				},
 			},
 		},
+	}
+}
+
+func getSystemTools() []Tool {
+	switch GetActiveToolset() {
+	case "development":
+		return getDevelopmentTools()
+	case "home":
+		return getHomeTools()
+	case "all":
+		fallthrough
+	default:
+		return append(getDevelopmentTools(), getHomeTools()...)
 	}
 }
 
@@ -348,6 +410,10 @@ type ListDirArgs struct {
 type GrepSearchArgs struct {
 	Pattern    string `json:"pattern"`
 	MaxResults int    `json:"max_results,omitempty"`
+}
+
+type OutsourceArgs struct {
+	Prompt string `json:"prompt"`
 }
 
 type SetDeviceStateArgs struct {
@@ -495,7 +561,7 @@ func readGrepFile(path string) ([]byte, bool) {
 		_ = f.Close()
 		return nil, false
 	}
-	content, readErr := io.ReadAll(io.LimitReader(f, maxGrepFileSize))
+	content, readErr := io.ReadAll(io.LimitReader(f, getMaxGrepFileSize()))
 	closeErr := f.Close()
 	if readErr != nil || closeErr != nil {
 		return nil, false
@@ -534,7 +600,7 @@ func runShell(command string) string {
 	defer cancel()
 	cmd := exec.CommandContext(ctx, "sh", "-c", command)
 	cmd.Dir = workingDir
-	output := &cappedBuffer{max: maxShellOutputSize}
+	output := &cappedBuffer{max: getMaxShellOutputSize()}
 	cmd.Stdout = output
 	cmd.Stderr = output
 	err := cmd.Run()
@@ -670,7 +736,7 @@ func runGit(subcommand string, pathArg string) string {
 	defer cancel()
 	cmd := exec.CommandContext(ctx, "git", args...)
 	cmd.Dir = workingDir
-	output := &cappedBuffer{max: maxShellOutputSize}
+	output := &cappedBuffer{max: getMaxShellOutputSize()}
 	cmd.Stdout = output
 	cmd.Stderr = output
 	err := cmd.Run()
@@ -706,7 +772,7 @@ func applyPatch(patchText string) string {
 	cmd := exec.CommandContext(ctx, patchCommand)
 	cmd.Dir = workingDir
 	cmd.Stdin = strings.NewReader(patchText)
-	output := &cappedBuffer{max: maxShellOutputSize}
+	output := &cappedBuffer{max: getMaxShellOutputSize()}
 	cmd.Stdout = output
 	cmd.Stderr = output
 	err = cmd.Run()
@@ -745,6 +811,43 @@ func dispatchToolCall(name string, rawArgs json.RawMessage) string {
 			return fmt.Sprintf("System Error parsing arguments: %v", err)
 		}
 		return applyPatch(args.Patch)
+
+	case "outsource":
+		var args OutsourceArgs
+		if err := json.Unmarshal(rawArgs, &args); err != nil {
+			return fmt.Sprintf("System Error parsing arguments: %v", err)
+		}
+		if strings.TrimSpace(args.Prompt) == "" {
+			return "System Error: prompt is required"
+		}
+
+		apiKey := getGoogleAPIKey()
+		if apiKey == "" {
+			return "System Error: Google API key is not configured. Set GOOGLE_API_KEY environment variable or 'google_api_key' in your config file (~/.config/scooter/config.json)."
+		}
+
+		modelName := getGoogleGenAIModel()
+		ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+		defer cancel()
+
+		client, err := genai.NewClient(ctx, &genai.ClientConfig{
+			APIKey:  apiKey,
+			Backend: genai.BackendGeminiAPI,
+		})
+		if err != nil {
+			return fmt.Sprintf("System Error creating GenAI client: %v", err)
+		}
+
+		result, err := client.Models.GenerateContent(ctx, modelName, genai.Text(args.Prompt), nil)
+		if err != nil {
+			return fmt.Sprintf("System Error generating content from Google GenAI: %v", err)
+		}
+
+		if result == nil || len(result.Candidates) == 0 {
+			return "System Error: No response candidates returned from Google GenAI."
+		}
+
+		return result.Text()
 
 	case "git_status", "git_diff":
 		var args GitPathArgs
@@ -959,7 +1062,7 @@ func dispatchToolCall(name string, rawArgs json.RawMessage) string {
 
 			// Skip non-regular files and files exceeding 2 MB limit
 			info, err := d.Info()
-			if err != nil || !info.Mode().IsRegular() || info.Size() > maxGrepFileSize {
+			if err != nil || !info.Mode().IsRegular() || info.Size() > getMaxGrepFileSize() {
 				return nil
 			}
 

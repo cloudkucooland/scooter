@@ -99,7 +99,7 @@ func (m model) View() string {
 	}
 	modelDisplay := filepath.Base(m.modelName)
 	statusBar := statusBarStyle.Render(
-		fmt.Sprintf(" Model: %s (%s) | [Esc] to abort | /context [size] | /model <name> | /compress | /clear | /quit", modelDisplay, ctxLabel),
+		fmt.Sprintf(" Model: %s (%s) | Toolset: %s | [Esc] to abort | /toolsets | /toolset <name> | /models | /model <name> | /context | /compress | /clear | /quit", modelDisplay, ctxLabel, GetActiveToolset()),
 	)
 	return fmt.Sprintf(
 		"%s\n%s\n%s\n%s",
@@ -330,6 +330,15 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.refreshViewport()
 		return m, nil
 
+	case ToolsetsMessage:
+		if msg.Err != nil {
+			m.chatHistory = append(m.chatHistory, Message{Role: "system", Content: "Toolsets Error: " + msg.Err.Error()})
+		} else {
+			m.chatHistory = append(m.chatHistory, Message{Role: "system", Content: "Available Toolsets:\n- " + strings.Join(msg.Toolsets, "\n- ")})
+		}
+		m.refreshViewport()
+		return m, nil
+
 	case StatusMessage:
 		if msg.Err != nil {
 			m.chatHistory = append(m.chatHistory, Message{Role: "system", Content: "Status Error: " + msg.Err.Error()})
@@ -355,6 +364,10 @@ func (m *model) handleCommand(input string) tea.Cmd {
 		return listModelsCmd()
 	}
 
+	if strings.HasPrefix(input, "/toolsets") {
+		return listToolsetsCmd()
+	}
+
 	if strings.HasPrefix(input, "/status") {
 		return statusCmd()
 	}
@@ -370,6 +383,23 @@ func (m *model) handleCommand(input string) tea.Cmd {
 			Role:    "system",
 			Content: fmt.Sprintf("Switched model to %s (Context: %dk / %d tokens)", resolved, detected/1024, detected),
 		})
+		m.refreshViewport()
+		return nil
+	}
+
+	if strings.HasPrefix(input, "/toolset ") {
+		newToolset := strings.TrimSpace(strings.TrimPrefix(input, "/toolset "))
+		if err := SetActiveToolset(newToolset); err != nil {
+			m.chatHistory = append(m.chatHistory, Message{
+				Role:    "system",
+				Content: fmt.Sprintf("Error switching toolset: %v. Available: development, home, all", err),
+			})
+		} else {
+			m.chatHistory = append(m.chatHistory, Message{
+				Role:    "system",
+				Content: fmt.Sprintf("Switched active toolset to %s", GetActiveToolset()),
+			})
+		}
 		m.refreshViewport()
 		return nil
 	}

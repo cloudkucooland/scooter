@@ -360,3 +360,82 @@ func TestGrepSearchLimitsMatchingLines(t *testing.T) {
 		t.Fatalf("expected max_results to limit output, got: %q", result)
 	}
 }
+
+func TestToolsets(t *testing.T) {
+	orig := GetActiveToolset()
+	defer SetActiveToolset(orig)
+
+	if err := SetActiveToolset("development"); err != nil {
+		t.Fatalf("unexpected error setting toolset development: %v", err)
+	}
+	if GetActiveToolset() != "development" {
+		t.Fatalf("expected development toolset, got %q", GetActiveToolset())
+	}
+	tools := getSystemTools()
+	foundOutsource := false
+	for _, tool := range tools {
+		if tool.Function.Name == "get_devices" {
+			t.Fatalf("expected home tool 'get_devices' to be excluded in development toolset")
+		}
+		if tool.Function.Name == "outsource" {
+			foundOutsource = true
+		}
+	}
+	if !foundOutsource {
+		t.Fatalf("expected outsource tool in development toolset")
+	}
+
+	if err := SetActiveToolset("home"); err != nil {
+		t.Fatalf("unexpected error setting toolset home: %v", err)
+	}
+	if GetActiveToolset() != "home" {
+		t.Fatalf("expected home toolset, got %q", GetActiveToolset())
+	}
+	homeTools := getSystemTools()
+	foundGetDevices := false
+	for _, tool := range homeTools {
+		if tool.Function.Name == "get_devices" {
+			foundGetDevices = true
+		}
+		if tool.Function.Name == "apply_patch" {
+			t.Fatalf("expected development tool 'apply_patch' to be excluded in home toolset")
+		}
+		if tool.Function.Name == "outsource" {
+			t.Fatalf("expected development tool 'outsource' to be excluded in home toolset")
+		}
+	}
+	if !foundGetDevices {
+		t.Fatalf("expected 'get_devices' tool in home toolset")
+	}
+
+	if err := SetActiveToolset("invalid_set"); err == nil {
+		t.Fatalf("expected error setting invalid toolset, got nil")
+	}
+
+	if err := SetActiveToolset("all"); err != nil {
+		t.Fatalf("unexpected error setting toolset all: %v", err)
+	}
+	if GetActiveToolset() != "all" {
+		t.Fatalf("expected all toolset, got %q", GetActiveToolset())
+	}
+}
+
+func TestOutsourceToolValidation(t *testing.T) {
+	origKey := os.Getenv("GOOGLE_API_KEY")
+	defer os.Setenv("GOOGLE_API_KEY", origKey)
+	os.Unsetenv("GOOGLE_API_KEY")
+
+	// Missing prompt
+	rawArgs, _ := json.Marshal(OutsourceArgs{Prompt: ""})
+	res := dispatchToolCall("outsource", rawArgs)
+	if !strings.Contains(res, "prompt is required") {
+		t.Fatalf("expected prompt required error, got: %q", res)
+	}
+
+	// Missing API key
+	rawArgs, _ = json.Marshal(OutsourceArgs{Prompt: "Hello"})
+	res = dispatchToolCall("outsource", rawArgs)
+	if !strings.Contains(res, "Google API key is not configured") {
+		t.Fatalf("expected API key not configured error, got: %q", res)
+	}
+}

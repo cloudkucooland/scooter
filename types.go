@@ -15,6 +15,11 @@ type ModelsMessage struct {
 	Err    error
 }
 
+type ToolsetsMessage struct {
+	Toolsets []string
+	Err      error
+}
+
 type StatusMessage struct {
 	Status string
 	Err    error

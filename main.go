@@ -1,7 +1,6 @@
 package main
 
 import (
-	"context"
 	"crypto/sha256"
 	"encoding/json"
 	"fmt"
@@ -125,7 +124,7 @@ func loadHistoryObjects() []Message {
 		var msg Message
 		if err := decoder.Decode(&msg); err == nil {
 			if msg.Role == "system" && strings.HasPrefix(msg.Content, "Context loaded from ") {
-				msg.Content = truncateToTokenBudget(msg.Content, HydrationTokenLimit)
+				msg.Content = truncateToTokenBudget(msg.Content, getHydrationTokenLimit())
 			}
 			history = append(history, msg)
 		} else {
@@ -141,7 +140,7 @@ func loadHydrationContext() *Message {
 	for _, file := range files {
 		content, err := os.ReadFile(file)
 		if err == nil && len(strings.TrimSpace(string(content))) > 0 {
-			boundedContent := truncateToTokenBudget(string(content), HydrationTokenLimit)
+			boundedContent := truncateToTokenBudget(string(content), getHydrationTokenLimit())
 			return &Message{
 				Role:    "system",
 				Content: fmt.Sprintf("Context loaded from %s:\n%s", file, boundedContent),
@@ -198,14 +197,14 @@ func contains(values []string, target string) bool {
 	return false
 }
 
-func sendStreamMsg(ctx context.Context, ch chan<- StreamMessage, msg StreamMessage) bool {
+/* func sendStreamMsg(ctx context.Context, ch chan<- StreamMessage, msg StreamMessage) bool {
 	select {
 	case <-ctx.Done():
 		return false
 	case ch <- msg:
 		return true
 	}
-}
+} */
 
 func main() {
 	defer closeLogger()

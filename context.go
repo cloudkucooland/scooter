@@ -10,18 +10,12 @@ import (
 )
 
 const (
-	DefaultContextTokens     = 4096
-	MinContextTokens         = 1024
-	MaxContextTokens         = 128 * 1024
-	ContextSafetyTokens      = 256
-	SummaryReserveTokens     = 512
-	HydrationTokenLimit      = 1000
 	conversationSummaryLabel = "Conversation summary:\n"
 )
 
 var (
 	contextMu          sync.RWMutex
-	activeContextLimit = DefaultContextTokens
+	activeContextLimit = getDefaultContextTokens()
 	contextPathRegex   = regexp.MustCompile(`(?i)(?:ctx|[-_/])(\d{1,3})k\b`)
 )
 
@@ -32,11 +26,13 @@ func getActiveContextLimit() int {
 }
 
 func setActiveContextLimit(tokens int) int {
-	if tokens < MinContextTokens {
-		tokens = MinContextTokens
+	minTok := getMinContextTokens()
+	maxTok := getMaxContextTokens()
+	if tokens < minTok {
+		tokens = minTok
 	}
-	if tokens > MaxContextTokens {
-		tokens = MaxContextTokens
+	if tokens > maxTok {
+		tokens = maxTok
 	}
 	contextMu.Lock()
 	activeContextLimit = tokens
@@ -72,13 +68,14 @@ func parseContextSize(raw string) (int, error) {
 }
 
 func detectContextLength(path string) int {
+	minTok := getMinContextTokens()
 	if env := os.Getenv("RKLLM_CONTEXT_LEN"); env != "" {
-		if tokens, err := parseContextSize(env); err == nil && tokens >= MinContextTokens {
+		if tokens, err := parseContextSize(env); err == nil && tokens >= minTok {
 			return tokens
 		}
 	}
 	if env := os.Getenv("RKLLM_CONTEXT"); env != "" {
-		if tokens, err := parseContextSize(env); err == nil && tokens >= MinContextTokens {
+		if tokens, err := parseContextSize(env); err == nil && tokens >= minTok {
 			return tokens
 		}
 	}
@@ -91,7 +88,7 @@ func detectContextLength(path string) int {
 		}
 	}
 
-	return DefaultContextTokens
+	return getDefaultContextTokens()
 }
 
 // estimateTokens deliberately overestimates normal English and source code.
@@ -114,7 +111,7 @@ func historyNeedsCompression(history []Message) bool {
 	for _, msg := range history {
 		total += estimateMessageTokens(msg)
 	}
-	return total+reserve+ContextSafetyTokens > limit
+	return total+reserve+getContextSafetyTokens() > limit
 }
 
 // planCompression retains system context and as much recent conversation as
@@ -140,7 +137,7 @@ func planCompression(history []Message, force bool) (source, retained []Message)
 
 	limit := getActiveContextLimit()
 	reserve := getResponseReserveTokens(limit)
-	budget := limit - reserve - ContextSafetyTokens - SummaryReserveTokens
+	budget := limit - reserve - getContextSafetyTokens() - getSummaryReserveTokens()
 	budget -= estimateTokens(buildToolInstructions(getSystemTools())) + 4
 	for _, msg := range retained {
 		budget -= estimateMessageTokens(msg)
@@ -187,7 +184,7 @@ func renderMessages(messages []Message) string {
 	return sb.String()
 }
 
-func truncateToTokenBudget(text string, budget int) string {
+/* func truncateToTokenBudget(text string, budget int) string {
 	if budget <= 0 {
 		return "[content omitted for context budget]"
 	}
@@ -201,4 +198,32 @@ func truncateToTokenBudget(text string, budget int) string {
 	}
 	half := (maxRunes - 32) / 2
 	return string(runes[:half]) + "\n[... truncated for context budget ...]\n" + string(runes[len(runes)-half:])
+} */
+
+func truncateToTokenBudget(text string, budget int) string {
+	if budget <= 0 {
+		return "[content omitted for context budget]"
+	}
+	if estimateTokens(text) <= budget {
+		return text
+	}
+
+	runes := []rune(text)
+	maxRunes := budget * 3
+
+	const notice = "\n[... truncated for context budget ...]\n"
+	noticeRunes := utf8.RuneCountInString(notice)
+
+	if maxRunes <= noticeRunes+4 {
+		if len(runes) > maxRunes {
+			return string(runes[:maxRunes])
+		}
+		return string(runes)
+	}
+
+	available := maxRunes - noticeRunes
+	half := available / 2
+	tail := available - half
+
+	return string(runes[:half]) + notice + string(runes[len(runes)-tail:])
 }

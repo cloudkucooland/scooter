@@ -27,7 +27,7 @@ func summarizeCmd(modelName string, messages, retained []Message) tea.Cmd {
 			return SummaryMessage{Err: err}
 		}
 		return SummaryMessage{
-			Summary:  truncateToTokenBudget(summaryText, SummaryReserveTokens),
+			Summary:  truncateToTokenBudget(summaryText, getSummaryReserveTokens()),
 			Retained: retained,
 		}
 	}
@@ -37,6 +37,13 @@ func listModelsCmd() tea.Cmd {
 	return func() tea.Msg {
 		models := listRKLLMModels()
 		return ModelsMessage{Models: models}
+	}
+}
+
+func listToolsetsCmd() tea.Cmd {
+	return func() tea.Msg {
+		toolsets := listToolsetsNames()
+		return ToolsetsMessage{Toolsets: toolsets}
 	}
 }
 

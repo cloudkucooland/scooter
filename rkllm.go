@@ -106,12 +106,18 @@ func getRKLLMLibPath() string {
 	if path := os.Getenv("RKLLM_LIB"); path != "" {
 		return path
 	}
+	if cfgLib := loadConfig().RKLLMLib; cfgLib != "" {
+		return cfgLib
+	}
 	return "librkllmrt.so"
 }
 
 func getRKLLMModelsDir() string {
 	if dir := os.Getenv("RKLLM_MODELS_DIR"); dir != "" {
 		return dir
+	}
+	if cfgDir := loadConfig().RKLLMModelsDir; cfgDir != "" {
+		return cfgDir
 	}
 	if homeDir, err := os.UserHomeDir(); err == nil {
 		return filepath.Join(homeDir, "rkllama-models")
@@ -122,6 +128,9 @@ func getRKLLMModelsDir() string {
 func getDefaultModelName() string {
 	if env := os.Getenv("RKLLM_MODEL"); env != "" {
 		return env
+	}
+	if cfgModel := loadConfig().DefaultModel; cfgModel != "" {
+		return getRKLLMModelPath(cfgModel)
 	}
 	return getRKLLMModelPath("qwen3-4b")
 }
