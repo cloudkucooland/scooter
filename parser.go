@@ -81,12 +81,19 @@ func (p *RkToolParser) ProcessChunk(text string) (string, []ToolCall) {
 
 		call, err := parseToolCall(rawCall)
 		if err != nil {
-			// Do not repair or execute malformed JSON. Returning it to the model
-			// transcript makes the failure observable on its next turn.
+			// Do not repair or execute malformed JSON. Return a tool error call
+			// so the model receives structured feedback via role: tool.
 			logDebug("Invalid tool call: %v; payload: %s", err, rawCall)
-			visible.WriteString(toolCallStartTag)
-			visible.WriteString(rawCall)
-			visible.WriteString(toolCallEndTag)
+			call = ToolCall{
+				Function: struct {
+					Name      string          `json:"name"`
+					Arguments json.RawMessage `json:"arguments"`
+				}{
+					Name:      "_error",
+					Arguments: json.RawMessage(fmt.Sprintf("%q", err.Error()+" in payload: "+rawCall)),
+				},
+			}
+			calls = append(calls, call)
 			continue
 		}
 		calls = append(calls, call)
@@ -118,7 +125,6 @@ func parseToolCall(raw string) (ToolCall, error) {
 		Arguments json.RawMessage `json:"arguments"`
 	}
 	decoder := json.NewDecoder(strings.NewReader(clean))
-	decoder.DisallowUnknownFields()
 	if err := decoder.Decode(&envelope); err != nil {
 		return ToolCall{}, fmt.Errorf("invalid JSON: %w", err)
 	}

@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -27,16 +28,34 @@ var (
 )
 
 type model struct {
-	viewport      viewport.Model
-	textarea      textarea.Model
-	modelName     string
-	contextLen    int
-	chatHistory   []Message
-	isStreaming   bool
-	streamCancel  context.CancelFunc
-	currentBuffer *strings.Builder
-	streamChan    chan StreamMessage
-	pendingTools  []ToolCall
+	viewport       viewport.Model
+	textarea       textarea.Model
+	modelName      string
+	contextLen     int
+	chatHistory    []Message
+	isStreaming    bool
+	streamCancel   context.CancelFunc
+	currentBuffer  *strings.Builder
+	streamChan     chan StreamMessage
+	pendingTools   []ToolCall
+	confirmingTool *ToolCall
+}
+
+func (m *model) saveMessage(msg Message) {
+	if err := saveMessageObject(msg); err != nil {
+		errorMessage := Message{
+			Role:    "system",
+			Content: fmt.Sprintf("Cache error: could not save %s message: %v", msg.Role, err),
+		}
+		// The caller normally appends msg immediately before saving it. Keep
+		// that message last so the UI remains in chronological order while the
+		// persistence failure is still visible.
+		m.chatHistory = append(m.chatHistory, errorMessage)
+		if len(m.chatHistory) >= 2 && m.chatHistory[len(m.chatHistory)-2] == msg {
+			last := len(m.chatHistory) - 1
+			m.chatHistory[last-1], m.chatHistory[last] = m.chatHistory[last], m.chatHistory[last-1]
+		}
+	}
 }
 
 func initialModel() model {
@@ -148,6 +167,37 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		return m, nil
 
 	case tea.KeyMsg:
+		if m.confirmingTool != nil {
+			switch msg.String() {
+			case "y", "Y":
+				call := *m.confirmingTool
+				m.confirmingTool = nil
+				var args ShellArgs
+				_ = json.Unmarshal(call.Function.Arguments, &args)
+
+				logDebug("Dispatching confirmed shell tool: %s", args.Command)
+				toolOutcomeText := dispatchToolCall(call.Function.Name, call.Function.Arguments)
+				logDebug("Tool outcome: %s", toolOutcomeText)
+				toolMsg := Message{Role: "tool", Content: toolOutcomeText}
+				m.chatHistory = append(m.chatHistory, toolMsg)
+				m.saveMessage(toolMsg)
+				m.refreshViewport()
+
+				return m, m.resumeOrProcessNextTools()
+
+			case "n", "N", "esc", "q":
+				m.confirmingTool = nil
+
+				toolMsg := Message{Role: "tool", Content: "Tool execution cancelled by user."}
+				m.chatHistory = append(m.chatHistory, toolMsg)
+				m.saveMessage(toolMsg)
+				m.refreshViewport()
+
+				return m, m.resumeOrProcessNextTools()
+			}
+			return m, nil
+		}
+
 		switch msg.Type {
 		case tea.KeyCtrlC:
 			closeRKLLMSession()
@@ -169,7 +219,7 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				if partial != "" {
 					aiResponse := Message{Role: "assistant", Content: partial + " [aborted]"}
 					m.chatHistory = append(m.chatHistory, aiResponse)
-					saveMessageObject(aiResponse)
+					m.saveMessage(aiResponse)
 				} else {
 					m.chatHistory = append(m.chatHistory, Message{
 						Role:    "system",
@@ -226,35 +276,15 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			if m.currentBuffer.Len() > 0 {
 				aiResponse := Message{Role: "assistant", Content: m.currentBuffer.String()}
 				m.chatHistory = append(m.chatHistory, aiResponse)
-				saveMessageObject(aiResponse)
+				m.saveMessage(aiResponse)
 				m.currentBuffer.Reset()
 			}
 			m.isStreaming = false
 
-			// Execute tool calls sequentially
+			// Execute tool calls sequentially with shell confirmation
 			if len(m.pendingTools) > 0 {
 				logDebug("Executing %d pending tool calls", len(m.pendingTools))
-				toolsToRun := m.pendingTools
-				m.pendingTools = nil
-
-				for _, call := range toolsToRun {
-					logDebug("Dispatching tool: %s", call.Function.Name)
-					toolOutcomeText := dispatchToolCall(call.Function.Name, call.Function.Arguments)
-					logDebug("Tool outcome: %s", toolOutcomeText)
-					toolMsg := Message{Role: "tool", Content: toolOutcomeText}
-					m.chatHistory = append(m.chatHistory, toolMsg)
-					saveMessageObject(toolMsg)
-				}
-
-				m.refreshViewport()
-
-				// Loop tool result back to LLM context
-				m.isStreaming = true
-				m.streamChan = make(chan StreamMessage, 10)
-				ctx, cancel := context.WithCancel(context.Background())
-				m.streamCancel = cancel
-				go streamRKLLM(ctx, m.modelName, m.chatHistory, m.streamChan)
-				return m, waitForStream(m.streamChan)
+				return m, m.resumeOrProcessNextTools()
 			}
 
 			m.refreshViewport()
@@ -285,7 +315,7 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			}
 			clearCache()
 			for _, historyMsg := range m.chatHistory {
-				saveMessageObject(historyMsg)
+				m.saveMessage(historyMsg)
 			}
 		}
 		m.refreshViewport()
@@ -392,7 +422,7 @@ func (m *model) handleCommand(input string) tea.Cmd {
 
 		if hydration := loadHydrationContext(); hydration != nil {
 			m.chatHistory = append(m.chatHistory, *hydration)
-			saveMessageObject(*hydration)
+			m.saveMessage(*hydration)
 		}
 
 		m.refreshViewport()
@@ -407,7 +437,7 @@ func (m *model) handleCommand(input string) tea.Cmd {
 		} else {
 			fileMsg := Message{Role: "user", Content: fmt.Sprintf("File content (%s):\n%s", filePath, string(content))}
 			m.chatHistory = append(m.chatHistory, fileMsg)
-			saveMessageObject(fileMsg)
+			m.saveMessage(fileMsg)
 		}
 		m.refreshViewport()
 		return nil
@@ -420,7 +450,7 @@ func (m *model) handleCommand(input string) tea.Cmd {
 	// Submit user input message
 	userMsg := Message{Role: "user", Content: input}
 	m.chatHistory = append(m.chatHistory, userMsg)
-	saveMessageObject(userMsg)
+	m.saveMessage(userMsg)
 
 	m.refreshViewport()
 
@@ -431,6 +461,45 @@ func (m *model) handleCommand(input string) tea.Cmd {
 	ctx, cancel := context.WithCancel(context.Background())
 	m.streamCancel = cancel
 
+	go streamRKLLM(ctx, m.modelName, m.chatHistory, m.streamChan)
+	return waitForStream(m.streamChan)
+}
+
+func (m *model) resumeOrProcessNextTools() tea.Cmd {
+	if len(m.pendingTools) > 0 {
+		call := m.pendingTools[0]
+		m.pendingTools = m.pendingTools[1:]
+
+		if call.Function.Name == "shell" {
+			var args ShellArgs
+			_ = json.Unmarshal(call.Function.Arguments, &args)
+			m.confirmingTool = &call
+			msg := Message{
+				Role:    "system",
+				Content: fmt.Sprintf("Execute shell command?\n  $ %s\nPress [y] to confirm, [n] to cancel.", args.Command),
+			}
+			m.chatHistory = append(m.chatHistory, msg)
+			m.saveMessage(msg)
+			m.refreshViewport()
+			return nil
+		}
+
+		logDebug("Dispatching tool: %s", call.Function.Name)
+		toolOutcomeText := dispatchToolCall(call.Function.Name, call.Function.Arguments)
+		logDebug("Tool outcome: %s", toolOutcomeText)
+		toolMsg := Message{Role: "tool", Content: toolOutcomeText}
+		m.chatHistory = append(m.chatHistory, toolMsg)
+		m.saveMessage(toolMsg)
+		m.refreshViewport()
+
+		return m.resumeOrProcessNextTools()
+	}
+
+	// Loop tool result back to LLM context
+	m.isStreaming = true
+	m.streamChan = make(chan StreamMessage, 10)
+	ctx, cancel := context.WithCancel(context.Background())
+	m.streamCancel = cancel
 	go streamRKLLM(ctx, m.modelName, m.chatHistory, m.streamChan)
 	return waitForStream(m.streamChan)
 }

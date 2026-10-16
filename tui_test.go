@@ -1,6 +1,7 @@
 package main
 
 import (
+	"encoding/json"
 	"strings"
 	"testing"
 
@@ -55,5 +56,36 @@ func TestUpdateEscStopsStreaming(t *testing.T) {
 	lastMsg := resModel.chatHistory[len(resModel.chatHistory)-1]
 	if !strings.Contains(lastMsg.Content, "[aborted]") {
 		t.Errorf("expected last message to contain [aborted], got %q", lastMsg.Content)
+	}
+}
+
+func TestShellCommandConfirmationPrompt(t *testing.T) {
+	m := model{
+		textarea:      textarea.New(),
+		viewport:      viewport.New(80, 24),
+		currentBuffer: &strings.Builder{},
+		confirmingTool: &ToolCall{
+			Function: struct {
+				Name      string          `json:"name"`
+				Arguments json.RawMessage `json:"arguments"`
+			}{
+				Name:      "shell",
+				Arguments: []byte(`{"command":"echo hello"}`),
+			},
+		},
+	}
+
+	// Pressing 'n' should cancel execution
+	updatedM, _ := m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'n'}})
+	resModel, ok := updatedM.(model)
+	if !ok {
+		t.Fatalf("expected model, got %T", updatedM)
+	}
+	if resModel.confirmingTool != nil {
+		t.Fatal("expected confirmingTool to be cleared after cancellation")
+	}
+	lastMsg := resModel.chatHistory[len(resModel.chatHistory)-1]
+	if !strings.Contains(lastMsg.Content, "cancelled") {
+		t.Fatalf("expected cancellation message, got %q", lastMsg.Content)
 	}
 }

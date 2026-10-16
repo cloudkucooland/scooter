@@ -67,39 +67,54 @@ func getCacheFile() (string, error) {
 func clearCache() {
 	cacheFile, err := getCacheFile()
 	if err != nil {
+		logDebug("cache clear failed: %v", err)
 		return
 	}
-	os.Remove(cacheFile)
+	if err := os.Remove(cacheFile); err != nil && !os.IsNotExist(err) {
+		logDebug("cache clear failed for %s: %v", cacheFile, err)
+	}
 }
 
 func saveMessageObject(msg Message) error {
 	cacheFile, err := getCacheFile()
 	if err != nil {
+		logDebug("cache save failed: %v", err)
 		return err
 	}
 	f, err := os.OpenFile(cacheFile, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0644)
 	if err != nil {
+		logDebug("cache save failed opening %s: %v", cacheFile, err)
 		return err
 	}
 	defer f.Close()
 
 	data, err := json.Marshal(msg)
 	if err != nil {
+		logDebug("cache save failed encoding message: %v", err)
 		return err
 	}
 	if _, err := f.Write(append(data, '\n')); err != nil {
+		logDebug("cache save failed writing %s: %v", cacheFile, err)
 		return err
 	}
-	return f.Sync()
+	if err := f.Sync(); err != nil {
+		logDebug("cache save failed syncing %s: %v", cacheFile, err)
+		return err
+	}
+	return nil
 }
 
 func loadHistoryObjects() []Message {
 	cacheFile, err := getCacheFile()
 	if err != nil {
+		logDebug("cache load failed: %v", err)
 		return nil
 	}
 	f, err := os.Open(cacheFile)
 	if err != nil {
+		if !os.IsNotExist(err) {
+			logDebug("cache load failed opening %s: %v", cacheFile, err)
+		}
 		return nil
 	}
 	defer f.Close()
@@ -113,6 +128,8 @@ func loadHistoryObjects() []Message {
 				msg.Content = truncateToTokenBudget(msg.Content, HydrationTokenLimit)
 			}
 			history = append(history, msg)
+		} else {
+			logDebug("cache load skipped malformed record in %s: %v", cacheFile, err)
 		}
 	}
 	return history
@@ -137,9 +154,10 @@ func loadHydrationContext() *Message {
 func buildToolInstructions(tools []Tool) string {
 	var sb strings.Builder
 	sb.WriteString("You can call available local tools when necessary. Do not claim that a tool was run unless a Tool result is present.\n")
+	sb.WriteString("CRITICAL: When a tool is needed, you MUST output the `[TOOL_CALL]` block to execute it. Do NOT merely describe, discuss, or reason about calling a tool in plain text without outputting the `[TOOL_CALL]` markers.\n")
 	sb.WriteString("For a tool call, output only this exact JSON object between the markers, with no Markdown or commentary inside the markers:\n")
 	sb.WriteString("[TOOL_CALL]{\"name\":\"TOOL_NAME\",\"arguments\":{}}[/TOOL_CALL]\n")
-	sb.WriteString("Use valid JSON: double-quote keys and string values; arguments must be an object. A response may contain multiple complete tool calls. Otherwise, answer in plain text.\n\n")
+	sb.WriteString("Use valid JSON: double-quote keys and string values; arguments must be an object. A response may contain multiple complete tool calls. If reasoning or thinking through steps, always conclude your response with the required `[TOOL_CALL]` block to invoke the tool. Otherwise, answer in plain text.\n\n")
 	fmt.Fprintf(&sb, "File and directory operations are restricted to the working directory: %s (paths may be relative or absolute within this directory).\n\n", workingDir)
 	sb.WriteString("Available tools:\n")
 
