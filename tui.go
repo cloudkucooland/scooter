@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"os"
+	"path/filepath"
 	"strings"
 
 	"github.com/charmbracelet/bubbles/textarea"
@@ -13,8 +14,7 @@ import (
 )
 
 const (
-	DefaultModelName = "/home/scot/rkllama-models/qwen3-4b-16k/qwen3-4b.rkllm"
-	PlaceholderText  = "Send a message... (Shift+Enter for newline)"
+	PlaceholderText = "Send a message... ([Esc] to stop generation)"
 )
 
 var (
@@ -30,8 +30,10 @@ type model struct {
 	viewport      viewport.Model
 	textarea      textarea.Model
 	modelName     string
+	contextLen    int
 	chatHistory   []Message
 	isStreaming   bool
+	streamCancel  context.CancelFunc
 	currentBuffer *strings.Builder
 	streamChan    chan StreamMessage
 	pendingTools  []ToolCall
@@ -54,10 +56,15 @@ func initialModel() model {
 		}
 	}
 
+	modelName := getDefaultModelName()
+	initialCtx := detectContextLength(modelName)
+	setActiveContextLimit(initialCtx)
+
 	m := model{
 		textarea:      ta,
 		viewport:      vp,
-		modelName:     DefaultModelName,
+		modelName:     modelName,
+		contextLen:    initialCtx,
 		chatHistory:   chatHist,
 		currentBuffer: &strings.Builder{},
 	}
@@ -67,8 +74,13 @@ func initialModel() model {
 }
 
 func (m model) View() string {
+	ctxLabel := fmt.Sprintf("%dk", m.contextLen/1024)
+	if m.contextLen%1024 != 0 {
+		ctxLabel = fmt.Sprintf("%d", m.contextLen)
+	}
+	modelDisplay := filepath.Base(m.modelName)
 	statusBar := statusBarStyle.Render(
-		fmt.Sprintf(" Model: %s | /model <name> | /compress | /clear | /file <path> | /quit", m.modelName),
+		fmt.Sprintf(" Model: %s (%s) | [Esc] to abort | /context [size] | /model <name> | /compress | /clear | /quit", modelDisplay, ctxLabel),
 	)
 	return fmt.Sprintf(
 		"%s\n%s\n%s\n%s",
@@ -138,7 +150,35 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	case tea.KeyMsg:
 		switch msg.Type {
 		case tea.KeyCtrlC:
+			closeRKLLMSession()
 			return m, tea.Quit
+		case tea.KeyCtrlL:
+			m.refreshViewport()
+			return m, tea.ClearScreen
+		case tea.KeyEsc:
+			if m.isStreaming {
+				abortRKLLM()
+				if m.streamCancel != nil {
+					m.streamCancel()
+					m.streamCancel = nil
+				}
+				m.isStreaming = false
+				partial := strings.TrimSpace(m.currentBuffer.String())
+				m.currentBuffer.Reset()
+				m.pendingTools = nil
+				if partial != "" {
+					aiResponse := Message{Role: "assistant", Content: partial + " [aborted]"}
+					m.chatHistory = append(m.chatHistory, aiResponse)
+					saveMessageObject(aiResponse)
+				} else {
+					m.chatHistory = append(m.chatHistory, Message{
+						Role:    "system",
+						Content: "[Prompt generation aborted by user]",
+					})
+				}
+				m.refreshViewport()
+				return m, nil
+			}
 		case tea.KeyEnter:
 			// Prevent submission while model is outputting
 			if m.isStreaming {
@@ -163,14 +203,26 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 
 	case StreamMessage:
 		logDebug("Received StreamMessage: Content='%s', ToolCallsLen=%d, Done=%v", msg.Content, len(msg.ToolCalls), msg.Done)
+		if !m.isStreaming {
+			return m, nil
+		}
+
 		if msg.Err != nil {
 			m.chatHistory = append(m.chatHistory, Message{Role: "system", Content: "Error: " + msg.Err.Error()})
 			m.refreshViewport()
 			m.isStreaming = false
+			if m.streamCancel != nil {
+				m.streamCancel()
+				m.streamCancel = nil
+			}
 			return m, nil
 		}
 
 		if msg.Done {
+			if m.streamCancel != nil {
+				m.streamCancel()
+				m.streamCancel = nil
+			}
 			if m.currentBuffer.Len() > 0 {
 				aiResponse := Message{Role: "assistant", Content: m.currentBuffer.String()}
 				m.chatHistory = append(m.chatHistory, aiResponse)
@@ -199,7 +251,9 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				// Loop tool result back to LLM context
 				m.isStreaming = true
 				m.streamChan = make(chan StreamMessage, 10)
-				go streamOllama(context.Background(), m.modelName, m.chatHistory, m.streamChan)
+				ctx, cancel := context.WithCancel(context.Background())
+				m.streamCancel = cancel
+				go streamRKLLM(ctx, m.modelName, m.chatHistory, m.streamChan)
 				return m, waitForStream(m.streamChan)
 			}
 
@@ -276,7 +330,59 @@ func (m *model) handleCommand(input string) tea.Cmd {
 	}
 
 	if strings.HasPrefix(input, "/model ") {
-		m.modelName = strings.TrimSpace(strings.TrimPrefix(input, "/model "))
+		newModel := strings.TrimSpace(strings.TrimPrefix(input, "/model "))
+		resolved := getRKLLMModelPath(newModel)
+		m.modelName = resolved
+		detected := detectContextLength(resolved)
+		m.contextLen = detected
+		setActiveContextLimit(detected)
+		m.chatHistory = append(m.chatHistory, Message{
+			Role:    "system",
+			Content: fmt.Sprintf("Switched model to %s (Context: %dk / %d tokens)", resolved, detected/1024, detected),
+		})
+		m.refreshViewport()
+		return nil
+	}
+
+	if strings.HasPrefix(input, "/context") {
+		arg := strings.TrimSpace(strings.TrimPrefix(input, "/context"))
+		if arg == "" {
+			used := 0
+			for _, h := range m.chatHistory {
+				used += estimateMessageTokens(h)
+			}
+			toolTokens := estimateTokens(buildToolInstructions(getSystemTools())) + 4
+			totalUsed := used + toolTokens
+			pct := 0
+			if m.contextLen > 0 {
+				pct = (totalUsed * 100) / m.contextLen
+			}
+			m.chatHistory = append(m.chatHistory, Message{
+				Role: "system",
+				Content: fmt.Sprintf("Context Configuration:\n- Limit: %d tokens (%dk)\n- Current conversation: %d tokens (%d%% of budget)\n- Tool instructions overhead: %d tokens\n- Use `/context <size>` (e.g. /context 4k, /context 8k, /context 16k, /context 16384) to adjust.",
+					m.contextLen, m.contextLen/1024, used, pct, toolTokens),
+			})
+			m.refreshViewport()
+			return nil
+		}
+
+		newSize, err := parseContextSize(arg)
+		if err != nil {
+			m.chatHistory = append(m.chatHistory, Message{
+				Role:    "system",
+				Content: fmt.Sprintf("Invalid context size %q. Examples: /context 4k, /context 8k, /context 16k, /context 16384", arg),
+			})
+			m.refreshViewport()
+			return nil
+		}
+
+		m.contextLen = newSize
+		setActiveContextLimit(newSize)
+		m.chatHistory = append(m.chatHistory, Message{
+			Role:    "system",
+			Content: fmt.Sprintf("Context limit set to %d tokens (%dk). Next model run will allocate this buffer.", newSize, newSize/1024),
+		})
+		m.refreshViewport()
 		return nil
 	}
 
@@ -322,7 +428,10 @@ func (m *model) handleCommand(input string) tea.Cmd {
 	m.currentBuffer.Reset()
 	m.streamChan = make(chan StreamMessage, 10)
 
-	go streamOllama(context.Background(), m.modelName, m.chatHistory, m.streamChan)
+	ctx, cancel := context.WithCancel(context.Background())
+	m.streamCancel = cancel
+
+	go streamRKLLM(ctx, m.modelName, m.chatHistory, m.streamChan)
 	return waitForStream(m.streamChan)
 }
 

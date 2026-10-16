@@ -21,10 +21,10 @@ type LLMHandle unsafe.Pointer
 type LLMCallState int32
 
 const (
-	RKLLM_RUN_NORMAL LLMCallState = 0
-	RKLLM_RUN_WAITING             = 1
-	RKLLM_RUN_FINISH              = 2
-	RKLLM_RUN_ERROR               = 3
+	RKLLM_RUN_NORMAL  LLMCallState = 0
+	RKLLM_RUN_WAITING              = 1
+	RKLLM_RUN_FINISH               = 2
+	RKLLM_RUN_ERROR                = 3
 )
 
 type RKLLMInputType int32
@@ -78,10 +78,10 @@ type RKLLMCallback struct {
 }
 
 type RKLLMInferParam struct {
-	Mode               RKLLMInferMode
-	LoraParams         unsafe.Pointer
-	PromptCacheParams  unsafe.Pointer
-	ModelParams        unsafe.Pointer
+	Mode              RKLLMInferMode
+	LoraParams        unsafe.Pointer
+	PromptCacheParams unsafe.Pointer
+	ModelParams       unsafe.Pointer
 }
 
 type functionPointer uintptr
@@ -109,6 +109,23 @@ func getRKLLMLibPath() string {
 	return "librkllmrt.so"
 }
 
+func getRKLLMModelsDir() string {
+	if dir := os.Getenv("RKLLM_MODELS_DIR"); dir != "" {
+		return dir
+	}
+	if homeDir, err := os.UserHomeDir(); err == nil {
+		return filepath.Join(homeDir, "rkllama-models")
+	}
+	return "rkllama-models"
+}
+
+func getDefaultModelName() string {
+	if env := os.Getenv("RKLLM_MODEL"); env != "" {
+		return env
+	}
+	return getRKLLMModelPath("qwen3-4b")
+}
+
 func getRKLLMModelPath(modelName string) string {
 	if path := os.Getenv("RKLLM_MODEL"); path != "" {
 		if _, err := os.Stat(path); err == nil {
@@ -122,7 +139,7 @@ func getRKLLMModelPath(modelName string) string {
 		}
 	}
 
-	baseDir := "/home/scot/rkllama-models"
+	baseDir := getRKLLMModelsDir()
 	target := strings.ToLower(modelName)
 	if target == "" {
 		target = "qwen3-4b"
@@ -157,30 +174,49 @@ func getRKLLMModelPath(modelName string) string {
 	if modelName != "" {
 		return modelName
 	}
-	return DefaultModelName
+	return "qwen3-4b"
 }
 
 type rkllmSession struct {
-	mu           sync.Mutex
+	inferMu      sync.Mutex // Serializes all NPU inferences & session init/teardown
+	mu           sync.Mutex // Protects metadata (initialized, lastStderr, libPath, modelPath, active fields)
 	lib          uintptr
 	handle       LLMHandle
 	modelPath    string
 	libPath      string
+	contextLen   int
 	initialized  bool
 	rkllmRun     func(handle LLMHandle, input *RKLLMInput, inferParams *RKLLMInferParam, userdata unsafe.Pointer) int32
 	rkllmDestroy func(handle LLMHandle) int32
+	rkllmAbort   func(handle LLMHandle) int32
 
 	// Active request state
 	activeChan    chan<- StreamMessage
 	activeBuilder *strings.Builder
 	activeParser  *RkToolParser
+	activeCtx     context.Context
 	lastStderr    string
 	justLoaded    bool
 }
 
 var globalSession rkllmSession
 
+func abortRKLLM() {
+	globalSession.mu.Lock()
+	handle := globalSession.handle
+	abortFn := globalSession.rkllmAbort
+	isInit := globalSession.initialized
+	globalSession.mu.Unlock()
+
+	if isInit && abortFn != nil && handle != nil {
+		abortFn(handle)
+	}
+}
+
 func closeRKLLMSession() {
+	globalSession.inferMu.Lock()
+	defer globalSession.inferMu.Unlock()
+
 	globalSession.mu.Lock()
 	defer globalSession.mu.Unlock()
 
@@ -199,15 +235,13 @@ func captureStderr(fn func() error) (string, error) {
 	if err != nil {
 		return "", fn()
 	}
+	defer r.Close()
 
 	oldStderrFd, err := syscall.Dup(2)
 	if err != nil {
-		r.Close()
 		w.Close()
 		return "", fn()
 	}
-
-	syscall.Dup3(int(w.Fd()), 2, 0)
 
 	outChan := make(chan string, 1)
 	go func() {
@@ -216,23 +250,33 @@ func captureStderr(fn func() error) (string, error) {
 		outChan <- buf.String()
 	}()
 
-	fnErr := fn()
-
-	w.Close()
-	syscall.Dup3(oldStderrFd, 2, 0)
-	syscall.Close(oldStderrFd)
-	r.Close()
+	var fnErr error
+	func() {
+		defer func() {
+			// Always restore stderr, even if fn() panics
+			syscall.Dup3(oldStderrFd, 2, 0)
+			syscall.Close(oldStderrFd)
+			w.Close()
+		}()
+		syscall.Dup3(int(w.Fd()), 2, 0)
+		fnErr = fn()
+	}()
 
 	captured := <-outChan
 	return strings.TrimSpace(captured), fnErr
 }
 
-func ensureSession(modelName string) error {
+func ensureSession(modelName string, contextLen int) error {
+	if contextLen <= 0 {
+		contextLen = getActiveContextLimit()
+	}
 	libPath := getRKLLMLibPath()
 	modelPath := getRKLLMModelPath(modelName)
 
-	if globalSession.initialized && globalSession.modelPath == modelPath && globalSession.libPath == libPath {
+	globalSession.mu.Lock()
+	if globalSession.initialized && globalSession.modelPath == modelPath && globalSession.libPath == libPath && globalSession.contextLen == contextLen {
 		globalSession.justLoaded = false
+		globalSession.mu.Unlock()
 		return nil
 	}
 
@@ -243,32 +287,42 @@ func ensureSession(modelName string) error {
 		globalSession.initialized = false
 		globalSession.handle = nil
 	}
+	lib := globalSession.lib
+	globalSession.mu.Unlock()
 
-	var lib uintptr
 	var handle LLMHandle
 	var rkllmCreateDefaultParam func() RKLLMParam
 	var rkllmInit func(handle *LLMHandle, param *RKLLMParam, callback *RKLLMCallback) int32
 	var rkllmRun func(handle LLMHandle, input *RKLLMInput, inferParams *RKLLMInferParam, userdata unsafe.Pointer) int32
 	var rkllmDestroy func(handle LLMHandle) int32
+	var rkllmAbort func(handle LLMHandle) int32
 
 	capturedStderr, err := captureStderr(func() error {
-		var dlErr error
-		lib, dlErr = purego.Dlopen(libPath, purego.RTLD_NOW|purego.RTLD_GLOBAL)
-		if dlErr != nil {
-			return dlErr
+		if lib == 0 {
+			var dlErr error
+			lib, dlErr = purego.Dlopen(libPath, purego.RTLD_NOW|purego.RTLD_GLOBAL)
+			if dlErr != nil {
+				return dlErr
+			}
 		}
 
 		purego.RegisterLibFunc(&rkllmCreateDefaultParam, lib, "rkllm_createDefaultParam")
 		purego.RegisterLibFunc(&rkllmInit, lib, "rkllm_init")
 		purego.RegisterLibFunc(&rkllmRun, lib, "rkllm_run")
 		purego.RegisterLibFunc(&rkllmDestroy, lib, "rkllm_destroy")
+		purego.RegisterLibFunc(&rkllmAbort, lib, "rkllm_abort")
 
 		callbackFn := func(result *RKLLMResult, userdata unsafe.Pointer, state LLMCallState) uintptr {
 			globalSession.mu.Lock()
 			ch := globalSession.activeChan
 			builder := globalSession.activeBuilder
 			parser := globalSession.activeParser
+			reqCtx := globalSession.activeCtx
 			globalSession.mu.Unlock()
+
+			if reqCtx == nil {
+				reqCtx = context.Background()
+			}
 
 			switch state {
 			case RKLLM_RUN_NORMAL:
@@ -279,24 +333,32 @@ func ensureSession(modelName string) error {
 					}
 					if ch != nil && parser != nil {
 						cleanText, calls := parser.ProcessChunk(text)
-						select {
-						case <-context.Background().Done():
-						default:
-							ch <- StreamMessage{
+						if cleanText != "" || len(calls) > 0 {
+							select {
+							case <-reqCtx.Done():
+								return 1
+							case ch <- StreamMessage{
 								Content:   cleanText,
 								ToolCalls: calls,
 								Done:      false,
+							}:
 							}
 						}
 					}
 				}
 			case RKLLM_RUN_FINISH:
 				if ch != nil {
-					ch <- StreamMessage{Done: true}
+					select {
+					case <-reqCtx.Done():
+					case ch <- StreamMessage{Done: true}:
+					}
 				}
 			case RKLLM_RUN_ERROR:
 				if ch != nil {
-					ch <- StreamMessage{Err: fmt.Errorf("rkllm execution error"), Done: true}
+					select {
+					case <-reqCtx.Done():
+					case ch <- StreamMessage{Err: fmt.Errorf("rkllm execution error"), Done: true}:
+					}
 				}
 			}
 			return 0
@@ -310,8 +372,12 @@ func ensureSession(modelName string) error {
 
 		param := rkllmCreateDefaultParam()
 		param.ModelPath = goStringToBytePtr(modelPath)
-		param.MaxContextLen = 4096
-		param.MaxNewTokens = 512
+		param.MaxContextLen = int32(contextLen)
+		newTokens := int32(512)
+		if contextLen >= 16384 {
+			newTokens = 1024
+		}
+		param.MaxNewTokens = newTokens
 
 		if ret := rkllmInit(&handle, &param, &cbStruct); ret != 0 {
 			return fmt.Errorf("rkllm_init failed (model: %s): %d", modelPath, ret)
@@ -326,27 +392,34 @@ func ensureSession(modelName string) error {
 		return err
 	}
 
+	globalSession.mu.Lock()
 	globalSession.lib = lib
 	globalSession.handle = handle
 	globalSession.modelPath = modelPath
 	globalSession.libPath = libPath
+	globalSession.contextLen = contextLen
 	globalSession.rkllmRun = rkllmRun
 	globalSession.rkllmDestroy = rkllmDestroy
+	globalSession.rkllmAbort = rkllmAbort
 	globalSession.initialized = true
 	globalSession.lastStderr = capturedStderr
 	globalSession.justLoaded = true
+	globalSession.mu.Unlock()
 
 	return nil
 }
 
 func streamRKLLM(ctx context.Context, modelName string, history []Message, channel chan<- StreamMessage) {
-	globalSession.mu.Lock()
-	if err := ensureSession(modelName); err != nil {
-		globalSession.mu.Unlock()
+	globalSession.inferMu.Lock()
+	defer globalSession.inferMu.Unlock()
+
+	contextLen := getActiveContextLimit()
+	if err := ensureSession(modelName, contextLen); err != nil {
 		channel <- StreamMessage{Err: err, Done: true}
 		return
 	}
 
+	globalSession.mu.Lock()
 	justLoaded := globalSession.justLoaded
 	lastStderr := globalSession.lastStderr
 	globalSession.justLoaded = false
@@ -355,15 +428,29 @@ func streamRKLLM(ctx context.Context, modelName string, history []Message, chann
 	globalSession.activeChan = channel
 	globalSession.activeBuilder = nil
 	globalSession.activeParser = rkParser
+	globalSession.activeCtx = ctx
 	runFn := globalSession.rkllmRun
 	handle := globalSession.handle
 	globalSession.mu.Unlock()
 
+	defer func() {
+		globalSession.mu.Lock()
+		globalSession.activeChan = nil
+		globalSession.activeParser = nil
+		globalSession.activeCtx = nil
+		globalSession.mu.Unlock()
+	}()
+
 	// If the model was just loaded and emitted stderr logs, send them as a system message first
 	if justLoaded && lastStderr != "" {
-		channel <- StreamMessage{
+		select {
+		case <-ctx.Done():
+			channel <- StreamMessage{Err: ctx.Err(), Done: true}
+			return
+		case channel <- StreamMessage{
 			Content: fmt.Sprintf("[Runtime Stderr Logs during initialization]:\n%s\n\n", lastStderr),
 			Done:    false,
+		}:
 		}
 	}
 
@@ -400,24 +487,38 @@ func streamRKLLM(ctx context.Context, modelName string, history []Message, chann
 	}
 
 	if ret := runFn(handle, &input, &inferParams, nil); ret != 0 {
-		channel <- StreamMessage{Err: fmt.Errorf("rkllm_run failed: %d", ret), Done: true}
+		select {
+		case <-ctx.Done():
+		case channel <- StreamMessage{Err: fmt.Errorf("rkllm_run failed: %d", ret), Done: true}:
+		}
 	}
 }
 
 func runRKLLMSummary(modelName string, messages []Message) (string, error) {
-	globalSession.mu.Lock()
-	if err := ensureSession(modelName); err != nil {
-		globalSession.mu.Unlock()
+	globalSession.inferMu.Lock()
+	defer globalSession.inferMu.Unlock()
+
+	contextLen := getActiveContextLimit()
+	if err := ensureSession(modelName, contextLen); err != nil {
 		return "", err
 	}
 
 	var sb strings.Builder
+	globalSession.mu.Lock()
 	globalSession.activeChan = nil
 	globalSession.activeBuilder = &sb
 	globalSession.activeParser = nil
+	globalSession.activeCtx = context.Background()
 	runFn := globalSession.rkllmRun
 	handle := globalSession.handle
 	globalSession.mu.Unlock()
+
+	defer func() {
+		globalSession.mu.Lock()
+		globalSession.activeBuilder = nil
+		globalSession.activeCtx = nil
+		globalSession.mu.Unlock()
+	}()
 
 	runtime.LockOSThread()
 	defer runtime.UnlockOSThread()
@@ -446,6 +547,7 @@ func checkRKLLMStatus() string {
 	globalSession.mu.Lock()
 	loaded := globalSession.initialized
 	stderr := globalSession.lastStderr
+	ctxLen := globalSession.contextLen
 	globalSession.mu.Unlock()
 
 	status := "Loaded in NPU memory"
@@ -453,7 +555,7 @@ func checkRKLLMStatus() string {
 		status = "Not currently loaded"
 	}
 
-	res := fmt.Sprintf("RKLLM runtime OK (lib: %s, model: %s, status: %s)", libPath, modelPath, status)
+	res := fmt.Sprintf("RKLLM runtime OK (lib: %s, model: %s, context: %d tokens, status: %s)", libPath, modelPath, ctxLen, status)
 	if stderr != "" {
 		res += fmt.Sprintf("\nLast Stderr logs:\n%s", stderr)
 	}
@@ -464,7 +566,7 @@ func listRKLLMModels() []string {
 	var models []string
 	seen := make(map[string]bool)
 
-	baseDir := "/home/scot/rkllama-models"
+	baseDir := getRKLLMModelsDir()
 	_ = filepath.WalkDir(baseDir, func(path string, d fs.DirEntry, err error) error {
 		if err == nil && !d.IsDir() && strings.HasSuffix(strings.ToLower(d.Name()), ".rkllm") {
 			if !seen[path] {

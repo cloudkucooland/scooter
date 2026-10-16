@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"crypto/sha256"
 	"encoding/json"
 	"fmt"
 	"os"
@@ -15,15 +16,52 @@ import (
 var workingDir string
 
 func getCacheFile() (string, error) {
+	if custom := os.Getenv("SCOOTER_CACHE_FILE"); custom != "" {
+		dir := filepath.Dir(custom)
+		if err := os.MkdirAll(dir, 0755); err != nil {
+			return "", fmt.Errorf("mkdir error: %w", err)
+		}
+		return custom, nil
+	}
+
 	cacheDir, err := os.UserCacheDir()
 	if err != nil {
 		return "", fmt.Errorf("user cache dir error: %w", err)
 	}
-	agentDir := filepath.Join(cacheDir, "agent")
-	if err := os.MkdirAll(agentDir, 0755); err != nil {
+
+	scooterDir := filepath.Join(cacheDir, "scooter")
+	if customDir := os.Getenv("SCOOTER_CACHE_DIR"); customDir != "" {
+		scooterDir = customDir
+	}
+	if err := os.MkdirAll(scooterDir, 0755); err != nil {
 		return "", fmt.Errorf("mkdir error: %w", err)
 	}
-	return filepath.Join(agentDir, "session.jsonl"), nil
+
+	targetDir := workingDir
+	if targetDir == "" {
+		if cwd, err := os.Getwd(); err == nil {
+			targetDir, _ = filepath.Abs(cwd)
+		}
+	}
+
+	hash := sha256.Sum256([]byte(targetDir))
+	hashHex := fmt.Sprintf("%x", hash)[:12]
+	base := filepath.Base(targetDir)
+	if base == "" || base == "." || base == "/" {
+		base = "root"
+	}
+	var cleanBase strings.Builder
+	for _, r := range base {
+		if (r >= 'a' && r <= 'z') || (r >= 'A' && r <= 'Z') || (r >= '0' && r <= '9') || r == '-' || r == '_' {
+			cleanBase.WriteRune(r)
+		}
+	}
+	slug := cleanBase.String()
+	if slug == "" {
+		slug = "workspace"
+	}
+
+	return filepath.Join(scooterDir, fmt.Sprintf("%s-%s.jsonl", slug, hashHex)), nil
 }
 
 func clearCache() {
@@ -96,17 +134,13 @@ func loadHydrationContext() *Message {
 	return nil
 }
 
-func streamOllama(ctx context.Context, modelName string, history []Message, channel chan<- StreamMessage) {
-	streamRKLLM(ctx, modelName, history, channel)
-}
-
 func buildToolInstructions(tools []Tool) string {
 	var sb strings.Builder
 	sb.WriteString("You can call available local tools when necessary. Do not claim that a tool was run unless a Tool result is present.\n")
 	sb.WriteString("For a tool call, output only this exact JSON object between the markers, with no Markdown or commentary inside the markers:\n")
 	sb.WriteString("[TOOL_CALL]{\"name\":\"TOOL_NAME\",\"arguments\":{}}[/TOOL_CALL]\n")
 	sb.WriteString("Use valid JSON: double-quote keys and string values; arguments must be an object. A response may contain multiple complete tool calls. Otherwise, answer in plain text.\n\n")
-	fmt.Fprintf(&sb, "All directory calls must be relative to the current working directory: %s.\n\n", workingDir)
+	fmt.Fprintf(&sb, "File and directory operations are restricted to the working directory: %s (paths may be relative or absolute within this directory).\n\n", workingDir)
 	sb.WriteString("Available tools:\n")
 
 	sortedTools := append([]Tool(nil), tools...)
@@ -156,6 +190,9 @@ func sendStreamMsg(ctx context.Context, ch chan<- StreamMessage, msg StreamMessa
 }
 
 func main() {
+	defer closeLogger()
+	defer closeRKLLMSession()
+
 	cwd, err := os.Getwd()
 	if err != nil {
 		panic(err)

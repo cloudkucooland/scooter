@@ -1,19 +1,98 @@
 package main
 
 import (
+	"fmt"
+	"os"
+	"regexp"
 	"strings"
+	"sync"
 	"unicode/utf8"
 )
 
 const (
-	ModelContextTokens       = 4096
-	ResponseReserveTokens    = 768
+	DefaultContextTokens     = 4096
+	MinContextTokens         = 1024
+	MaxContextTokens         = 128 * 1024
 	ContextSafetyTokens      = 256
 	SummaryReserveTokens     = 512
-	SummaryInputTokenLimit   = 2048
 	HydrationTokenLimit      = 1000
 	conversationSummaryLabel = "Conversation summary:\n"
 )
+
+var (
+	contextMu          sync.RWMutex
+	activeContextLimit = DefaultContextTokens
+	contextPathRegex   = regexp.MustCompile(`(?i)(?:ctx|[-_/])(\d{1,3})k\b`)
+)
+
+func getActiveContextLimit() int {
+	contextMu.RLock()
+	defer contextMu.RUnlock()
+	return activeContextLimit
+}
+
+func setActiveContextLimit(tokens int) int {
+	if tokens < MinContextTokens {
+		tokens = MinContextTokens
+	}
+	if tokens > MaxContextTokens {
+		tokens = MaxContextTokens
+	}
+	contextMu.Lock()
+	activeContextLimit = tokens
+	contextMu.Unlock()
+	return tokens
+}
+
+func getResponseReserveTokens(limit int) int {
+	if limit >= 16384 {
+		return 1536
+	} else if limit >= 8192 {
+		return 1024
+	}
+	return 768
+}
+
+func parseContextSize(raw string) (int, error) {
+	s := strings.TrimSpace(strings.ToLower(raw))
+	s = strings.TrimPrefix(s, "ctx")
+	if strings.HasSuffix(s, "k") {
+		numStr := strings.TrimSuffix(s, "k")
+		var k int
+		if _, err := fmt.Sscanf(numStr, "%d", &k); err != nil || k <= 0 {
+			return 0, fmt.Errorf("invalid context size %q", raw)
+		}
+		return k * 1024, nil
+	}
+	var tokens int
+	if _, err := fmt.Sscanf(s, "%d", &tokens); err != nil || tokens <= 0 {
+		return 0, fmt.Errorf("invalid context size %q", raw)
+	}
+	return tokens, nil
+}
+
+func detectContextLength(path string) int {
+	if env := os.Getenv("RKLLM_CONTEXT_LEN"); env != "" {
+		if tokens, err := parseContextSize(env); err == nil && tokens >= MinContextTokens {
+			return tokens
+		}
+	}
+	if env := os.Getenv("RKLLM_CONTEXT"); env != "" {
+		if tokens, err := parseContextSize(env); err == nil && tokens >= MinContextTokens {
+			return tokens
+		}
+	}
+
+	matches := contextPathRegex.FindStringSubmatch(path)
+	if len(matches) > 1 {
+		var k int
+		if _, err := fmt.Sscanf(matches[1], "%d", &k); err == nil && k > 0 {
+			return k * 1024
+		}
+	}
+
+	return DefaultContextTokens
+}
 
 // estimateTokens deliberately overestimates normal English and source code.
 // It is only used to leave safe room in a fixed-size model context.
@@ -29,11 +108,13 @@ func estimateMessageTokens(msg Message) int {
 }
 
 func historyNeedsCompression(history []Message) bool {
+	limit := getActiveContextLimit()
+	reserve := getResponseReserveTokens(limit)
 	total := estimateTokens(buildToolInstructions(getSystemTools())) + 4
 	for _, msg := range history {
 		total += estimateMessageTokens(msg)
 	}
-	return total+ResponseReserveTokens+ContextSafetyTokens > ModelContextTokens
+	return total+reserve+ContextSafetyTokens > limit
 }
 
 // planCompression retains system context and as much recent conversation as
@@ -57,7 +138,9 @@ func planCompression(history []Message, force bool) (source, retained []Message)
 		return source, retained
 	}
 
-	budget := ModelContextTokens - ResponseReserveTokens - ContextSafetyTokens - SummaryReserveTokens
+	limit := getActiveContextLimit()
+	reserve := getResponseReserveTokens(limit)
+	budget := limit - reserve - ContextSafetyTokens - SummaryReserveTokens
 	budget -= estimateTokens(buildToolInstructions(getSystemTools())) + 4
 	for _, msg := range retained {
 		budget -= estimateMessageTokens(msg)
@@ -118,11 +201,4 @@ func truncateToTokenBudget(text string, budget int) string {
 	}
 	half := (maxRunes - 32) / 2
 	return string(runes[:half]) + "\n[... truncated for context budget ...]\n" + string(runes[len(runes)-half:])
-}
-
-func min(a, b int) int {
-	if a < b {
-		return a
-	}
-	return b
 }

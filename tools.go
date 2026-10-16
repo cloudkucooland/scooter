@@ -1,9 +1,11 @@
 package main
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"fmt"
+	"io"
 	"os"
 	"path/filepath"
 	"regexp"
@@ -12,6 +14,37 @@ import (
 
 	"github.com/cloudkucooland/go-kasa"
 )
+
+const maxGrepFileSize = 2 * 1024 * 1024 // 2 MB
+
+var binaryFileExts = map[string]bool{
+	".rkllm": true,
+	".so":    true,
+	".dll":   true,
+	".dylib": true,
+	".bin":   true,
+	".exe":   true,
+	".o":     true,
+	".a":     true,
+	".png":   true,
+	".jpg":   true,
+	".jpeg":  true,
+	".gif":   true,
+	".webp":  true,
+	".ico":   true,
+	".zip":   true,
+	".tar":   true,
+	".gz":    true,
+	".7z":    true,
+	".pdf":   true,
+	".woff":  true,
+	".woff2": true,
+	".ttf":   true,
+	".eot":   true,
+	".mp3":   true,
+	".mp4":   true,
+	".wav":   true,
+}
 
 type Property struct {
 	Type        string   `json:"type"`
@@ -36,7 +69,7 @@ type Tool struct {
 	Function FunctionDefinition `json:"function"`
 }
 
-func getSystemTools() []Tool {
+func getSystemTools() []Tool{
 	return []Tool{
 		{
 			Type: "function",
@@ -46,7 +79,7 @@ func getSystemTools() []Tool {
 				Parameters: Parameters{
 					Type: "object",
 					Properties: map[string]Property{
-						"file_path": {Type: "string", Description: "Absolute output file path location."},
+						"file_path": {Type: "string", Description: "Path of the file to write (relative to working directory or absolute within it)."},
 						"content":   {Type: "string", Description: "Raw text or code contents for the file."},
 					},
 					Required: []string{"file_path", "content"},
@@ -61,7 +94,7 @@ func getSystemTools() []Tool {
 				Parameters: Parameters{
 					Type: "object",
 					Properties: map[string]Property{
-						"file_path": {Type: "string", Description: "Absolute file path location to read."},
+						"file_path": {Type: "string", Description: "Path of the file to read (relative to working directory or absolute within it)."},
 					},
 					Required: []string{"file_path"},
 				},
@@ -75,7 +108,7 @@ func getSystemTools() []Tool {
 				Parameters: Parameters{
 					Type: "object",
 					Properties: map[string]Property{
-						"dir_path": {Type: "string", Description: "Absolute directory path to list."},
+						"dir_path": {Type: "string", Description: "Directory path to list (relative to working directory or absolute within it; '.' for current directory)."},
 					},
 					Required: []string{"dir_path"},
 				},
@@ -126,7 +159,7 @@ func getSystemTools() []Tool {
 					Type: "object",
 					Properties: map[string]Property{
 						"ip":         {Type: "string", Description: "IP address of the device."},
-						"brightness": {Type: "string", Description: "Brightness level from 1 to 100."},
+						"brightness": {Type: "integer", Description: "Brightness level from 1 to 100."},
 					},
 					Required: []string{"ip", "brightness"},
 				},
@@ -147,6 +180,37 @@ func getSystemTools() []Tool {
 			},
 		},
 	}
+}
+
+// FlexibleInt supports unmarshaling integers from JSON numeric literals or quoted strings.
+type FlexibleInt int
+
+func (fi *FlexibleInt) UnmarshalJSON(data []byte) error {
+	data = bytes.TrimSpace(data)
+	if len(data) == 0 || bytes.Equal(data, []byte("null")) {
+		*fi = 0
+		return nil
+	}
+	if data[0] == '"' {
+		var s string
+		if err := json.Unmarshal(data, &s); err != nil {
+			return err
+		}
+		s = strings.TrimSpace(s)
+		s = strings.TrimSuffix(s, "%")
+		var val int
+		if _, err := fmt.Sscanf(s, "%d", &val); err != nil {
+			return fmt.Errorf("invalid integer: %q", s)
+		}
+		*fi = FlexibleInt(val)
+		return nil
+	}
+	var val int
+	if err := json.Unmarshal(data, &val); err != nil {
+		return err
+	}
+	*fi = FlexibleInt(val)
+	return nil
 }
 
 type WriteFileArgs struct {
@@ -172,35 +236,39 @@ type SetDeviceStateArgs struct {
 }
 
 type SetBrightnessArgs struct {
-	IP         string `json:"ip"`
-	Brightness string `json:"brightness"`
+	IP         string      `json:"ip"`
+	Brightness FlexibleInt `json:"brightness"`
 }
 
 type DeviceIPOnlyArgs struct {
 	IP string `json:"ip"`
 }
 
-type SetLEDStateArgs struct {
-	IP    string `json:"ip"`
-	State string `json:"state"`
-}
-
 func validatePath(path string) (string, error) {
-	absPath, err := filepath.Abs(path)
-	if err != nil {
-		return "", err
+	baseDir := workingDir
+	if baseDir == "" {
+		if cwd, err := os.Getwd(); err == nil {
+			baseDir, _ = filepath.Abs(cwd)
+		}
 	}
 
-	rel, err := filepath.Rel(workingDir, absPath)
+	var targetPath string
+	if filepath.IsAbs(path) {
+		targetPath = filepath.Clean(path)
+	} else {
+		targetPath = filepath.Join(baseDir, path)
+	}
+
+	rel, err := filepath.Rel(baseDir, targetPath)
 	if err != nil {
 		return "", err
 	}
 
 	if strings.HasPrefix(rel, "..") || rel == ".." {
-		return "", fmt.Errorf("path %s is outside of allowed directory %s", absPath, workingDir)
+		return "", fmt.Errorf("path %s is outside of allowed directory %s", targetPath, baseDir)
 	}
 
-	return absPath, nil
+	return targetPath, nil
 }
 
 func dispatchToolCall(name string, rawArgs json.RawMessage) string {
@@ -284,31 +352,61 @@ func dispatchToolCall(name string, rawArgs json.RawMessage) string {
 			return fmt.Sprintf("System Error: Invalid regex pattern: %v", err)
 		}
 
-		cwd, err := os.Getwd()
-		if err != nil {
-			return fmt.Sprintf("System Error: Could not get working directory: %v", err)
+		baseDir := workingDir
+		if baseDir == "" {
+			if cwd, err := os.Getwd(); err == nil {
+				baseDir, _ = filepath.Abs(cwd)
+			}
 		}
 
 		var sb strings.Builder
-		err = filepath.WalkDir(cwd, func(path string, d os.DirEntry, err error) error {
+		err = filepath.WalkDir(baseDir, func(path string, d os.DirEntry, err error) error {
 			if err != nil {
 				return err
 			}
 			if d.IsDir() {
-				// Skip .git directory
+				// Skip .git directory and hidden dirs
 				if d.Name() == ".git" {
 					return filepath.SkipDir
 				}
 				return nil
 			}
 
-			content, err := os.ReadFile(path)
+			// Skip non-regular files and files exceeding 2 MB limit
+			info, err := d.Info()
+			if err != nil || !info.Mode().IsRegular() || info.Size() > maxGrepFileSize {
+				return nil
+			}
+
+			// Skip known binary extensions
+			if binaryFileExts[strings.ToLower(filepath.Ext(path))] {
+				return nil
+			}
+
+			f, err := os.Open(path)
 			if err != nil {
-				return nil // Skip files we cannot read
+				return nil // Skip files we cannot open
+			}
+			defer f.Close()
+
+			// Check first 512 bytes for null byte (binary file indicator)
+			header := make([]byte, 512)
+			n, _ := f.Read(header)
+			if bytes.IndexByte(header[:n], 0) != -1 {
+				return nil
+			}
+
+			if _, err := f.Seek(0, io.SeekStart); err != nil {
+				return nil
+			}
+
+			content, err := io.ReadAll(io.LimitReader(f, maxGrepFileSize))
+			if err != nil {
+				return nil
 			}
 
 			if re.Match(content) {
-				rel, _ := filepath.Rel(cwd, path)
+				rel, _ := filepath.Rel(baseDir, path)
 				fmt.Fprintf(&sb, "%s\n", rel)
 			}
 			return nil
@@ -384,9 +482,9 @@ func dispatchToolCall(name string, rawArgs json.RawMessage) string {
 			return fmt.Sprintf("System Error parsing arguments: %v", err)
 		}
 
-		var brightness int
-		if _, err := fmt.Sscanf(args.Brightness, "%d", &brightness); err != nil || brightness < 1 || brightness > 100 {
-			return fmt.Sprintf("System Error: Brightness must be a number between 1 and 100, got '%s'", args.Brightness)
+		brightness := int(args.Brightness)
+		if brightness < 1 || brightness > 100 {
+			return fmt.Sprintf("System Error: Brightness must be a number between 1 and 100, got %d", brightness)
 		}
 
 		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
