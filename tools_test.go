@@ -408,6 +408,29 @@ func TestToolsets(t *testing.T) {
 		t.Fatalf("expected 'get_devices' tool in home toolset")
 	}
 
+	if err := SetActiveToolset("web"); err != nil {
+		t.Fatalf("unexpected error setting toolset web: %v", err)
+	}
+	if GetActiveToolset() != "web" {
+		t.Fatalf("expected web toolset, got %q", GetActiveToolset())
+	}
+	webTools := getSystemTools()
+	foundWebFetch := false
+	for _, tool := range webTools {
+		if tool.Function.Name == "web_fetch" {
+			foundWebFetch = true
+		}
+		if tool.Function.Name == "apply_patch" {
+			t.Fatalf("expected development tool 'apply_patch' to be excluded in web toolset")
+		}
+		if tool.Function.Name == "get_devices" {
+			t.Fatalf("expected home tool 'get_devices' to be excluded in web toolset")
+		}
+	}
+	if !foundWebFetch {
+		t.Fatalf("expected 'web_fetch' tool in web toolset")
+	}
+
 	if err := SetActiveToolset("invalid_set"); err == nil {
 		t.Fatalf("expected error setting invalid toolset, got nil")
 	}
@@ -437,5 +460,21 @@ func TestOutsourceToolValidation(t *testing.T) {
 	res = dispatchToolCall("outsource", rawArgs)
 	if !strings.Contains(res, "Google API key is not configured") {
 		t.Fatalf("expected API key not configured error, got: %q", res)
+	}
+}
+
+func TestWebFetchToolValidation(t *testing.T) {
+	// Empty prompt
+	rawArgs, _ := json.Marshal(WebFetchArgs{Prompt: ""})
+	res := dispatchToolCall("web_fetch", rawArgs)
+	if !strings.Contains(res, "prompt is required") {
+		t.Fatalf("expected prompt required error, got: %q", res)
+	}
+
+	// Prompt without valid URL
+	rawArgs, _ = json.Marshal(WebFetchArgs{Prompt: "Please summarize this text without urls"})
+	res = dispatchToolCall("web_fetch", rawArgs)
+	if !strings.Contains(res, "no valid HTTP/HTTPS URLs found in prompt") {
+		t.Fatalf("expected no valid URLs error, got: %q", res)
 	}
 }

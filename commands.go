@@ -47,9 +47,9 @@ func listToolsetsCmd() tea.Cmd {
 	}
 }
 
-func statusCmd() tea.Cmd {
+func statusCmd(modelName string) tea.Cmd {
 	return func() tea.Msg {
-		status := checkRKLLMStatus()
+		status := checkRKLLMStatus(modelName)
 		return StatusMessage{Status: status}
 	}
 }

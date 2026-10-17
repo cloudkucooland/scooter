@@ -550,14 +550,18 @@ func runRKLLMSummary(modelName string, messages []Message) (string, error) {
 	return sb.String(), nil
 }
 
-func checkRKLLMStatus() string {
+func checkRKLLMStatus(modelName string) string {
 	libPath := getRKLLMLibPath()
-	modelPath := getRKLLMModelPath("")
 	globalSession.mu.Lock()
 	loaded := globalSession.initialized
 	stderr := globalSession.lastStderr
 	ctxLen := globalSession.contextLen
+	modelPath := globalSession.modelPath
 	globalSession.mu.Unlock()
+
+	if modelPath == "" {
+		modelPath = getRKLLMModelPath(modelName)
+	}
 
 	status := "Loaded in NPU memory"
 	if !loaded {

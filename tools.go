@@ -7,6 +7,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"net/http"
 	"os"
 	"os/exec"
 	"path"
@@ -87,10 +88,12 @@ func SetActiveToolset(name string) error {
 		activeToolset = "development"
 	case "home", "kasa", "iot":
 		activeToolset = "home"
+	case "web", "net", "internet":
+		activeToolset = "web"
 	case "all", "every":
 		activeToolset = "all"
 	default:
-		return fmt.Errorf("unknown toolset %q (available: development, home, all)", name)
+		return fmt.Errorf("unknown toolset %q (available: development, home, web, all)", name)
 	}
 	return nil
 }
@@ -99,7 +102,30 @@ func listToolsetsNames() []string {
 	return []string{
 		"development (dev)",
 		"home (kasa, iot)",
+		"web (internet)",
 		"all (default)",
+	}
+}
+
+func getWebTools() []Tool {
+	return []Tool{
+		{
+			Type: "function",
+			Function: FunctionDefinition{
+				Name:        "web_fetch",
+				Description: "Processes content from URL(s) embedded in a prompt. Include up to 20 URLs and instructions (e.g., summarize, extract specific data) directly in the 'prompt' parameter.",
+				Parameters: Parameters{
+					Type: "object",
+					Properties: map[string]Property{
+						"prompt": {
+							Type:        "string",
+							Description: "A prompt containing URL(s) (up to 20) to fetch and instructions on how to process their content. URLs must start with http:// or https://.",
+						},
+					},
+					Required: []string{"prompt"},
+				},
+			},
+		},
 	}
 }
 
@@ -330,11 +356,87 @@ func getSystemTools() []Tool {
 		return getDevelopmentTools()
 	case "home":
 		return getHomeTools()
+	case "web":
+		return getWebTools()
 	case "all":
 		fallthrough
 	default:
-		return append(getDevelopmentTools(), getHomeTools()...)
+		return append(append(getDevelopmentTools(), getHomeTools()...), getWebTools()...)
 	}
+}
+
+type WebFetchArgs struct {
+	Prompt string `json:"prompt"`
+}
+
+func webFetch(prompt string) string {
+	prompt = strings.TrimSpace(prompt)
+	if prompt == "" {
+		return "System Error: prompt is required"
+	}
+
+	urlRegex := regexp.MustCompile(`https?://[^\s"'<>]+`)
+	matches := urlRegex.FindAllString(prompt, 20)
+	if len(matches) == 0 {
+		if strings.HasPrefix(prompt, "http://") || strings.HasPrefix(prompt, "https://") {
+			matches = []string{prompt}
+		} else {
+			return "System Error: no valid HTTP/HTTPS URLs found in prompt"
+		}
+	}
+
+	seen := make(map[string]bool)
+	var uniqueUrls []string
+	for _, u := range matches {
+		u = strings.TrimRight(u, ".,;:!?)")
+		if !seen[u] {
+			seen[u] = true
+			uniqueUrls = append(uniqueUrls, u)
+		}
+	}
+
+	var sb strings.Builder
+	client := &http.Client{
+		Timeout: 30 * time.Second,
+	}
+
+	for _, u := range uniqueUrls {
+		req, err := http.NewRequestWithContext(context.Background(), "GET", u, nil)
+		if err != nil {
+			fmt.Fprintf(&sb, "<source url=\"%s\">\nError creating request: %v\n</source>\n", sanitizeXmlForSource(u), err)
+			continue
+		}
+		req.Header.Set("User-Agent", "Scooter/1.0 (+https://github.com/cloudkucooland/scooter)")
+
+		resp, err := client.Do(req)
+		if err != nil {
+			fmt.Fprintf(&sb, "<source url=\"%s\">\nError fetching URL: %v\n</source>\n", sanitizeXmlForSource(u), err)
+			continue
+		}
+		defer resp.Body.Close()
+
+		bodyBytes, err := io.ReadAll(io.LimitReader(resp.Body, 1024*1024))
+		if err != nil {
+			fmt.Fprintf(&sb, "<source url=\"%s\">\nError reading response body: %v\n</source>\n", sanitizeXmlForSource(u), err)
+			continue
+		}
+
+		content := string(bodyBytes)
+		if len(content) > 100*1024 {
+			content = content[:100*1024] + "\n[content truncated at 100KB]"
+		}
+
+		fmt.Fprintf(&sb, "<source url=\"%s\">\n%s\n</source>\n", sanitizeXmlForSource(u), sanitizeXmlForSource(content))
+	}
+
+	return sb.String()
+}
+
+func sanitizeXmlForSource(s string) string {
+	s = strings.ReplaceAll(s, "&", "&amp;")
+	s = strings.ReplaceAll(s, "<", "&lt;")
+	s = strings.ReplaceAll(s, ">", "&gt;")
+	return s
 }
 
 // FlexibleInt supports unmarshaling integers from JSON numeric literals or quoted strings.
@@ -848,6 +950,13 @@ func dispatchToolCall(name string, rawArgs json.RawMessage) string {
 		}
 
 		return result.Text()
+
+	case "web_fetch":
+		var args WebFetchArgs
+		if err := json.Unmarshal(rawArgs, &args); err != nil {
+			return fmt.Sprintf("System Error parsing arguments: %v", err)
+		}
+		return webFetch(args.Prompt)
 
 	case "git_status", "git_diff":
 		var args GitPathArgs
