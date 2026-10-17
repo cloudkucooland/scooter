@@ -26,8 +26,15 @@ type StatusMessage struct {
 }
 
 type Message struct {
-	Role    string `json:"role"` // "system", "user", "assistant", "tool"
-	Content string `json:"content"`
+	Role      string     `json:"role"` // "system", "user", "assistant", "tool"
+	Content   string     `json:"content"`
+	ToolName  string     `json:"tool_name,omitempty"`
+	ToolCalls []ToolCall `json:"tool_calls,omitempty"`
+}
+
+type ToolExecutionResult struct {
+	Call   ToolCall
+	Result string
 }
 
 type StreamMessage struct {

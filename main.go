@@ -8,6 +8,7 @@ import (
 	"path/filepath"
 	"sort"
 	"strings"
+	"time"
 
 	tea "github.com/charmbracelet/bubbletea"
 )
@@ -158,6 +159,7 @@ func buildToolInstructions(tools []Tool) string {
 	sb.WriteString("[TOOL_CALL]{\"name\":\"TOOL_NAME\",\"arguments\":{}}[/TOOL_CALL]\n")
 	sb.WriteString("Use valid JSON: double-quote keys and string values; arguments must be an object. A response may contain multiple complete tool calls. If reasoning or thinking through steps, always conclude your response with the required `[TOOL_CALL]` block to invoke the tool. Otherwise, answer in plain text.\n\n")
 	fmt.Fprintf(&sb, "File and directory operations are restricted to the working directory: %s (paths may be relative or absolute within this directory).\n\n", workingDir)
+	sb.WriteString("Tool calls and their named results are retained in the conversation. After a tool succeeds, use its result and do not repeat the same call unless the user explicitly asks again. If a tool call fails, explain the failure or try a different approach instead of repeating the same malformed call.\n\n")
 	sb.WriteString("Available tools:\n")
 
 	sortedTools := append([]Tool(nil), tools...)
@@ -208,7 +210,18 @@ func contains(values []string, target string) bool {
 
 func main() {
 	defer closeLogger()
-	defer closeRKLLMSession()
+	defer func() {
+		closed := make(chan struct{})
+		go func() {
+			closeRKLLMSession()
+			close(closed)
+		}()
+		select {
+		case <-closed:
+		case <-time.After(2 * time.Second):
+			logDebug("RKLLM session teardown did not finish within 2 seconds; exiting")
+		}
+	}()
 
 	cwd, err := os.Getwd()
 	if err != nil {

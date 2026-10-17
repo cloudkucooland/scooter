@@ -6,11 +6,14 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"reflect"
 	"strings"
+	"time"
 
 	"github.com/charmbracelet/bubbles/textarea"
 	"github.com/charmbracelet/bubbles/viewport"
 	tea "github.com/charmbracelet/bubbletea"
+	"github.com/charmbracelet/glamour"
 	"github.com/charmbracelet/lipgloss"
 )
 
@@ -28,17 +31,38 @@ var (
 )
 
 type model struct {
-	viewport       viewport.Model
-	textarea       textarea.Model
-	modelName      string
-	contextLen     int
-	chatHistory    []Message
-	isStreaming    bool
-	streamCancel   context.CancelFunc
-	currentBuffer  *strings.Builder
-	streamChan     chan StreamMessage
-	pendingTools   []ToolCall
-	confirmingTool *ToolCall
+	viewport            viewport.Model
+	textarea            textarea.Model
+	modelName           string
+	contextLen          int
+	chatHistory         []Message
+	isStreaming         bool
+	streamCancel        context.CancelFunc
+	currentBuffer       *strings.Builder
+	streamChan          chan StreamMessage
+	pendingTools        []ToolCall
+	confirmingTool      *ToolCall
+	markdownWidth       int
+	markdownCache       map[string]string
+	streamRenderPending bool
+	isProcessingTool    bool
+	toolRounds          int
+	toolCallCount       int
+	seenToolCalls       map[string]bool
+}
+
+const streamRenderInterval = 75 * time.Millisecond
+
+const (
+	maxToolRoundsPerTurn = 5
+	maxToolCallsPerTurn  = 10
+)
+
+type streamRenderTick struct{}
+
+type markdownRenderedMsg struct {
+	width    int
+	rendered map[string]string
 }
 
 func (m *model) saveMessage(msg Message) {
@@ -51,7 +75,7 @@ func (m *model) saveMessage(msg Message) {
 		// that message last so the UI remains in chronological order while the
 		// persistence failure is still visible.
 		m.chatHistory = append(m.chatHistory, errorMessage)
-		if len(m.chatHistory) >= 2 && m.chatHistory[len(m.chatHistory)-2] == msg {
+		if len(m.chatHistory) >= 2 && reflect.DeepEqual(m.chatHistory[len(m.chatHistory)-2], msg) {
 			last := len(m.chatHistory) - 1
 			m.chatHistory[last-1], m.chatHistory[last] = m.chatHistory[last], m.chatHistory[last-1]
 		}
@@ -88,7 +112,6 @@ func initialModel() model {
 		currentBuffer: &strings.Builder{},
 	}
 
-	m.refreshViewport()
 	return m
 }
 
@@ -227,7 +250,14 @@ func (m *model) buildDisplayString() string {
 		case "user":
 			sb.WriteString("User: " + msg.Content + "\n\n")
 		case "assistant":
-			sb.WriteString("AI: " + msg.Content + "\n\n")
+			sb.WriteString("AI:\n")
+			if msg.Content != "" {
+				sb.WriteString(m.renderAssistantMessage(msg))
+				sb.WriteString("\n")
+			}
+			for _, call := range msg.ToolCalls {
+				sb.WriteString("Tool call: " + call.Function.Name + " " + string(call.Function.Arguments) + "\n")
+			}
 		case "system":
 			sb.WriteString("System: " + msg.Content + "\n\n")
 		case "tool":
@@ -245,7 +275,11 @@ func (m *model) buildDisplayString() string {
 				Foreground(lipgloss.Color("42")).
 				Padding(0, 1)
 
-			summary := fmt.Sprintf("⚙️ Tool Result [%d lines / %d chars]\n  %s", len(lines), len(msg.Content), preview)
+			toolLabel := "Tool Result"
+			if msg.ToolName != "" {
+				toolLabel += " [" + msg.ToolName + "]"
+			}
+			summary := fmt.Sprintf("⚙️ %s [%d lines / %d chars]\n  %s", toolLabel, len(lines), len(msg.Content), preview)
 			sb.WriteString(toolBoxStyle.Render(summary) + "\n\n")
 		}
 	}
@@ -255,20 +289,44 @@ func (m *model) buildDisplayString() string {
 	return sb.String()
 }
 
-func (m *model) refreshViewport() {
-	if m.viewport.Width > 0 {
-		wrapped := lipgloss.NewStyle().
-			Width(m.viewport.Width).
-			Render(m.buildDisplayString())
-		m.viewport.SetContent(wrapped)
-	} else {
-		m.viewport.SetContent(m.buildDisplayString())
+func (m *model) renderAssistantMessage(msg Message) string {
+	if m.markdownWidth == m.viewport.Width {
+		if rendered, ok := m.markdownCache[msg.Content]; ok {
+			return rendered
+		}
 	}
-	m.viewport.GotoBottom()
+	return msg.Content
+}
+
+func renderMarkdownCmd(messages []Message, width int) tea.Cmd {
+	if width <= 0 {
+		width = 80
+	}
+	toRender := append([]Message(nil), messages...)
+	return func() tea.Msg {
+		renderer, err := glamour.NewTermRenderer(
+			glamour.WithStandardStyle("dark"),
+			glamour.WithWordWrap(width),
+		)
+		if err != nil {
+			return markdownRenderedMsg{width: width}
+		}
+		rendered := make(map[string]string)
+		for _, msg := range toRender {
+			if msg.Role != "assistant" {
+				continue
+			}
+			formatted, err := renderer.Render(msg.Content)
+			if err == nil {
+				rendered[msg.Content] = formatted
+			}
+		}
+		return markdownRenderedMsg{width: width, rendered: rendered}
+	}
 }
 
 func (m model) Init() tea.Cmd {
-	return textarea.Blink
+	return tea.Batch(textarea.Blink, renderMarkdownCmd(m.chatHistory, m.viewport.Width))
 }
 
 func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
@@ -278,6 +336,20 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	)
 
 	switch msg := msg.(type) {
+	case markdownRenderedMsg:
+		if msg.width != m.viewport.Width {
+			return m, nil
+		}
+		if m.markdownCache == nil {
+			m.markdownCache = make(map[string]string)
+		}
+		m.markdownWidth = msg.width
+		for content, formatted := range msg.rendered {
+			m.markdownCache[content] = formatted
+		}
+		m.refreshViewport()
+		return m, nil
+
 	case tea.WindowSizeMsg:
 		headerHeight := 1
 		statusBarHeight := 1
@@ -288,10 +360,29 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.viewport.Style = m.viewport.Style.Width(msg.Width)
 
 		m.textarea.SetWidth(msg.Width)
-		m.refreshViewport()
-		return m, nil
+		m.markdownWidth = -1
+		m.markdownCache = make(map[string]string)
+		return m, renderMarkdownCmd(m.chatHistory, msg.Width)
 
 	case tea.KeyMsg:
+		input := strings.TrimSpace(m.textarea.Value())
+		isQuit := msg.Type == tea.KeyCtrlC ||
+			(msg.Type == tea.KeyEnter && input != "" && strings.Fields(input)[0] == "/quit")
+		if isQuit {
+			m.pendingTools = nil
+			m.confirmingTool = nil
+			if m.isStreaming {
+				cancel := m.streamCancel
+				go func() {
+					if cancel != nil {
+						cancel()
+					}
+					abortRKLLM()
+				}()
+			}
+			return m, tea.Quit
+		}
+
 		if m.confirmingTool != nil {
 			switch msg.String() {
 			case "y", "Y":
@@ -301,21 +392,17 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				_ = json.Unmarshal(call.Function.Arguments, &args)
 
 				logDebug("Dispatching confirmed shell tool: %s", args.Command)
-				toolOutcomeText := dispatchToolCall(call.Function.Name, call.Function.Arguments)
-				logDebug("Tool outcome: %s", toolOutcomeText)
-				toolMsg := Message{Role: "tool", Content: toolOutcomeText}
-				m.chatHistory = append(m.chatHistory, toolMsg)
-				m.saveMessage(toolMsg)
-				m.refreshViewport()
-
-				return m, m.resumeOrProcessNextTools()
+				m.isProcessingTool = true
+				return m, runToolCallCmd(call)
 
 			case "n", "N", "esc", "q":
+				call := *m.confirmingTool
 				m.confirmingTool = nil
 
-				toolMsg := Message{Role: "tool", Content: "Tool execution cancelled by user."}
+				toolMsg := Message{Role: "tool", ToolName: call.Function.Name, Content: "Tool execution cancelled by user."}
 				m.chatHistory = append(m.chatHistory, toolMsg)
 				m.saveMessage(toolMsg)
+				m.isProcessingTool = false
 				m.refreshViewport()
 
 				return m, m.resumeOrProcessNextTools()
@@ -324,9 +411,6 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		}
 
 		switch msg.Type {
-		case tea.KeyCtrlC:
-			closeRKLLMSession()
-			return m, tea.Quit
 		case tea.KeyCtrlL:
 			m.refreshViewport()
 			return m, tea.ClearScreen
@@ -345,6 +429,8 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 					aiResponse := Message{Role: "assistant", Content: partial + " [aborted]"}
 					m.chatHistory = append(m.chatHistory, aiResponse)
 					m.saveMessage(aiResponse)
+					m.refreshViewport()
+					return m, renderMarkdownCmd([]Message{aiResponse}, m.viewport.Width)
 				} else {
 					m.chatHistory = append(m.chatHistory, Message{
 						Role:    "system",
@@ -355,12 +441,6 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				return m, nil
 			}
 		case tea.KeyEnter:
-			// Prevent submission while model is outputting
-			if m.isStreaming {
-				return m, nil
-			}
-
-			// Allow Shift+Enter for multiline inputs
 			if msg.Alt {
 				m.textarea, tiCmd = m.textarea.Update(msg)
 				return m, tiCmd
@@ -369,6 +449,9 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			input := strings.TrimSpace(m.textarea.Value())
 			if input == "" {
 				m.textarea.Reset()
+				return m, nil
+			}
+			if m.isStreaming || m.isProcessingTool {
 				return m, nil
 			}
 
@@ -383,13 +466,16 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		}
 
 		if msg.Err != nil {
-			m.chatHistory = append(m.chatHistory, Message{Role: "system", Content: "Error: " + msg.Err.Error()})
-			m.refreshViewport()
 			m.isStreaming = false
+			m.isProcessingTool = false
 			if m.streamCancel != nil {
 				m.streamCancel()
 				m.streamCancel = nil
 			}
+			m.currentBuffer.Reset()
+			m.pendingTools = nil
+			m.chatHistory = append(m.chatHistory, Message{Role: "system", Content: "Error: " + msg.Err.Error()})
+			m.refreshViewport()
 			return m, nil
 		}
 
@@ -398,36 +484,61 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				m.streamCancel()
 				m.streamCancel = nil
 			}
-			if m.currentBuffer.Len() > 0 {
-				aiResponse := Message{Role: "assistant", Content: m.currentBuffer.String()}
+			var renderCmd tea.Cmd
+			if m.currentBuffer.Len() > 0 || len(m.pendingTools) > 0 {
+				aiResponse := Message{
+					Role:      "assistant",
+					Content:   m.currentBuffer.String(),
+					ToolCalls: append([]ToolCall(nil), m.pendingTools...),
+				}
 				m.chatHistory = append(m.chatHistory, aiResponse)
 				m.saveMessage(aiResponse)
 				m.currentBuffer.Reset()
+				renderCmd = renderMarkdownCmd([]Message{aiResponse}, m.viewport.Width)
 			}
 			m.isStreaming = false
 
-			// Execute tool calls sequentially with shell confirmation
 			if len(m.pendingTools) > 0 {
-				logDebug("Executing %d pending tool calls", len(m.pendingTools))
-				return m, m.resumeOrProcessNextTools()
+				m.toolRounds++
+				if m.toolRounds > maxToolRoundsPerTurn {
+					m.pendingTools = nil
+					m.chatHistory = append(m.chatHistory, Message{
+						Role:    "system",
+						Content: fmt.Sprintf("Stopped tool execution after %d rounds. Review the results and send a new prompt to continue.", maxToolRoundsPerTurn),
+					})
+					m.refreshViewport()
+					return m, renderCmd
+				}
+				logDebug("Executing %d pending tool calls in round %d", len(m.pendingTools), m.toolRounds)
+				return m, tea.Batch(renderCmd, m.resumeOrProcessNextTools())
 			}
 
 			m.refreshViewport()
-
 			if historyNeedsCompression(m.chatHistory) {
-				return m, compressHistoryCmd(m.modelName, m.chatHistory, false)
+				return m, tea.Batch(renderCmd, compressHistoryCmd(m.modelName, m.chatHistory, false))
 			}
-			return m, nil
+			return m, renderCmd
 		}
 
-		// Stream content accumulation
 		m.currentBuffer.WriteString(msg.Content)
 		if len(msg.ToolCalls) > 0 {
 			m.pendingTools = append(m.pendingTools, msg.ToolCalls...)
 		}
 
-		m.refreshViewport()
+		if !m.streamRenderPending {
+			m.streamRenderPending = true
+			return m, tea.Batch(waitForStream(m.streamChan), tea.Tick(streamRenderInterval, func(time.Time) tea.Msg {
+				return streamRenderTick{}
+			}))
+		}
 		return m, waitForStream(m.streamChan)
+
+	case streamRenderTick:
+		m.streamRenderPending = false
+		if m.isStreaming {
+			m.refreshViewport()
+		}
+		return m, nil
 
 	case SummaryMessage:
 		if msg.Err != nil {
@@ -445,6 +556,14 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		}
 		m.refreshViewport()
 		return m, nil
+
+	case ToolExecutionResult:
+		m.isProcessingTool = false
+		toolMsg := Message{Role: "tool", ToolName: msg.Call.Function.Name, Content: msg.Result}
+		m.chatHistory = append(m.chatHistory, toolMsg)
+		m.saveMessage(toolMsg)
+		m.refreshViewport()
+		return m, m.resumeOrProcessNextTools()
 
 	case ModelsMessage:
 		if msg.Err != nil {
@@ -479,9 +598,18 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	return m, tea.Batch(tiCmd, vpCmd)
 }
 
+func (m *model) refreshViewport() {
+	if m.viewport.Width > 0 {
+		wrapped := lipgloss.NewStyle().Width(m.viewport.Width).Render(m.buildDisplayString())
+		m.viewport.SetContent(wrapped)
+	} else {
+		m.viewport.SetContent(m.buildDisplayString())
+	}
+	m.viewport.GotoBottom()
+}
+
 func (m *model) handleCommand(input string) tea.Cmd {
-	if strings.HasPrefix(input, "/quit") {
-		closeRKLLMSession()
+	if input == "/quit" {
 		return tea.Quit
 	}
 
@@ -629,6 +757,9 @@ func (m *model) handleCommand(input string) tea.Cmd {
 	userMsg := Message{Role: "user", Content: input}
 	m.chatHistory = append(m.chatHistory, userMsg)
 	m.saveMessage(userMsg)
+	m.toolRounds = 0
+	m.toolCallCount = 0
+	m.seenToolCalls = make(map[string]bool)
 
 	m.refreshViewport()
 
@@ -644,9 +775,35 @@ func (m *model) handleCommand(input string) tea.Cmd {
 }
 
 func (m *model) resumeOrProcessNextTools() tea.Cmd {
-	if len(m.pendingTools) > 0 {
+	for len(m.pendingTools) > 0 {
 		call := m.pendingTools[0]
 		m.pendingTools = m.pendingTools[1:]
+		if m.toolCallCount >= maxToolCallsPerTurn {
+			m.pendingTools = nil
+			m.chatHistory = append(m.chatHistory, Message{
+				Role:    "system",
+				Content: fmt.Sprintf("Stopped tool execution after %d tool calls in this turn.", maxToolCallsPerTurn),
+			})
+			m.refreshViewport()
+			return nil
+		}
+		m.toolCallCount++
+		key := toolCallDedupKey(call)
+		if m.seenToolCalls == nil {
+			m.seenToolCalls = make(map[string]bool)
+		}
+		if m.seenToolCalls[key] {
+			toolMsg := Message{
+				Role:     "tool",
+				ToolName: call.Function.Name,
+				Content:  "Duplicate call skipped within this turn.",
+			}
+			m.chatHistory = append(m.chatHistory, toolMsg)
+			m.saveMessage(toolMsg)
+			m.refreshViewport()
+			continue
+		}
+		m.seenToolCalls[key] = true
 
 		if call.Function.Name == "shell" {
 			var args ShellArgs
@@ -662,24 +819,38 @@ func (m *model) resumeOrProcessNextTools() tea.Cmd {
 			return nil
 		}
 
-		logDebug("Dispatching tool: %s", call.Function.Name)
-		toolOutcomeText := dispatchToolCall(call.Function.Name, call.Function.Arguments)
-		logDebug("Tool outcome: %s", toolOutcomeText)
-		toolMsg := Message{Role: "tool", Content: toolOutcomeText}
-		m.chatHistory = append(m.chatHistory, toolMsg)
-		m.saveMessage(toolMsg)
-		m.refreshViewport()
-
-		return m.resumeOrProcessNextTools()
+		m.isProcessingTool = true
+		return runToolCallCmd(call)
 	}
 
 	// Loop tool result back to LLM context
+	m.isProcessingTool = false
 	m.isStreaming = true
 	m.streamChan = make(chan StreamMessage, 10)
 	ctx, cancel := context.WithCancel(context.Background())
 	m.streamCancel = cancel
 	go streamRKLLM(ctx, m.modelName, m.chatHistory, m.streamChan)
 	return waitForStream(m.streamChan)
+}
+
+func runToolCallCmd(call ToolCall) tea.Cmd {
+	return func() tea.Msg {
+		logDebug("Dispatching tool: %s", call.Function.Name)
+		result := dispatchToolCall(call.Function.Name, call.Function.Arguments)
+		logDebug("Tool outcome: %s", result)
+		return ToolExecutionResult{Call: call, Result: result}
+	}
+}
+
+func toolCallDedupKey(call ToolCall) string {
+	arguments := call.Function.Arguments
+	var decoded any
+	if json.Unmarshal(arguments, &decoded) == nil {
+		if normalized, err := json.Marshal(decoded); err == nil {
+			arguments = normalized
+		}
+	}
+	return call.Function.Name + "\x00" + string(arguments)
 }
 
 func waitForStream(ch chan StreamMessage) tea.Cmd {

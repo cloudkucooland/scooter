@@ -1,6 +1,7 @@
 package main
 
 import (
+	"encoding/json"
 	"fmt"
 	"os"
 	"regexp"
@@ -101,7 +102,26 @@ func estimateTokens(text string) int {
 }
 
 func estimateMessageTokens(msg Message) int {
-	return estimateTokens(msg.Role) + estimateTokens(msg.Content) + 4
+	tokens := estimateTokens(msg.Role) + estimateTokens(msg.Content) + estimateTokens(msg.ToolName) + 4
+	for _, call := range msg.ToolCalls {
+		tokens += estimateTokens(toolCallSummaryText(call))
+	}
+	return tokens
+}
+
+func toolCallSummaryText(call ToolCall) string {
+	arguments := call.Function.Arguments
+	if len(arguments) == 0 {
+		arguments = json.RawMessage(`{}`)
+	}
+	payload, err := json.Marshal(struct {
+		Name      string          `json:"name"`
+		Arguments json.RawMessage `json:"arguments"`
+	}{Name: call.Function.Name, Arguments: arguments})
+	if err == nil {
+		return string(payload)
+	}
+	return fmt.Sprintf("name=%q arguments=%q", call.Function.Name, string(arguments))
 }
 
 func historyNeedsCompression(history []Message) bool {
@@ -177,9 +197,18 @@ func renderMessages(messages []Message) string {
 	for _, msg := range messages {
 		sb.WriteString("[")
 		sb.WriteString(msg.Role)
+		if msg.Role == "tool" && msg.ToolName != "" {
+			sb.WriteString(" result from ")
+			sb.WriteString(msg.ToolName)
+		}
 		sb.WriteString("] ")
 		sb.WriteString(msg.Content)
 		sb.WriteString("\n")
+		for _, call := range msg.ToolCalls {
+			sb.WriteString("[assistant tool call] ")
+			sb.WriteString(toolCallSummaryText(call))
+			sb.WriteString("\n")
+		}
 	}
 	return sb.String()
 }

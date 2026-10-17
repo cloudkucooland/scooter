@@ -3,6 +3,7 @@ package main
 import (
 	"bytes"
 	"context"
+	"encoding/json"
 	"fmt"
 	"io"
 	"io/fs"
@@ -476,9 +477,28 @@ func streamRKLLM(ctx context.Context, modelName string, history []Message, chann
 		case "user":
 			prompt.WriteString("User: " + msg.Content + "\n")
 		case "assistant":
-			prompt.WriteString("Assistant: " + msg.Content + "\n")
+			if msg.Content != "" {
+				prompt.WriteString("Assistant: " + msg.Content + "\n")
+			}
+			for _, call := range msg.ToolCalls {
+				arguments := call.Function.Arguments
+				if len(arguments) == 0 {
+					arguments = json.RawMessage(`{}`)
+				}
+				payload, err := json.Marshal(struct {
+					Name      string          `json:"name"`
+					Arguments json.RawMessage `json:"arguments"`
+				}{Name: call.Function.Name, Arguments: arguments})
+				if err == nil {
+					fmt.Fprintf(&prompt, "%s%s%s\n", toolCallStartTag, payload, toolCallEndTag)
+				}
+			}
 		case "tool":
-			prompt.WriteString("Tool result: " + msg.Content + "\n")
+			if msg.ToolName != "" {
+				fmt.Fprintf(&prompt, "Tool result from %s: %s\n", msg.ToolName, msg.Content)
+			} else {
+				prompt.WriteString("Tool result: " + msg.Content + "\n")
+			}
 		}
 	}
 	systemParts = append(systemParts, buildToolInstructions(getSystemTools()))

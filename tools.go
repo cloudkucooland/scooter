@@ -7,7 +7,9 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"net"
 	"net/http"
+	"net/url"
 	"os"
 	"os/exec"
 	"path"
@@ -396,11 +398,50 @@ func webFetch(prompt string) string {
 	}
 
 	var sb strings.Builder
+	dialer := &net.Dialer{Timeout: 10 * time.Second}
+	transport := http.DefaultTransport.(*http.Transport).Clone()
+	transport.DialContext = func(ctx context.Context, network, address string) (net.Conn, error) {
+		host, port, err := net.SplitHostPort(address)
+		if err != nil {
+			return nil, err
+		}
+		ips, err := net.DefaultResolver.LookupIPAddr(ctx, host)
+		if err != nil {
+			return nil, err
+		}
+		if len(ips) == 0 {
+			return nil, fmt.Errorf("host %q resolved to no addresses", host)
+		}
+		for _, resolved := range ips {
+			if prohibitedFetchIP(resolved.IP) {
+				return nil, fmt.Errorf("host %q resolves to prohibited address %s", host, resolved.IP)
+			}
+		}
+		var lastErr error
+		for _, resolved := range ips {
+			conn, dialErr := dialer.DialContext(ctx, network, net.JoinHostPort(resolved.IP.String(), port))
+			if dialErr == nil {
+				return conn, nil
+			}
+			lastErr = dialErr
+		}
+		return nil, lastErr
+	}
 	client := &http.Client{
-		Timeout: 30 * time.Second,
+		Timeout:   30 * time.Second,
+		Transport: transport,
 	}
 
 	for _, u := range uniqueUrls {
+		parsed, err := url.Parse(u)
+		if err != nil || (parsed.Scheme != "http" && parsed.Scheme != "https") || parsed.Hostname() == "" || parsed.User != nil {
+			fmt.Fprintf(&sb, "<source url=\"%s\">\nError fetching URL: invalid HTTP/HTTPS URL\n</source>\n", sanitizeXmlForSource(u))
+			continue
+		}
+		if ip := net.ParseIP(parsed.Hostname()); ip != nil && prohibitedFetchIP(ip) {
+			fmt.Fprintf(&sb, "<source url=\"%s\">\nError fetching URL: prohibited address\n</source>\n", sanitizeXmlForSource(u))
+			continue
+		}
 		req, err := http.NewRequestWithContext(context.Background(), "GET", u, nil)
 		if err != nil {
 			fmt.Fprintf(&sb, "<source url=\"%s\">\nError creating request: %v\n</source>\n", sanitizeXmlForSource(u), err)
@@ -413,9 +454,8 @@ func webFetch(prompt string) string {
 			fmt.Fprintf(&sb, "<source url=\"%s\">\nError fetching URL: %v\n</source>\n", sanitizeXmlForSource(u), err)
 			continue
 		}
-		defer resp.Body.Close()
-
 		bodyBytes, err := io.ReadAll(io.LimitReader(resp.Body, 1024*1024))
+		_ = resp.Body.Close()
 		if err != nil {
 			fmt.Fprintf(&sb, "<source url=\"%s\">\nError reading response body: %v\n</source>\n", sanitizeXmlForSource(u), err)
 			continue
@@ -430,6 +470,24 @@ func webFetch(prompt string) string {
 	}
 
 	return sb.String()
+}
+
+func prohibitedFetchIP(ip net.IP) bool {
+	if ip == nil || ip.IsLoopback() || ip.IsPrivate() || ip.IsLinkLocalUnicast() || ip.IsLinkLocalMulticast() || ip.IsUnspecified() || ip.IsMulticast() || !ip.IsGlobalUnicast() {
+		return true
+	}
+	// Exclude special-purpose and benchmarking ranges not covered by IsPrivate.
+	for _, cidr := range []string{
+		"0.0.0.0/8", "100.64.0.0/10", "192.0.0.0/24", "192.0.2.0/24",
+		"198.18.0.0/15", "198.51.100.0/24", "203.0.113.0/24", "240.0.0.0/4",
+		"2001:db8::/32",
+	} {
+		_, network, _ := net.ParseCIDR(cidr)
+		if network.Contains(ip) {
+			return true
+		}
+	}
+	return false
 }
 
 func sanitizeXmlForSource(s string) string {
