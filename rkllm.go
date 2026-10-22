@@ -3,6 +3,8 @@ package main
 import (
 	"bytes"
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -399,6 +401,16 @@ func ensureSession(modelName string, contextLen int) error {
 		if ret := rkllmInit(&handle, &param, &cbStruct); ret != 0 {
 			return fmt.Errorf("rkllm_init failed (model: %s): %d", modelPath, ret)
 		}
+
+		cfg := loadConfig()
+		if cfg.RKLLMCacheEnabled {
+			systemCacheFile := getPromptCacheFile(modelPath, contextLen)
+			if cacheErr := createSystemPromptCache(rkllmRun, handle, systemCacheFile); cacheErr != nil {
+				// Log or handle non-fatal caching errors
+				fmt.Fprintf(os.Stderr, "Warning: %v\n", cacheErr)
+			}
+		}
+
 		return nil
 	})
 
@@ -426,14 +438,27 @@ func ensureSession(modelName string, contextLen int) error {
 	return nil
 }
 
-func getPromptCacheFile() string {
+func getPromptCacheFile(modelPath string, contextLen int) string {
 	if custom := loadConfig().RKLLMCachePath; custom != "" {
 		return custom
 	}
-	if cacheFile, err := getCacheFile(); err == nil {
-		return cacheFile + ".rkllm_cache"
+
+	baseName := filepath.Base(modelPath)
+	baseName = strings.TrimSuffix(baseName, filepath.Ext(baseName))
+	if baseName == "" {
+		baseName = "default_model"
 	}
-	return "scooter_prompt.cache"
+
+	hash := sha256.Sum256([]byte(modelPath))
+	shortHash := hex.EncodeToString(hash[:])[:8]
+
+	cacheFileName := fmt.Sprintf("%s_ctx%d_%s.rkllm_cache", baseName, contextLen, shortHash)
+
+	if cacheDir, err := getCacheFile(); err == nil && cacheDir != "" {
+		return filepath.Join(filepath.Dir(cacheDir), cacheFileName)
+	}
+
+	return cacheFileName
 }
 
 func streamRKLLM(ctx context.Context, modelName string, history []Message, channel chan<- StreamMessage) {
@@ -447,6 +472,7 @@ func streamRKLLM(ctx context.Context, modelName string, history []Message, chann
 	}
 
 	globalSession.mu.Lock()
+	activeModelPath := globalSession.modelPath
 	justLoaded := globalSession.justLoaded
 	lastStderr := globalSession.lastStderr
 	globalSession.justLoaded = false
@@ -529,7 +555,7 @@ func streamRKLLM(ctx context.Context, modelName string, history []Message, chann
 
 	cfg := loadConfig()
 	var cacheParam RKLLMPromptCacheParam
-	cacheFile := getPromptCacheFile()
+	cacheFile := getPromptCacheFile(activeModelPath, contextLen)
 
 	if cfg.RKLLMCacheEnabled {
 		if _, err := os.Stat(cacheFile); err == nil {
@@ -541,9 +567,11 @@ func streamRKLLM(ctx context.Context, modelName string, history []Message, chann
 		}
 	}
 
+	conversationPrompt := prompt.String()
+
 	input := RKLLMInput{
 		InputType:   RKLLM_INPUT_PROMPT,
-		PromptInput: goStringToBytePtr(fullPrompt),
+		PromptInput: goStringToBytePtr(conversationPrompt),
 	}
 
 	if ret := runFn(handle, &input, &inferParams, nil); ret != 0 {
@@ -664,4 +692,43 @@ func listRKLLMModels() []string {
 		models = append(models, "No .rkllm models found in "+baseDir)
 	}
 	return models
+}
+
+func createSystemPromptCache(
+	runFn func(handle LLMHandle, input *RKLLMInput, inferParams *RKLLMInferParam, userdata unsafe.Pointer) int32,
+	handle LLMHandle,
+	systemCacheFile string,
+) error {
+	// Skip generation if the system cache file already exists on disk
+	if _, err := os.Stat(systemCacheFile); err == nil {
+		return nil
+	}
+
+	// 1. Construct system prompt (system instructions + tool definitions)
+	systemParts := []string{
+		"You are a helpful AI assistant.", // Default or configured system prompt
+		buildToolInstructions(getSystemTools()),
+	}
+	systemOnlyPrompt := "System:\n" + strings.Join(systemParts, "\n\n") + "\n\n"
+
+	// 2. Configure SaveCachePath
+	var cacheParam RKLLMPromptCacheParam
+	cacheParam.SaveCachePath = goStringToBytePtr(systemCacheFile)
+
+	inferParams := RKLLMInferParam{
+		Mode:              RKLLM_INFER_GENERATE,
+		PromptCacheParams: &cacheParam,
+	}
+
+	input := RKLLMInput{
+		InputType:   RKLLM_INPUT_PROMPT,
+		PromptInput: goStringToBytePtr(systemOnlyPrompt),
+	}
+
+	// 3. Execute inference to generate and save the KV cache file
+	if ret := runFn(handle, &input, &inferParams, nil); ret != 0 {
+		return fmt.Errorf("failed to pre-cache system prompt: error code %d", ret)
+	}
+
+	return nil
 }
