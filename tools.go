@@ -208,6 +208,36 @@ func getDevelopmentTools() []Tool {
 		{
 			Type: "function",
 			Function: FunctionDefinition{
+				Name:        "file_metadata",
+				Description: "Retrieves metadata for a file or directory (size, modification time, permissions, type).",
+				Parameters: Parameters{
+					Type: "object",
+					Properties: map[string]Property{
+						"file_path": {Type: "string", Description: "Path of the file or directory to inspect."},
+					},
+					Required: []string{"file_path"},
+				},
+			},
+		},
+		{
+			Type: "function",
+			Function: FunctionDefinition{
+				Name:        "edit_file",
+				Description: "Edits a file using structured operations (replace, insert, delete) with diff preview and atomic writes.",
+				Parameters: Parameters{
+					Type: "object",
+					Properties: map[string]Property{
+						"file_path":    {Type: "string", Description: "Path of the file to edit."},
+						"operations":   {Type: "array", Description: "List of edit operations (replace, insert, delete)."},
+						"preview_only": {Type: "boolean", Description: "Optional: if true, returns diff preview without writing."},
+					},
+					Required: []string{"file_path", "operations"},
+				},
+			},
+		},
+		{
+			Type: "function",
+			Function: FunctionDefinition{
 				Name:        "shell",
 				Description: "Runs a shell command as the current user in the working directory. Use only when a local shell command is necessary.",
 				Parameters: Parameters{
@@ -542,6 +572,28 @@ type ReplaceTextArgs struct {
 	OldText         string `json:"old_text"`
 	NewText         string `json:"new_text"`
 	ExpectedMatches int    `json:"expected_matches,omitempty"`
+}
+
+type FileMetadataArgs struct {
+	FilePath string `json:"file_path"`
+}
+
+type EditOperation struct {
+	Type        string      `json:"type"`
+	Pattern     string      `json:"pattern,omitempty"`
+	Replacement string      `json:"replacement,omitempty"`
+	Flags       int         `json:"flags,omitempty"`
+	Count       int         `json:"count,omitempty"`
+	LineNumber  int         `json:"line_number,omitempty"`
+	Content     interface{} `json:"content,omitempty"`
+	StartLine   int         `json:"start_line,omitempty"`
+	EndLine     int         `json:"end_line,omitempty"`
+}
+
+type EditFileArgs struct {
+	FilePath    string          `json:"file_path"`
+	Operations  []EditOperation `json:"operations"`
+	PreviewOnly bool            `json:"preview_only,omitempty"`
 }
 
 type FindFilesArgs struct {
@@ -952,6 +1004,223 @@ func applyPatch(patchText string) string {
 	return result
 }
 
+func fileMetadata(absPath string) string {
+	info, err := os.Lstat(absPath)
+	if err != nil {
+		return fmt.Sprintf("System Error: %v", err)
+	}
+
+	isSymlink := info.Mode()&os.ModeSymlink != 0
+	symlinkTarget := ""
+	if isSymlink {
+		if target, err := os.Readlink(absPath); err == nil {
+			symlinkTarget = target
+		}
+	}
+
+	var sb strings.Builder
+	fmt.Fprintf(&sb, "Path: %s\n", absPath)
+	fmt.Fprintf(&sb, "Size: %d bytes\n", info.Size())
+	fmt.Fprintf(&sb, "Mode: %s\n", info.Mode().String())
+	fmt.Fprintf(&sb, "Permissions: %#o\n", info.Mode().Perm())
+	fmt.Fprintf(&sb, "ModTime: %s\n", info.ModTime().Format(time.RFC3339))
+	fmt.Fprintf(&sb, "IsDir: %v\n", info.IsDir())
+	fmt.Fprintf(&sb, "IsSymlink: %v\n", isSymlink)
+	if symlinkTarget != "" {
+		fmt.Fprintf(&sb, "SymlinkTarget: %s\n", symlinkTarget)
+	}
+	return sb.String()
+}
+
+func generateDiff(original, modified string) string {
+	origLines := strings.Split(original, "\n")
+	modLines := strings.Split(modified, "\n")
+	var sb strings.Builder
+	max := len(origLines)
+	if len(modLines) > max {
+		max = len(modLines)
+	}
+	for i := 0; i < max; i++ {
+		var origLine, modLine string
+		hasOrig := i < len(origLines)
+		hasMod := i < len(modLines)
+		if hasOrig {
+			origLine = origLines[i]
+		}
+		if hasMod {
+			modLine = modLines[i]
+		}
+		if hasOrig && hasMod && origLine != modLine {
+			fmt.Fprintf(&sb, "- %s\n+ %s\n", origLine, modLine)
+		} else if hasOrig && !hasMod {
+			fmt.Fprintf(&sb, "- %s\n", origLine)
+		} else if !hasOrig && hasMod {
+			fmt.Fprintf(&sb, "+ %s\n", modLine)
+		}
+	}
+	return sb.String()
+}
+
+func editFile(absPath string, operations []EditOperation, previewOnly bool) (string, error) {
+	contentBytes, err := os.ReadFile(absPath)
+	if err != nil {
+		return "", fmt.Errorf("read file: %w", err)
+	}
+	originalContent := string(contentBytes)
+	modifiedContent := originalContent
+
+	var replaceOps []EditOperation
+	var insertOps []EditOperation
+	var deleteOps []EditOperation
+
+	for _, op := range operations {
+		switch op.Type {
+		case "replace":
+			replaceOps = append(replaceOps, op)
+		case "insert":
+			insertOps = append(insertOps, op)
+		case "delete":
+			deleteOps = append(deleteOps, op)
+		default:
+			return "", fmt.Errorf("unknown operation type: %q", op.Type)
+		}
+	}
+
+	// 1. Apply replace operations
+	for _, op := range replaceOps {
+		if op.Pattern == "" {
+			return "", fmt.Errorf("replace operation missing pattern")
+		}
+		re, err := regexp.Compile(op.Pattern)
+		if err != nil {
+			return "", fmt.Errorf("invalid regex pattern %q: %w", op.Pattern, err)
+		}
+		modifiedContent = re.ReplaceAllString(modifiedContent, op.Replacement)
+	}
+
+	// 2. Line-based operations (insert, delete)
+	if len(insertOps) > 0 || len(deleteOps) > 0 {
+		lines := strings.Split(modifiedContent, "\n")
+
+		// Sort deletions descending by StartLine
+		sortedDeletions := make([]EditOperation, len(deleteOps))
+		copy(sortedDeletions, deleteOps)
+		for i := 0; i < len(sortedDeletions); i++ {
+			for j := i + 1; j < len(sortedDeletions); j++ {
+				if sortedDeletions[i].StartLine < sortedDeletions[j].StartLine {
+					sortedDeletions[i], sortedDeletions[j] = sortedDeletions[j], sortedDeletions[i]
+				}
+			}
+		}
+
+		for _, op := range sortedDeletions {
+			start := op.StartLine - 1
+			end := op.EndLine - 1
+			if end < start {
+				end = start
+			}
+			if start < 0 {
+				start = 0
+			}
+			if start >= len(lines) {
+				continue
+			}
+			if end >= len(lines) {
+				end = len(lines) - 1
+			}
+			lines = append(lines[:start], lines[end+1:]...)
+		}
+
+		// Sort insertions descending by LineNumber
+		sortedInsertions := make([]EditOperation, len(insertOps))
+		copy(sortedInsertions, insertOps)
+		for i := 0; i < len(sortedInsertions); i++ {
+			for j := i + 1; j < len(sortedInsertions); j++ {
+				if sortedInsertions[i].LineNumber < sortedInsertions[j].LineNumber {
+					sortedInsertions[i], sortedInsertions[j] = sortedInsertions[j], sortedInsertions[i]
+				}
+			}
+		}
+
+		for _, op := range sortedInsertions {
+			var insertLines []string
+			switch c := op.Content.(type) {
+			case string:
+				insertLines = strings.Split(strings.TrimSuffix(c, "\n"), "\n")
+			case []interface{}:
+				for _, item := range c {
+					if s, ok := item.(string); ok {
+						insertLines = append(insertLines, strings.TrimSuffix(s, "\n"))
+					}
+				}
+			case []string:
+				for _, s := range c {
+					insertLines = append(insertLines, strings.TrimSuffix(s, "\n"))
+				}
+			}
+
+			idx := op.LineNumber
+			if idx == -1 {
+				idx = len(lines) + 1
+			}
+			if idx <= 0 {
+				idx = 1
+			}
+			targetIdx := idx - 1
+			if targetIdx > len(lines) {
+				targetIdx = len(lines)
+			}
+
+			newLines := make([]string, 0, len(lines)+len(insertLines))
+			newLines = append(newLines, lines[:targetIdx]...)
+			newLines = append(newLines, insertLines...)
+			newLines = append(newLines, lines[targetIdx:]...)
+			lines = newLines
+		}
+
+		modifiedContent = strings.Join(lines, "\n")
+	}
+
+	if originalContent == modifiedContent {
+		return "No changes made (content unchanged).", nil
+	}
+
+	diff := generateDiff(originalContent, modifiedContent)
+
+	if previewOnly {
+		return fmt.Sprintf("Preview Diff:\n%s", diff), nil
+	}
+
+	dir := filepath.Dir(absPath)
+	tmpFile, err := os.CreateTemp(dir, "scooter-edit-*")
+	if err != nil {
+		return "", fmt.Errorf("create temp file: %w", err)
+	}
+	tmpName := tmpFile.Name()
+	defer func() {
+		_ = tmpFile.Close()
+		_ = os.Remove(tmpName)
+	}()
+
+	if _, err := tmpFile.WriteString(modifiedContent); err != nil {
+		return "", fmt.Errorf("write temp file: %w", err)
+	}
+	if err := tmpFile.Close(); err != nil {
+		return "", fmt.Errorf("close temp file: %w", err)
+	}
+
+	info, err := os.Stat(absPath)
+	if err == nil {
+		_ = os.Chmod(tmpName, info.Mode())
+	}
+
+	if err := os.Rename(tmpName, absPath); err != nil {
+		return "", fmt.Errorf("atomic rename: %w", err)
+	}
+
+	return fmt.Sprintf("Success: File edited successfully.\nDiff:\n%s", diff), nil
+}
+
 func dispatchToolCall(name string, rawArgs json.RawMessage) string {
 	logDebug("dispatchToolCall called: %s, Args: %s", name, string(rawArgs))
 	if strings.TrimSpace(name) == "" {
@@ -971,6 +1240,41 @@ func dispatchToolCall(name string, rawArgs json.RawMessage) string {
 			return fmt.Sprintf("System Error parsing arguments: %v", err)
 		}
 		return applyPatch(args.Patch)
+
+	case "file_metadata":
+		var args FileMetadataArgs
+		if err := json.Unmarshal(rawArgs, &args); err != nil {
+			return fmt.Sprintf("System Error parsing arguments: %v", err)
+		}
+		if strings.TrimSpace(args.FilePath) == "" {
+			return "System Error: file_path is required"
+		}
+		absPath, err := validatePath(args.FilePath)
+		if err != nil {
+			return fmt.Sprintf("System Error: %v", err)
+		}
+		return fileMetadata(absPath)
+
+	case "edit_file":
+		var args EditFileArgs
+		if err := json.Unmarshal(rawArgs, &args); err != nil {
+			return fmt.Sprintf("System Error parsing arguments: %v", err)
+		}
+		if strings.TrimSpace(args.FilePath) == "" {
+			return "System Error: file_path is required"
+		}
+		if len(args.Operations) == 0 {
+			return "System Error: operations are required"
+		}
+		absPath, err := validatePath(args.FilePath)
+		if err != nil {
+			return fmt.Sprintf("System Error: %v", err)
+		}
+		res, err := editFile(absPath, args.Operations, args.PreviewOnly)
+		if err != nil {
+			return fmt.Sprintf("System Error: %v", err)
+		}
+		return res
 
 	case "outsource":
 		var args OutsourceArgs

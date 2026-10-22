@@ -7,28 +7,29 @@ import (
 	tea "github.com/charmbracelet/bubbletea"
 )
 
-func compressHistoryCmd(modelName string, history []Message, force bool) tea.Cmd {
+func compressHistoryCmd(modelName string, history []Message, force bool, generation uint64) tea.Cmd {
 	source, retained := planCompression(history, force)
 	if len(source) == 0 {
 		return func() tea.Msg {
-			return SummaryMessage{Retained: retained}
+			return SummaryMessage{Retained: retained, Generation: generation}
 		}
 	}
-	return summarizeCmd(modelName, source, retained)
+	return summarizeCmd(modelName, source, retained, generation)
 }
 
-func summarizeCmd(modelName string, messages, retained []Message) tea.Cmd {
+func summarizeCmd(modelName string, messages, retained []Message, generation uint64) tea.Cmd {
 	return func() tea.Msg {
 		_, cancel := context.WithTimeout(context.Background(), 60*time.Minute)
 		defer cancel()
 
 		summaryText, err := runRKLLMSummary(modelName, messages)
 		if err != nil {
-			return SummaryMessage{Err: err}
+			return SummaryMessage{Err: err, Generation: generation}
 		}
 		return SummaryMessage{
-			Summary:  truncateToTokenBudget(summaryText, getSummaryReserveTokens()),
-			Retained: retained,
+			Summary:    truncateToTokenBudget(summaryText, getSummaryReserveTokens()),
+			Retained:   retained,
+			Generation: generation,
 		}
 	}
 }

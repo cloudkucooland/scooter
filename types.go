@@ -5,9 +5,10 @@ import (
 )
 
 type SummaryMessage struct {
-	Summary  string
-	Retained []Message
-	Err      error
+	Summary    string
+	Retained   []Message
+	Err        error
+	Generation uint64
 }
 
 type ModelsMessage struct {

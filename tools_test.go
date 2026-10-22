@@ -478,3 +478,88 @@ func TestWebFetchToolValidation(t *testing.T) {
 		t.Fatalf("expected no valid URLs error, got: %q", res)
 	}
 }
+
+func TestFileMetadata(t *testing.T) {
+	tmpDir := t.TempDir()
+	origWorkingDir := workingDir
+	defer func() { workingDir = origWorkingDir }()
+	workingDir = tmpDir
+
+	filePath := filepath.Join(tmpDir, "meta.txt")
+	if err := os.WriteFile(filePath, []byte("hello metadata"), 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	// Test valid file metadata
+	rawArgs, _ := json.Marshal(FileMetadataArgs{FilePath: "meta.txt"})
+	res := dispatchToolCall("file_metadata", rawArgs)
+	if !strings.Contains(res, "Size: 14 bytes") || !strings.Contains(res, "IsDir: false") {
+		t.Fatalf("unexpected file_metadata result: %q", res)
+	}
+
+	// Test validation error (missing file_path)
+	rawArgs, _ = json.Marshal(FileMetadataArgs{FilePath: ""})
+	res = dispatchToolCall("file_metadata", rawArgs)
+	if !strings.Contains(res, "file_path is required") {
+		t.Fatalf("expected file_path required error, got: %q", res)
+	}
+}
+
+func TestEditFile(t *testing.T) {
+	tmpDir := t.TempDir()
+	origWorkingDir := workingDir
+	defer func() { workingDir = origWorkingDir }()
+	workingDir = tmpDir
+
+	filePath := filepath.Join(tmpDir, "edit.txt")
+	initialContent := "Line 1: Alpha\nLine 2: Beta\nLine 3: Gamma\n"
+	if err := os.WriteFile(filePath, []byte(initialContent), 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	// 1. Test preview_only mode (no disk write)
+	ops := []EditOperation{
+		{Type: "replace", Pattern: "Alpha", Replacement: "Delta"},
+	}
+	rawArgs, _ := json.Marshal(EditFileArgs{FilePath: "edit.txt", Operations: ops, PreviewOnly: true})
+	res := dispatchToolCall("edit_file", rawArgs)
+	if !strings.Contains(res, "Preview Diff:") || !strings.Contains(res, "- Line 1: Alpha") || !strings.Contains(res, "+ Line 1: Delta") {
+		t.Fatalf("unexpected preview result: %q", res)
+	}
+
+	contentBefore, _ := os.ReadFile(filePath)
+	if string(contentBefore) != initialContent {
+		t.Fatal("preview_only modified the file on disk")
+	}
+
+	// 2. Test actual edit (replace, insert, delete)
+	complexOps := []EditOperation{
+		{Type: "replace", Pattern: "Beta", Replacement: "Omega"},
+		{Type: "insert", LineNumber: 2, Content: "Line 1.5: Inserted\n"},
+		{Type: "delete", StartLine: 3, EndLine: 3}, // delete Line 3 (Gamma)
+	}
+	rawArgs, _ = json.Marshal(EditFileArgs{FilePath: "edit.txt", Operations: complexOps, PreviewOnly: false})
+	res = dispatchToolCall("edit_file", rawArgs)
+	if !strings.Contains(res, "Success: File edited successfully") {
+		t.Fatalf("edit_file failed: %q", res)
+	}
+
+	updatedContent, _ := os.ReadFile(filePath)
+	expectedContent := "Line 1: Alpha\nLine 1.5: Inserted\nLine 2: Omega\n"
+	if string(updatedContent) != expectedContent {
+		t.Fatalf("unexpected updated content: %q, want %q", string(updatedContent), expectedContent)
+	}
+
+	// 3. Test validation errors
+	rawArgs, _ = json.Marshal(EditFileArgs{FilePath: "", Operations: ops})
+	res = dispatchToolCall("edit_file", rawArgs)
+	if !strings.Contains(res, "file_path is required") {
+		t.Fatalf("expected file_path required error, got: %q", res)
+	}
+
+	rawArgs, _ = json.Marshal(EditFileArgs{FilePath: "edit.txt", Operations: nil})
+	res = dispatchToolCall("edit_file", rawArgs)
+	if !strings.Contains(res, "operations are required") {
+		t.Fatalf("expected operations required error, got: %q", res)
+	}
+}

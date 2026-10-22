@@ -49,6 +49,7 @@ type model struct {
 	toolRounds          int
 	toolCallCount       int
 	seenToolCalls       map[string]bool
+	historyGeneration   uint64
 }
 
 const streamRenderInterval = 75 * time.Millisecond
@@ -190,6 +191,73 @@ func (m model) renderAutocompletePopup() string {
 	if !strings.HasPrefix(val, "/") {
 		return ""
 	}
+
+	lowerVal := strings.ToLower(val)
+
+	if strings.HasPrefix(lowerVal, "/models") {
+		var matches []struct{ cmd, desc string }
+		for _, c := range availableCommands {
+			if strings.HasPrefix(strings.ToLower(c.cmd), lowerVal) {
+				matches = append(matches, c)
+			}
+		}
+		if len(matches) == 0 {
+			return ""
+		}
+		var popupLines []string
+		popupLines = append(popupLines, lipgloss.NewStyle().Foreground(lipgloss.Color("205")).Bold(true).Render(" ── Suggestions ── "))
+		for _, match := range matches {
+			line := fmt.Sprintf(" %-10s - %s ", match.cmd, match.desc)
+			popupLines = append(popupLines, lipgloss.NewStyle().Foreground(lipgloss.Color("252")).Render(line))
+		}
+		popupBoxStyle := lipgloss.NewStyle().
+			Border(lipgloss.RoundedBorder()).
+			BorderForeground(lipgloss.Color("63")).
+			Background(lipgloss.Color("235")).
+			Padding(0, 1)
+		return popupBoxStyle.Render(strings.Join(popupLines, "\n"))
+	}
+
+	if strings.HasPrefix(lowerVal, "/model") {
+		query := ""
+		if strings.HasPrefix(lowerVal, "/model ") {
+			query = strings.TrimSpace(val[len("/model "):])
+		} else if len(val) > len("/model") {
+			query = strings.TrimSpace(val[len("/model"):])
+		}
+
+		models := listRKLLMModels()
+		var matches []string
+		for _, mdl := range models {
+			if query == "" || strings.Contains(strings.ToLower(mdl), strings.ToLower(query)) {
+				matches = append(matches, mdl)
+			}
+		}
+
+		if len(matches) == 0 {
+			matches = models
+		}
+
+		var popupLines []string
+		popupLines = append(popupLines, lipgloss.NewStyle().Foreground(lipgloss.Color("205")).Bold(true).Render(" ── RKLLM Models ── "))
+		for _, match := range matches {
+			displayMatch := match
+			if filepath.IsAbs(match) {
+				displayMatch = filepath.Base(match) + " (" + match + ")"
+			}
+			line := fmt.Sprintf(" %s ", displayMatch)
+			popupLines = append(popupLines, lipgloss.NewStyle().Foreground(lipgloss.Color("252")).Render(line))
+		}
+
+		popupBoxStyle := lipgloss.NewStyle().
+			Border(lipgloss.RoundedBorder()).
+			BorderForeground(lipgloss.Color("63")).
+			Background(lipgloss.Color("235")).
+			Padding(0, 1)
+
+		return popupBoxStyle.Render(strings.Join(popupLines, "\n"))
+	}
+
 	parts := strings.Fields(val)
 	prefix := ""
 	if len(parts) > 0 {
@@ -411,6 +479,35 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		}
 
 		switch msg.Type {
+		case tea.KeyTab:
+			val := m.textarea.Value()
+			lowerVal := strings.ToLower(strings.TrimSpace(val))
+			if strings.HasPrefix(lowerVal, "/model") && !strings.HasPrefix(lowerVal, "/models") {
+				query := ""
+				if strings.HasPrefix(lowerVal, "/model ") {
+					query = strings.TrimSpace(val[len("/model "):])
+				}
+				models := listRKLLMModels()
+				for _, mdl := range models {
+					if query == "" || strings.Contains(strings.ToLower(mdl), strings.ToLower(query)) {
+						m.textarea.SetValue("/model " + mdl)
+						m.textarea.CursorEnd()
+						return m, nil
+					}
+				}
+			} else if strings.HasPrefix(lowerVal, "/") {
+				var matches []string
+				for _, c := range availableCommands {
+					if strings.HasPrefix(strings.ToLower(c.cmd), lowerVal) {
+						matches = append(matches, c.cmd)
+					}
+				}
+				if len(matches) > 0 {
+					m.textarea.SetValue(matches[0] + " ")
+					m.textarea.CursorEnd()
+					return m, nil
+				}
+			}
 		case tea.KeyCtrlL:
 			m.refreshViewport()
 			return m, tea.ClearScreen
@@ -515,7 +612,7 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 
 			m.refreshViewport()
 			if historyNeedsCompression(m.chatHistory) {
-				return m, tea.Batch(renderCmd, compressHistoryCmd(m.modelName, m.chatHistory, false))
+				return m, tea.Batch(renderCmd, compressHistoryCmd(m.modelName, m.chatHistory, false, m.historyGeneration))
 			}
 			return m, renderCmd
 		}
@@ -541,6 +638,9 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		return m, nil
 
 	case SummaryMessage:
+		if msg.Generation != m.historyGeneration {
+			return m, nil
+		}
 		if msg.Err != nil {
 			m.chatHistory = append(m.chatHistory, Message{Role: "system", Content: "Summary Error: " + msg.Err.Error()})
 		} else {
@@ -613,6 +713,27 @@ func (m *model) handleCommand(input string) tea.Cmd {
 		return tea.Quit
 	}
 
+	if strings.HasPrefix(input, "!") {
+		cmdStr := strings.TrimSpace(strings.TrimPrefix(input, "!"))
+		userMsg := Message{Role: "user", Content: input}
+		m.chatHistory = append(m.chatHistory, userMsg)
+		m.saveMessage(userMsg)
+
+		var result string
+		if cmdStr == "" {
+			result = "System Error: command is required after !"
+		} else {
+			result = runShell(cmdStr)
+		}
+
+		toolMsg := Message{Role: "tool", ToolName: "shell", Content: result}
+		m.chatHistory = append(m.chatHistory, toolMsg)
+		m.saveMessage(toolMsg)
+
+		m.refreshViewport()
+		return nil
+	}
+
 	if strings.HasPrefix(input, "/help") {
 		helpText := `Scooter Agent Commands:
 - /help: Show this help message
@@ -626,6 +747,7 @@ func (m *model) handleCommand(input string) tea.Cmd {
 - /file <path>: Load a local file into the conversation
 - /status: Check RKLLM backend status
 - /quit: Exit Scooter
+- !<command>: Execute a shell command directly (e.g. !ls, !/bin/ls)
 - [Esc]: Abort generation or cancel pending tool confirmation`
 
 		m.chatHistory = append(m.chatHistory, Message{
@@ -723,7 +845,13 @@ func (m *model) handleCommand(input string) tea.Cmd {
 	}
 
 	if strings.HasPrefix(input, "/clear") {
+		m.historyGeneration++
 		m.chatHistory = nil
+		m.currentBuffer.Reset()
+		m.pendingTools = nil
+		m.toolRounds = 0
+		m.toolCallCount = 0
+		m.seenToolCalls = nil
 		clearCache()
 
 		if hydration := loadHydrationContext(); hydration != nil {
@@ -750,7 +878,7 @@ func (m *model) handleCommand(input string) tea.Cmd {
 	}
 
 	if strings.HasPrefix(input, "/compress") {
-		return compressHistoryCmd(m.modelName, m.chatHistory, true)
+		return compressHistoryCmd(m.modelName, m.chatHistory, true, m.historyGeneration)
 	}
 
 	// Submit user input message
