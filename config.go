@@ -18,6 +18,8 @@ type Config struct {
 	DefaultModel         string `json:"default_model"`
 	RKLLMModelsDir       string `json:"rkllm_models_dir"`
 	RKLLMLib             string `json:"rkllm_lib"`
+	RKLLMCacheEnabled    bool   `json:"rkllm_cache_enabled"`
+	RKLLMCachePath       string `json:"rkllm_cache_path"`
 	MaxGrepFileSize      int64  `json:"max_grep_file_size"`
 	MaxShellOutputSize   int    `json:"max_shell_output_size"`
 	DefaultToolset       string `json:"default_toolset"`
@@ -35,6 +37,7 @@ var (
 		HydrationTokenLimit:  1000,
 		DefaultModel:         "qwen3-4b",
 		RKLLMLib:             "librkllmrt.so",
+		RKLLMCacheEnabled:    true,
 		MaxGrepFileSize:      2 * 1024 * 1024,
 		MaxShellOutputSize:   64 * 1024,
 		DefaultToolset:       "all",

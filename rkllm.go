@@ -78,10 +78,17 @@ type RKLLMCallback struct {
 	Userdata unsafe.Pointer
 }
 
+type RKLLMPromptCacheParam struct {
+	SaveCachePath *byte
+	LoadCachePath *byte
+	// Additional reserved fields corresponding to rkllm_prompt_cache_param
+	Reserved [64]byte
+}
+
 type RKLLMInferParam struct {
 	Mode              RKLLMInferMode
 	LoraParams        unsafe.Pointer
-	PromptCacheParams unsafe.Pointer
+	PromptCacheParams *RKLLMPromptCacheParam
 	ModelParams       unsafe.Pointer
 }
 
@@ -419,6 +426,16 @@ func ensureSession(modelName string, contextLen int) error {
 	return nil
 }
 
+func getPromptCacheFile() string {
+	if custom := loadConfig().RKLLMCachePath; custom != "" {
+		return custom
+	}
+	if cacheFile, err := getCacheFile(); err == nil {
+		return cacheFile + ".rkllm_cache"
+	}
+	return "scooter_prompt.cache"
+}
+
 func streamRKLLM(ctx context.Context, modelName string, history []Message, channel chan<- StreamMessage) {
 	globalSession.inferMu.Lock()
 	defer globalSession.inferMu.Unlock()
@@ -508,6 +525,20 @@ func streamRKLLM(ctx context.Context, modelName string, history []Message, chann
 
 	inferParams := RKLLMInferParam{
 		Mode: RKLLM_INFER_GENERATE,
+	}
+
+	cfg := loadConfig()
+	var cacheParam RKLLMPromptCacheParam
+	cacheFile := getPromptCacheFile()
+
+	if cfg.RKLLMCacheEnabled {
+		if _, err := os.Stat(cacheFile); err == nil {
+			cacheParam.LoadCachePath = goStringToBytePtr(cacheFile)
+			inferParams.PromptCacheParams = &cacheParam
+		} else {
+			cacheParam.SaveCachePath = goStringToBytePtr(cacheFile)
+			inferParams.PromptCacheParams = &cacheParam
+		}
 	}
 
 	input := RKLLMInput{
