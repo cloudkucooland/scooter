@@ -80,9 +80,14 @@ type RKLLMCallback struct {
 	Userdata unsafe.Pointer
 }
 
+/* typedef struct {
+    int save_prompt_cache;           Flag to indicate whether to save the prompt cache (0 = don't save, 1 = save).
+    const char* prompt_cache_path;   Path to the prompt cache file. 
+} RKLLMPromptCacheParam; */
+
 type RKLLMPromptCacheParam struct {
-	SaveCachePath *byte
-	LoadCachePath *byte
+	SavePromptCache int32
+	CachePath *byte
 	// Additional reserved fields corresponding to rkllm_prompt_cache_param
 	Reserved [64]byte
 }
@@ -398,6 +403,9 @@ func ensureSession(modelName string, contextLen int) error {
 		}
 		param.MaxNewTokens = newTokens
 
+		var rkllmLoadPromptCache func(handle LLMHandle, path *byte) int32
+		purego.RegisterLibFunc(&rkllmLoadPromptCache, lib, "rkllm_load_prompt_cache")
+
 		if ret := rkllmInit(&handle, &param, &cbStruct); ret != 0 {
 			return fmt.Errorf("rkllm_init failed (model: %s): %d", modelPath, ret)
 		}
@@ -408,6 +416,10 @@ func ensureSession(modelName string, contextLen int) error {
 			if cacheErr := createSystemPromptCache(rkllmRun, handle, systemCacheFile); cacheErr != nil {
 				// Log or handle non-fatal caching errors
 				fmt.Fprintf(os.Stderr, "Warning: %v\n", cacheErr)
+			} else if rkllmLoadPromptCache != nil {
+				if ret := rkllmLoadPromptCache(handle, goStringToBytePtr(systemCacheFile)); ret != 0 {
+					fmt.Fprintf(os.Stderr, "Warning: rkllm_load_prompt_cache failed: %d\n", ret)
+				}
 			}
 		}
 
@@ -443,16 +455,26 @@ func getPromptCacheFile(modelPath string, contextLen int) string {
 		return custom
 	}
 
+	if modelPath == "" {
+		modelPath = getDefaultModelName()
+	}
+	if contextLen <= 0 {
+		contextLen = getActiveContextLimit()
+	}
+
+	toolset := GetActiveToolset()
+
 	baseName := filepath.Base(modelPath)
 	baseName = strings.TrimSuffix(baseName, filepath.Ext(baseName))
 	if baseName == "" {
 		baseName = "default_model"
 	}
 
-	hash := sha256.Sum256([]byte(modelPath))
+	hashInput := fmt.Sprintf("%s|%s", modelPath, toolset)
+	hash := sha256.Sum256([]byte(hashInput))
 	shortHash := hex.EncodeToString(hash[:])[:8]
 
-	cacheFileName := fmt.Sprintf("%s_ctx%d_%s.rkllm_cache", baseName, contextLen, shortHash)
+	cacheFileName := fmt.Sprintf("%s_%s_ctx%d_%s.rkllm_cache", baseName, toolset, contextLen, shortHash)
 
 	if cacheDir, err := getCacheFile(); err == nil && cacheDir != "" {
 		return filepath.Join(filepath.Dir(cacheDir), cacheFileName)
@@ -547,8 +569,6 @@ func streamRKLLM(ctx context.Context, modelName string, history []Message, chann
 	systemParts = append(systemParts, buildToolInstructions(getSystemTools()))
 	prompt.WriteString("Assistant: ")
 
-	fullPrompt := "System:\n" + strings.Join(systemParts, "\n\n") + "\n\n" + prompt.String()
-
 	inferParams := RKLLMInferParam{
 		Mode: RKLLM_INFER_GENERATE,
 	}
@@ -556,18 +576,24 @@ func streamRKLLM(ctx context.Context, modelName string, history []Message, chann
 	cfg := loadConfig()
 	var cacheParam RKLLMPromptCacheParam
 	cacheFile := getPromptCacheFile(activeModelPath, contextLen)
+	cacheLoaded := false
 
 	if cfg.RKLLMCacheEnabled {
 		if _, err := os.Stat(cacheFile); err == nil {
-			cacheParam.LoadCachePath = goStringToBytePtr(cacheFile)
-			inferParams.PromptCacheParams = &cacheParam
-		} else {
-			cacheParam.SaveCachePath = goStringToBytePtr(cacheFile)
+			cacheLoaded = true
+			cacheParam.SavePromptCache = 0
+			cacheParam.CachePath = goStringToBytePtr(cacheFile)
 			inferParams.PromptCacheParams = &cacheParam
 		}
 	}
 
-	conversationPrompt := prompt.String()
+	var conversationPrompt string
+	if cacheLoaded {
+		conversationPrompt = prompt.String()
+	} else {
+		fullPrompt := "System:\n" + strings.Join(systemParts, "\n\n") + "\n\n" + prompt.String()
+		conversationPrompt = fullPrompt
+	}
 
 	input := RKLLMInput{
 		InputType:   RKLLM_INPUT_PROMPT,
@@ -699,21 +725,21 @@ func createSystemPromptCache(
 	handle LLMHandle,
 	systemCacheFile string,
 ) error {
-	// Skip generation if the system cache file already exists on disk
 	if _, err := os.Stat(systemCacheFile); err == nil {
-		return nil
+		return nil // Cache file already created
 	}
 
-	// 1. Construct system prompt (system instructions + tool definitions)
 	systemParts := []string{
-		"You are a helpful AI assistant.", // Default or configured system prompt
 		buildToolInstructions(getSystemTools()),
 	}
 	systemOnlyPrompt := "System:\n" + strings.Join(systemParts, "\n\n") + "\n\n"
 
-	// 2. Configure SaveCachePath
+	// Explicitly zero-initialize the cache parameter struct
 	var cacheParam RKLLMPromptCacheParam
-	cacheParam.SaveCachePath = goStringToBytePtr(systemCacheFile)
+	
+	// Convert string to null-terminated C string byte pointer
+	cacheParam.CachePath = goStringToBytePtr(systemCacheFile)
+	cacheParam.SavePromptCache = 1
 
 	inferParams := RKLLMInferParam{
 		Mode:              RKLLM_INFER_GENERATE,
@@ -725,9 +751,8 @@ func createSystemPromptCache(
 		PromptInput: goStringToBytePtr(systemOnlyPrompt),
 	}
 
-	// 3. Execute inference to generate and save the KV cache file
 	if ret := runFn(handle, &input, &inferParams, nil); ret != 0 {
-		return fmt.Errorf("failed to pre-cache system prompt: error code %d", ret)
+		return fmt.Errorf("rkllm pre-caching failed with code %d", ret)
 	}
 
 	return nil

@@ -7,7 +7,7 @@ import (
 
 func TestGetPromptCacheFileDefaultsAndCustom(t *testing.T) {
 	// Test default prompt cache file generation
-	cacheFile := getPromptCacheFile()
+	cacheFile := getPromptCacheFile("qwen3-4b.rkllm", 4096)
 	if cacheFile == "" {
 		t.Fatal("expected non-empty prompt cache file path")
 	}
