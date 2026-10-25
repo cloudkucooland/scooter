@@ -127,3 +127,74 @@ func TestBangCommandExecution(t *testing.T) {
 		t.Errorf("expected tool message with output containing 'hello_bang', got %+v", toolMsg)
 	}
 }
+
+func TestDisableAndEnableCacheCommands(t *testing.T) {
+	m := model{
+		textarea:      textarea.New(),
+		viewport:      viewport.New(80, 24),
+		currentBuffer: &strings.Builder{},
+	}
+
+	cmd1 := m.handleCommand("/disablecache")
+	if cmd1 != nil {
+		t.Errorf("expected nil cmd for /disablecache, got %v", cmd1)
+	}
+	if loadConfig().RKLLMCacheEnabled {
+		t.Errorf("expected RKLLMCacheEnabled to be false after /disablecache")
+	}
+
+	cmd2 := m.handleCommand("/enablecache")
+	if cmd2 != nil {
+		t.Errorf("expected nil cmd for /enablecache, got %v", cmd2)
+	}
+	if !loadConfig().RKLLMCacheEnabled {
+		t.Errorf("expected RKLLMCacheEnabled to be true after /enablecache")
+	}
+}
+
+func TestStatusBarCacheIndicator(t *testing.T) {
+	m := model{
+		textarea:      textarea.New(),
+		viewport:      viewport.New(80, 24),
+		modelName:     "test_model",
+		currentBuffer: &strings.Builder{},
+	}
+
+	cfg := loadConfig()
+	cfg.RKLLMCacheEnabled = true
+	_ = saveConfig(cfg)
+	statusBar1 := m.renderStatusBar()
+	if !strings.Contains(statusBar1, "Cache: ⚡") {
+		t.Errorf("expected status bar to contain 'Cache: ⚡', got %q", statusBar1)
+	}
+
+	cfg.RKLLMCacheEnabled = false
+	_ = saveConfig(cfg)
+	statusBar2 := m.renderStatusBar()
+	if !strings.Contains(statusBar2, "Cache: off") {
+		t.Errorf("expected status bar to contain 'Cache: off', got %q", statusBar2)
+	}
+
+	// restore
+	cfg.RKLLMCacheEnabled = true
+	_ = saveConfig(cfg)
+}
+
+func TestCacheCommandsInAvailableCommands(t *testing.T) {
+	foundEnable := false
+	foundDisable := false
+	for _, c := range availableCommands {
+		if c.cmd == "/enablecache" {
+			foundEnable = true
+		}
+		if c.cmd == "/disablecache" {
+			foundDisable = true
+		}
+	}
+	if !foundEnable {
+		t.Errorf("expected /enablecache in availableCommands")
+	}
+	if !foundDisable {
+		t.Errorf("expected /disablecache in availableCommands")
+	}
+}

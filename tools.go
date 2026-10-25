@@ -16,6 +16,7 @@ import (
 	"path/filepath"
 	"regexp"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/cloudkucooland/go-kasa"
@@ -1695,4 +1696,44 @@ func dispatchToolCall(name string, rawArgs json.RawMessage) string {
 
 	logDebug("dispatchToolCall failed for: %s", name)
 	return fmt.Sprintf("System Error: Tool %s not implemented.", name)
+}
+
+var (
+	homeAmbientCache     string
+	homeAmbientCacheTime time.Time
+	homeAmbientMu        sync.Mutex
+)
+
+func GetHomeAmbientState() string {
+	homeAmbientMu.Lock()
+	defer homeAmbientMu.Unlock()
+
+	if time.Since(homeAmbientCacheTime) < 30*time.Second {
+		return homeAmbientCache
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 1*time.Second)
+	defer cancel()
+
+	d, err := kasa.BroadcastDiscovery(ctx, 1)
+	if err != nil || len(d) == 0 {
+		return homeAmbientCache
+	}
+
+	var sb strings.Builder
+	sb.WriteString("Discovered Smart Home Devices (Ambient State):\n")
+	for k, v := range d {
+		if len(v.Children) == 0 {
+			state := "OFF"
+			if v.RelayState == 1 {
+				state = "ON"
+			}
+			fmt.Fprintf(&sb, "- Alias: %q, IP: %s, State: %s, Brightness: %d\n", v.Alias, k, state, v.Brightness)
+		}
+	}
+	sb.WriteString("\n")
+
+	homeAmbientCache = sb.String()
+	homeAmbientCacheTime = time.Now()
+	return homeAmbientCache
 }

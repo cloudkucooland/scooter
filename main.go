@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"crypto/sha256"
 	"encoding/json"
 	"fmt"
@@ -11,6 +12,7 @@ import (
 	"time"
 
 	tea "github.com/charmbracelet/bubbletea"
+	"github.com/urfave/cli/v3"
 )
 
 var workingDir string
@@ -159,6 +161,9 @@ func buildToolInstructions(tools []Tool) string {
 	sb.WriteString("[TOOL_CALL]{\"name\":\"TOOL_NAME\",\"arguments\":{}}[/TOOL_CALL]\n")
 	sb.WriteString("Use valid JSON: double-quote keys and string values; arguments must be an object. A response may contain multiple complete tool calls. If reasoning or thinking through steps, always conclude your response with the required `[TOOL_CALL]` block to invoke the tool. Otherwise, answer in plain text.\n\n")
 	fmt.Fprintf(&sb, "File and directory operations are restricted to the working directory: %s (paths may be relative or absolute within this directory).\n\n", workingDir)
+	if GetActiveToolset() == "home" || GetActiveToolset() == "all" {
+		sb.WriteString("IMPORTANT (Smart Home IoT Control): You have direct control over local smart home devices via tools like set_device_state, set_brightness, and get_sysinfo. When the user asks to turn a light or device on or off, you MUST execute the appropriate tool call. Never refuse or tell the user to do it manually.\n\n")
+	}
 	sb.WriteString("Tool calls and their named results are retained in the conversation. After a tool succeeds, use its result and do not repeat the same call unless the user explicitly asks again. If a tool call fails, explain the failure or try a different approach instead of repeating the same malformed call.\n\n")
 	sb.WriteString("Available tools:\n")
 
@@ -199,15 +204,6 @@ func contains(values []string, target string) bool {
 	return false
 }
 
-/* func sendStreamMsg(ctx context.Context, ch chan<- StreamMessage, msg StreamMessage) bool {
-	select {
-	case <-ctx.Done():
-		return false
-	case ch <- msg:
-		return true
-	}
-} */
-
 func main() {
 	defer closeLogger()
 	defer func() {
@@ -232,9 +228,128 @@ func main() {
 		panic(err)
 	}
 
-	p := tea.NewProgram(initialModel(), tea.WithAltScreen())
-	if _, err := p.Run(); err != nil {
+	app := &cli.Command{
+		Name:  "scooter",
+		Usage: "Local-first AI agent for RK3588",
+		Flags: []cli.Flag{
+			&cli.StringFlag{
+				Name:    "toolset",
+				Aliases: []string{"t"},
+				Value:   "all",
+				Usage:   "Active toolset (dev, home, web, all)",
+			},
+			&cli.StringFlag{
+				Name:    "model",
+				Aliases: []string{"m"},
+				Usage:   "RKLLM model path or name",
+			},
+			&cli.StringFlag{
+				Name:    "prompt",
+				Aliases: []string{"p"},
+				Usage:   "Run a single prompt non-interactively and exit",
+			},
+		},
+		Action: func(ctx context.Context, cmd *cli.Command) error {
+			toolset := cmd.String("toolset")
+			if toolset != "" {
+				if err := SetActiveToolset(toolset); err != nil {
+					return err
+				}
+			}
+
+			modelName := cmd.String("model")
+			if modelName == "" {
+				modelName = loadConfig().DefaultModel
+			}
+
+			promptText := cmd.String("prompt")
+			if promptText != "" {
+				return runNonInteractive(modelName, toolset, promptText)
+			}
+
+			p := tea.NewProgram(initialModel(), tea.WithAltScreen())
+			if _, err := p.Run(); err != nil {
+				return err
+			}
+			return nil
+		},
+	}
+
+	if err := app.Run(context.Background(), os.Args); err != nil {
 		fmt.Fprintf(os.Stderr, "Error: %v\n", err)
 		os.Exit(1)
 	}
+}
+
+func runNonInteractive(modelName, toolset, promptText string) error {
+	SetActiveToolset(toolset)
+	resolvedModel := getRKLLMModelPath(modelName)
+	detected := detectContextLength(resolvedModel)
+	setActiveContextLimit(detected)
+
+	var history []Message
+	if toolset == "home" || toolset == "all" {
+		if ambient := GetHomeAmbientState(); ambient != "" {
+			history = append(history, Message{
+				Role:    "system",
+				Content: ambient,
+			})
+		}
+	}
+	history = append(history, Message{Role: "user", Content: promptText})
+
+	for rounds := 0; rounds < 5; rounds++ {
+		ch := make(chan StreamMessage, 10)
+		ctx := context.Background()
+		go streamRKLLM(ctx, resolvedModel, history, ch)
+
+		var assistantContent strings.Builder
+		var toolCalls []ToolCall
+		done := false
+
+		for !done {
+			msg, ok := <-ch
+			if !ok {
+				break
+			}
+			if msg.Err != nil {
+				return msg.Err
+			}
+			if msg.Content != "" {
+				fmt.Print(msg.Content)
+				assistantContent.WriteString(msg.Content)
+			}
+			if len(msg.ToolCalls) > 0 {
+				toolCalls = msg.ToolCalls
+			}
+			if msg.Done {
+				done = true
+			}
+		}
+		fmt.Println()
+
+		assistantMsg := Message{
+			Role:      "assistant",
+			Content:   assistantContent.String(),
+			ToolCalls: toolCalls,
+		}
+		history = append(history, assistantMsg)
+
+		if len(toolCalls) == 0 {
+			break
+		}
+
+		for _, call := range toolCalls {
+			fmt.Fprintf(os.Stderr, "[Executing tool: %s]\n", call.Function.Name)
+			result := dispatchToolCall(call.Function.Name, call.Function.Arguments)
+			toolMsg := Message{
+				Role:     "tool",
+				ToolName: call.Function.Name,
+				Content:  result,
+			}
+			history = append(history, toolMsg)
+			fmt.Fprintf(os.Stderr, "[Tool result: %s]\n", result)
+		}
+	}
+	return nil
 }

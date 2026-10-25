@@ -152,15 +152,21 @@ func (m model) renderStatusBar() string {
 		tokenStr = fmt.Sprintf("%d/%dt", currentTokens, ctxLimit)
 	}
 
+	cacheDisplay := "Cache: ⚡"
+	if !loadConfig().RKLLMCacheEnabled {
+		cacheDisplay = "Cache: off"
+	}
+
 	abortHint := "[Esc] Abort"
 	if m.isStreaming {
 		abortHint = "[Esc] ⏳ Generating..."
 	}
 
 	statusText := fmt.Sprintf(
-		" Model: %s | Toolset: %s | Ctx: %s [%s] %d%% | %s | /help",
+		" Model: %s | Toolset: %s | %s | Ctx: %s [%s] %d%% | %s | /help",
 		modelDisplay,
 		GetActiveToolset(),
+		cacheDisplay,
 		tokenStr,
 		bar,
 		ctxPercent,
@@ -181,6 +187,8 @@ var availableCommands = []struct {
 	{"/context", "View or change context size"},
 	{"/compress", "Manually compress conversation history"},
 	{"/clear", "Clear conversation history and cache"},
+	{"/enablecache", "Enable prompt caching"},
+	{"/disablecache", "Disable prompt caching"},
 	{"/file", "Load a local file into context"},
 	{"/status", "Check RKLLM backend status"},
 	{"/quit", "Exit Scooter"},
@@ -744,6 +752,8 @@ func (m *model) handleCommand(input string) tea.Cmd {
 - /context [size]: View or change context limit (e.g. /context 8k, /context 16384)
 - /compress: Manually compress/summarize older conversation history
 - /clear: Clear conversation history and session cache
+- /disablecache: Disable prompt caching and remove cache files
+- /enablecache: Enable prompt caching for the next request
 - /file <path>: Load a local file into the conversation
 - /status: Check RKLLM backend status
 - /quit: Exit Scooter
@@ -753,6 +763,32 @@ func (m *model) handleCommand(input string) tea.Cmd {
 		m.chatHistory = append(m.chatHistory, Message{
 			Role:    "system",
 			Content: helpText,
+		})
+		m.refreshViewport()
+		return nil
+	}
+
+	if strings.HasPrefix(input, "/disablecache") {
+		cfg := loadConfig()
+		cfg.RKLLMCacheEnabled = false
+		_ = saveConfig(cfg)
+		removePromptCacheFiles()
+		m.chatHistory = append(m.chatHistory, Message{
+			Role:    "system",
+			Content: "Prompt caching disabled (`rkllm_cache_enabled` set to false) and existing cache files removed.",
+		})
+		m.refreshViewport()
+		return nil
+	}
+
+	if strings.HasPrefix(input, "/enablecache") {
+		cfg := loadConfig()
+		cfg.RKLLMCacheEnabled = true
+		_ = saveConfig(cfg)
+
+		m.chatHistory = append(m.chatHistory, Message{
+			Role:    "system",
+			Content: "Prompt caching enabled (`rkllm_cache_enabled` set to true); the cache will be built for the current system prompt on the next request.",
 		})
 		m.refreshViewport()
 		return nil
@@ -988,5 +1024,20 @@ func waitForStream(ch chan StreamMessage) tea.Cmd {
 			return StreamMessage{Done: true}
 		}
 		return msg
+	}
+}
+
+func removePromptCacheFiles() {
+	cacheDir, err := getCacheFile()
+	if err != nil {
+		return
+	}
+	dir := filepath.Dir(cacheDir)
+	matches, err := filepath.Glob(filepath.Join(dir, "*.rkllm_cache"))
+	if err != nil {
+		return
+	}
+	for _, m := range matches {
+		_ = os.Remove(m)
 	}
 }

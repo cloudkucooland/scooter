@@ -191,3 +191,29 @@ func getGoogleGenAIModel() string {
 	}
 	return defaultConfig.GoogleGenAIModel
 }
+
+func saveConfig(cfg Config) error {
+	configMu.Lock()
+	defer configMu.Unlock()
+
+	path, err := getConfigFilePath()
+	if err != nil {
+		return err
+	}
+
+	data, err := json.MarshalIndent(cfg, "", "  ")
+	if err != nil {
+		return err
+	}
+
+	if err := os.WriteFile(path, data, 0644); err != nil {
+		return err
+	}
+
+	cachedCfg = &cfg
+	cachedPath = path
+	if info, statErr := os.Stat(path); statErr == nil {
+		cachedModTime = info.ModTime()
+	}
+	return nil
+}
