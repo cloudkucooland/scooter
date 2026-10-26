@@ -155,22 +155,27 @@ func loadHydrationContext() *Message {
 
 func buildToolInstructions(tools []Tool) string {
 	var sb strings.Builder
-	sb.WriteString("You can call available local tools when necessary. Do not claim that a tool was run unless a Tool result is present.\n")
-	sb.WriteString("CRITICAL: When a tool is needed, you MUST output the `[TOOL_CALL]` block to execute it. Do NOT merely describe, discuss, or reason about calling a tool in plain text without outputting the `[TOOL_CALL]` markers.\n")
-	sb.WriteString("For a tool call, output only this exact JSON object between the markers, with no Markdown or commentary inside the markers:\n")
-	sb.WriteString("[TOOL_CALL]{\"name\":\"TOOL_NAME\",\"arguments\":{}}[/TOOL_CALL]\n")
-	sb.WriteString("Use valid JSON: double-quote keys and string values; arguments must be an object. A response may contain multiple complete tool calls. If reasoning or thinking through steps, always conclude your response with the required `[TOOL_CALL]` block to invoke the tool. Otherwise, answer in plain text.\n\n")
-	fmt.Fprintf(&sb, "File and directory operations are restricted to the working directory: %s (paths may be relative or absolute within this directory).\n\n", workingDir)
+	sb.WriteString("## Operational Tool Execution Policy\n")
+	sb.WriteString("1. You operate in a live production environment with full real-time tool execution capabilities.\n")
+	sb.WriteString("2. When a tool is required to fulfill a user's request, you MUST invoke it immediately. Do NOT explain, discuss, or speculate about tool availability, network access, or limitations in conversational text.\n")
+	sb.WriteString("3. NEVER claim a tool failed or is unavailable without attempting the execution first.\n")
+	sb.WriteString("4. To invoke a tool, output ONLY the JSON request wrapped in exact `[TOOL_CALL]` and `[/TOOL_CALL]` tags:\n")
+	sb.WriteString("   [TOOL_CALL]{\"name\": \"TOOL_NAME\", \"arguments\": {}}[/TOOL_CALL]\n")
+	sb.WriteString("5. Arguments must be a valid, single-line JSON object with double-quoted keys and string values.\n\n")
+
+	fmt.Fprintf(&sb, "File and directory operations are restricted to: %s\n\n", workingDir)
+
 	if GetActiveToolset() == "home" || GetActiveToolset() == "all" {
-		sb.WriteString("IMPORTANT (Smart Home IoT Control): You have direct control over local smart home devices via tools like set_device_state, set_brightness, and get_sysinfo. When the user asks to turn a light or device on or off, you MUST execute the appropriate tool call. Never refuse or tell the user to do it manually.\n\n")
+		sb.WriteString("IMPORTANT (Smart Home Control): You have active control over local smart home devices via set_device_state, set_brightness, and get_sysinfo. Execute the tool call immediately when asked to adjust devices.\n\n")
 	}
-	sb.WriteString("Tool calls and their named results are retained in the conversation. After a tool succeeds, use its result and do not repeat the same call unless the user explicitly asks again. If a tool call fails, explain the failure or try a different approach instead of repeating the same malformed call.\n\n")
+
 	sb.WriteString("Available tools:\n")
 
 	sortedTools := append([]Tool(nil), tools...)
 	sort.Slice(sortedTools, func(i, j int) bool {
 		return sortedTools[i].Function.Name < sortedTools[j].Function.Name
 	})
+
 	for _, tool := range sortedTools {
 		sb.WriteString(fmt.Sprintf("- %s: %s\n", tool.Function.Name, tool.Function.Description))
 		if len(tool.Function.Parameters.Properties) == 0 {
@@ -248,8 +253,21 @@ func main() {
 				Aliases: []string{"p"},
 				Usage:   "Run a single prompt non-interactively and exit",
 			},
+			&cli.BoolFlag{
+				Name:    "debug",
+				Aliases: []string{"d"},
+				Usage:   "Enable RKNN and RKLLM debug logging output",
+			},
 		},
 		Action: func(ctx context.Context, cmd *cli.Command) error {
+			if cmd.Bool("debug") {
+				_ = os.Setenv("RKNN_LOG_LEVEL", "1")
+				_ = os.Setenv("RKLLM_LOG_LEVEL", "1")
+			} else {
+				_ = os.Setenv("RKNN_LOG_LEVEL", "0")
+				_ = os.Setenv("RKLLM_LOG_LEVEL", "0")
+			}
+
 			toolset := cmd.String("toolset")
 			if toolset != "" {
 				if err := SetActiveToolset(toolset); err != nil {
@@ -288,14 +306,6 @@ func runNonInteractive(modelName, toolset, promptText string) error {
 	setActiveContextLimit(detected)
 
 	var history []Message
-	if toolset == "home" || toolset == "all" {
-		if ambient := GetHomeAmbientState(); ambient != "" {
-			history = append(history, Message{
-				Role:    "system",
-				Content: ambient,
-			})
-		}
-	}
 	history = append(history, Message{Role: "user", Content: promptText})
 
 	for rounds := 0; rounds < 5; rounds++ {

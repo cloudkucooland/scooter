@@ -94,9 +94,11 @@ type RKLLMInferParam struct {
 
 type functionPointer uintptr
 
-func goStringToBytePtr(s string) *byte {
+// stringToBytePtr creates a null-terminated byte slice and returns a pointer
+// to its first element alongside the backing slice so it can be pinned in scope.
+func stringToBytePtr(s string) (*byte, []byte) {
 	b := append([]byte(s), 0)
-	return &b[0]
+	return &b[0], b
 }
 
 func cStringToGo(ptr *byte) string {
@@ -196,7 +198,7 @@ func getRKLLMModelPath(modelName string) string {
 
 type rkllmSession struct {
 	inferMu              sync.Mutex // Serializes all NPU inferences & session init/teardown
-	mu                   sync.Mutex // Protects metadata (initialized, lastStderr, libPath, modelPath, active fields)
+	mu                   sync.Mutex // Protects metadata
 	lib                  uintptr
 	handle               LLMHandle
 	modelPath            string
@@ -219,118 +221,14 @@ type rkllmSession struct {
 
 var globalSession rkllmSession
 
-func abortRKLLM() {
-	globalSession.mu.Lock()
-	handle := globalSession.handle
-	abortFn := globalSession.rkllmAbort
-	isInit := globalSession.initialized
-	globalSession.mu.Unlock()
+// Package-level static callback allocation to prevent executable memory leaks across session reloads.
+var (
+	globalCallbackPtr  uintptr
+	globalCallbackOnce sync.Once
+)
 
-	if isInit && abortFn != nil && handle != nil {
-		abortFn(handle)
-	}
-}
-
-func closeRKLLMSession() {
-	globalSession.inferMu.Lock()
-	defer globalSession.inferMu.Unlock()
-
-	globalSession.mu.Lock()
-	defer globalSession.mu.Unlock()
-
-	if globalSession.initialized {
-		if globalSession.rkllmDestroy != nil && globalSession.handle != nil {
-			globalSession.rkllmDestroy(globalSession.handle)
-		}
-		globalSession.initialized = false
-		globalSession.handle = nil
-		globalSession.lib = 0
-	}
-}
-
-func captureStderr(fn func() error) (string, error) {
-	r, w, err := os.Pipe()
-	if err != nil {
-		return "", fn()
-	}
-	defer r.Close()
-
-	oldStderrFd, err := syscall.Dup(2)
-	if err != nil {
-		w.Close()
-		return "", fn()
-	}
-
-	outChan := make(chan string, 1)
-	go func() {
-		var buf bytes.Buffer
-		io.Copy(&buf, r)
-		outChan <- buf.String()
-	}()
-
-	var fnErr error
-	func() {
-		defer func() {
-			// Always restore stderr, even if fn() panics
-			syscall.Dup3(oldStderrFd, 2, 0)
-			syscall.Close(oldStderrFd)
-			w.Close()
-		}()
-		syscall.Dup3(int(w.Fd()), 2, 0)
-		fnErr = fn()
-	}()
-
-	captured := <-outChan
-	return strings.TrimSpace(captured), fnErr
-}
-
-func ensureSession(modelName string, contextLen int) error {
-	if contextLen <= 0 {
-		contextLen = getActiveContextLimit()
-	}
-	libPath := getRKLLMLibPath()
-	modelPath := getRKLLMModelPath(modelName)
-
-	globalSession.mu.Lock()
-	if globalSession.initialized && globalSession.modelPath == modelPath && globalSession.libPath == libPath && globalSession.contextLen == contextLen {
-		globalSession.justLoaded = false
-		globalSession.mu.Unlock()
-		return nil
-	}
-
-	if globalSession.initialized {
-		if globalSession.rkllmDestroy != nil && globalSession.handle != nil {
-			globalSession.rkllmDestroy(globalSession.handle)
-		}
-		globalSession.initialized = false
-		globalSession.handle = nil
-	}
-	lib := globalSession.lib
-	globalSession.mu.Unlock()
-
-	var handle LLMHandle
-	var rkllmCreateDefaultParam func() RKLLMParam
-	var rkllmInit func(handle *LLMHandle, param *RKLLMParam, callback *RKLLMCallback) int32
-	var rkllmRun func(handle LLMHandle, input *RKLLMInput, inferParams *RKLLMInferParam, userdata unsafe.Pointer) int32
-	var rkllmDestroy func(handle LLMHandle) int32
-	var rkllmAbort func(handle LLMHandle) int32
-	var rkllmLoadPromptCache func(handle LLMHandle, path *byte) int32
-
-	capturedStderr, err := captureStderr(func() error {
-		if lib == 0 {
-			var dlErr error
-			lib, dlErr = purego.Dlopen(libPath, purego.RTLD_NOW|purego.RTLD_GLOBAL)
-			if dlErr != nil {
-				return dlErr
-			}
-		}
-
-		purego.RegisterLibFunc(&rkllmCreateDefaultParam, lib, "rkllm_createDefaultParam")
-		purego.RegisterLibFunc(&rkllmInit, lib, "rkllm_init")
-		purego.RegisterLibFunc(&rkllmRun, lib, "rkllm_run")
-		purego.RegisterLibFunc(&rkllmDestroy, lib, "rkllm_destroy")
-		purego.RegisterLibFunc(&rkllmAbort, lib, "rkllm_abort")
-
+func getRKLLMCallback() RKLLMCallback {
+	globalCallbackOnce.Do(func() {
 		callbackFn := func(result *RKLLMResult, userdata unsafe.Pointer, state LLMCallState) uintptr {
 			globalSession.mu.Lock()
 			ch := globalSession.activeChan
@@ -385,21 +283,141 @@ func ensureSession(modelName string, contextLen int) error {
 			}
 			return 0
 		}
+		globalCallbackPtr = purego.NewCallback(callbackFn)
+	})
 
-		callbackPtr := purego.NewCallback(callbackFn)
-		cbStruct := RKLLMCallback{
-			Callback: functionPointer(callbackPtr),
-			Userdata: nil,
+	return RKLLMCallback{
+		Callback: functionPointer(globalCallbackPtr),
+		Userdata: nil,
+	}
+}
+
+func abortRKLLM() {
+	globalSession.mu.Lock()
+	handle := globalSession.handle
+	abortFn := globalSession.rkllmAbort
+	isInit := globalSession.initialized
+	globalSession.mu.Unlock()
+
+	if isInit && abortFn != nil && handle != nil {
+		abortFn(handle)
+	}
+}
+
+func closeRKLLMSession() {
+	globalSession.inferMu.Lock()
+	defer globalSession.inferMu.Unlock()
+
+	globalSession.mu.Lock()
+	defer globalSession.mu.Unlock()
+
+	if globalSession.initialized {
+		if globalSession.rkllmDestroy != nil && globalSession.handle != nil {
+			globalSession.rkllmDestroy(globalSession.handle)
 		}
+		globalSession.initialized = false
+		globalSession.handle = nil
+		globalSession.lib = 0
+	}
+}
+
+func captureStderr(fn func() error) (string, error) {
+	r, w, err := os.Pipe()
+	if err != nil {
+		return "", fn()
+	}
+	defer r.Close()
+
+	oldStderrFd, err := syscall.Dup(2)
+	if err != nil {
+		w.Close()
+		return "", fn()
+	}
+
+	outChan := make(chan string, 1)
+	go func() {
+		var buf bytes.Buffer
+		_, _ = io.Copy(&buf, r)
+		outChan <- buf.String()
+	}()
+
+	var fnErr error
+	func() {
+		defer func() {
+			syscall.Dup3(oldStderrFd, 2, 0)
+			syscall.Close(oldStderrFd)
+			w.Close()
+		}()
+		syscall.Dup3(int(w.Fd()), 2, 0)
+		fnErr = fn()
+	}()
+
+	captured := <-outChan
+	return strings.TrimSpace(captured), fnErr
+}
+
+func ensureSession(modelName string, contextLen int) error {
+	if contextLen <= 0 {
+		contextLen = getActiveContextLimit()
+	}
+	libPath := getRKLLMLibPath()
+	modelPath := getRKLLMModelPath(modelName)
+
+	globalSession.mu.Lock()
+	if globalSession.initialized && globalSession.modelPath == modelPath && globalSession.libPath == libPath && globalSession.contextLen == contextLen {
+		globalSession.justLoaded = false
+		globalSession.mu.Unlock()
+		return nil
+	}
+
+	if globalSession.initialized {
+		if globalSession.rkllmDestroy != nil && globalSession.handle != nil {
+			globalSession.rkllmDestroy(globalSession.handle)
+		}
+		globalSession.initialized = false
+		globalSession.handle = nil
+	}
+	lib := globalSession.lib
+	globalSession.mu.Unlock()
+
+	var handle LLMHandle
+	var rkllmCreateDefaultParam func() RKLLMParam
+	var rkllmInit func(handle *LLMHandle, param *RKLLMParam, callback *RKLLMCallback) int32
+	var rkllmRun func(handle LLMHandle, input *RKLLMInput, inferParams *RKLLMInferParam, userdata unsafe.Pointer) int32
+	var rkllmDestroy func(handle LLMHandle) int32
+	var rkllmAbort func(handle LLMHandle) int32
+	var rkllmLoadPromptCache func(handle LLMHandle, path *byte) int32
+
+	capturedStderr, err := captureStderr(func() error {
+		if lib == 0 {
+			var dlErr error
+			// Pure RTLD_NOW without RTLD_GLOBAL prevents symbol contamination
+			lib, dlErr = purego.Dlopen(libPath, purego.RTLD_NOW)
+			if dlErr != nil {
+				return dlErr
+			}
+		}
+
+		purego.RegisterLibFunc(&rkllmCreateDefaultParam, lib, "rkllm_createDefaultParam")
+		purego.RegisterLibFunc(&rkllmInit, lib, "rkllm_init")
+		purego.RegisterLibFunc(&rkllmRun, lib, "rkllm_run")
+		purego.RegisterLibFunc(&rkllmDestroy, lib, "rkllm_destroy")
+		purego.RegisterLibFunc(&rkllmAbort, lib, "rkllm_abort")
+
+		cbStruct := getRKLLMCallback()
+
+		modelPathPtr, modelPathSlice := stringToBytePtr(modelPath)
+		defer runtime.KeepAlive(modelPathSlice)
 
 		param := rkllmCreateDefaultParam()
-		param.ModelPath = goStringToBytePtr(modelPath)
+		param.ModelPath = modelPathPtr
 		param.MaxContextLen = int32(contextLen)
-		newTokens := int32(512)
-		if contextLen >= 16384 {
-			newTokens = 1024
-		}
-		param.MaxNewTokens = newTokens
+
+		// Set high generation upper bound to prevent truncating agent/tool responses
+		param.MaxNewTokens = 4096
+
+		// Enable all 3 NPU Cores on the RK3588 (Core 0 + Core 1 + Core 2 mask)
+		param.ExtendParam[0] = 7
 
 		purego.RegisterLibFunc(&rkllmLoadPromptCache, lib, "rkllm_load_prompt_cache")
 
@@ -512,7 +530,6 @@ func streamRKLLM(ctx context.Context, modelName string, history []Message, chann
 		globalSession.mu.Unlock()
 	}()
 
-	// If the model was just loaded and emitted stderr logs, send them as a system message first
 	if justLoaded && lastStderr != "" {
 		select {
 		case <-ctx.Done():
@@ -573,7 +590,7 @@ func streamRKLLM(ctx context.Context, modelName string, history []Message, chann
 	var cacheParam RKLLMPromptCacheParam
 	systemPrompt := "System:\n" + strings.Join(systemParts, "\n\n") + "\n\n"
 	cacheFile := getPromptCacheFileForSystemPrompt(activeModelPath, contextLen, systemPrompt)
-	cacheLoaded := false
+	// cacheLoaded := false
 
 	if cfg.RKLLMCacheEnabled && loadPromptCacheFn != nil {
 		if _, err := os.Stat(cacheFile); err != nil {
@@ -582,12 +599,13 @@ func streamRKLLM(ctx context.Context, modelName string, history []Message, chann
 					fmt.Fprintf(os.Stderr, "Warning: create prompt cache directory: %v\n", mkdirErr)
 				}
 			}
-			// Do not stream the cache-building inference as if it were the answer.
 			globalSession.mu.Lock()
 			previousChan, previousParser, previousCtx := globalSession.activeChan, globalSession.activeParser, globalSession.activeCtx
 			globalSession.activeChan, globalSession.activeParser, globalSession.activeCtx = nil, nil, nil
 			globalSession.mu.Unlock()
+
 			cacheErr := createSystemPromptCache(runFn, handle, cacheFile, systemPrompt)
+
 			globalSession.mu.Lock()
 			globalSession.activeChan, globalSession.activeParser, globalSession.activeCtx = previousChan, previousParser, previousCtx
 			globalSession.mu.Unlock()
@@ -596,27 +614,38 @@ func streamRKLLM(ctx context.Context, modelName string, history []Message, chann
 			}
 		}
 		if _, err := os.Stat(cacheFile); err == nil {
-			if ret := loadPromptCacheFn(handle, goStringToBytePtr(cacheFile)); ret != 0 {
+			cachePathPtr, cachePathSlice := stringToBytePtr(cacheFile)
+			defer runtime.KeepAlive(cachePathSlice)
+
+			if ret := loadPromptCacheFn(handle, cachePathPtr); ret != 0 {
 				fmt.Fprintf(os.Stderr, "Warning: rkllm_load_prompt_cache failed: %d\n", ret)
 			} else {
-				cacheLoaded = true
+				// cacheLoaded = true
 				cacheParam.SavePromptCache = 0
-				cacheParam.CachePath = goStringToBytePtr(cacheFile)
+				cacheParam.CachePath = cachePathPtr
 				inferParams.PromptCacheParams = &cacheParam
 			}
 		}
 	}
 
-	var conversationPrompt string
+	/* librkllmrt.so prompt caching does NOT work by loading a static file into memory and letting you append arbitrary context on the fly without system wrappers.
+In librkllmrt, rkllm_load_prompt_cache expects the incoming prompt in rkllm_run to contain the exact prefix matching the cached tokens, or the transformer position embeddings ($pos_0, pos_1, ...$  ) alignment breaks!
+	*/
+	/* var conversationPrompt string
 	if cacheLoaded {
 		conversationPrompt = prompt.String()
 	} else {
 		conversationPrompt = systemPrompt + prompt.String()
-	}
+	} */
+	// Always include systemPrompt in the text so positional embeddings align with the cache, 
+	conversationPrompt := systemPrompt + prompt.String()
+
+	promptPtr, promptSlice := stringToBytePtr(conversationPrompt)
+	defer runtime.KeepAlive(promptSlice)
 
 	input := RKLLMInput{
 		InputType:   RKLLM_INPUT_PROMPT,
-		PromptInput: goStringToBytePtr(conversationPrompt),
+		PromptInput: promptPtr,
 	}
 
 	if ret := runFn(handle, &input, &inferParams, nil); ret != 0 {
@@ -656,7 +685,9 @@ func runRKLLMSummary(modelName string, messages []Message) (string, error) {
 	runtime.LockOSThread()
 	defer runtime.UnlockOSThread()
 
-	prompt := "System:\nSummarize the conversation for a future assistant. Preserve user goals, decisions, changed files, relevant tool results, and unresolved work. Omit chatter. Return only the summary.\n\n" + renderMessages(messages) + "\n\nAssistant: "
+	promptStr := "System:\nSummarize the conversation for a future assistant. Preserve user goals, decisions, changed files, relevant tool results, and unresolved work. Omit chatter. Return only the summary.\n\n" + renderMessages(messages) + "\n\nAssistant: "
+	promptPtr, promptSlice := stringToBytePtr(promptStr)
+	defer runtime.KeepAlive(promptSlice)
 
 	inferParams := RKLLMInferParam{
 		Mode: RKLLM_INFER_GENERATE,
@@ -664,7 +695,7 @@ func runRKLLMSummary(modelName string, messages []Message) (string, error) {
 
 	input := RKLLMInput{
 		InputType:   RKLLM_INPUT_PROMPT,
-		PromptInput: goStringToBytePtr(prompt),
+		PromptInput: promptPtr,
 	}
 
 	if ret := runFn(handle, &input, &inferParams, nil); ret != 0 {
@@ -746,14 +777,14 @@ func createSystemPromptCache(
 	systemOnlyPrompt string,
 ) error {
 	if _, err := os.Stat(systemCacheFile); err == nil {
-		return nil // Cache file already created
+		return nil
 	}
 
-	// Explicitly zero-initialize the cache parameter struct
 	var cacheParam RKLLMPromptCacheParam
+	cachePathPtr, cachePathSlice := stringToBytePtr(systemCacheFile)
+	defer runtime.KeepAlive(cachePathSlice)
 
-	// Convert string to null-terminated C string byte pointer
-	cacheParam.CachePath = goStringToBytePtr(systemCacheFile)
+	cacheParam.CachePath = cachePathPtr
 	cacheParam.SavePromptCache = 1
 
 	inferParams := RKLLMInferParam{
@@ -761,9 +792,12 @@ func createSystemPromptCache(
 		PromptCacheParams: &cacheParam,
 	}
 
+	promptPtr, promptSlice := stringToBytePtr(systemOnlyPrompt)
+	defer runtime.KeepAlive(promptSlice)
+
 	input := RKLLMInput{
 		InputType:   RKLLM_INPUT_PROMPT,
-		PromptInput: goStringToBytePtr(systemOnlyPrompt),
+		PromptInput: promptPtr,
 	}
 
 	ret := runFn(handle, &input, &inferParams, nil)
