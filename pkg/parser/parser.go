@@ -1,4 +1,4 @@
-package main
+package parser
 
 import (
 	"bytes"
@@ -6,15 +6,17 @@ import (
 	"fmt"
 	"io"
 	"strings"
+
+	"codeberg.org/indievisible/scooter/pkg/types"
 )
 
 const (
-	toolCallStartTag = "[TOOL_CALL]"
-	toolCallEndTag   = "[/TOOL_CALL]"
-	// Tool calls may contain a source file, but must still be bounded so a
-	// malformed model response cannot grow memory without limit.
-	MaxToolCallSize = 256 * 1024
+	ToolCallStartTag = "[TOOL_CALL]"
+	ToolCallEndTag   = "[/TOOL_CALL]"
+	MaxToolCallSize  = 256 * 1024
 )
+
+var LogDebug = func(format string, v ...any) {}
 
 type RkToolParser struct {
 	buffer     strings.Builder
@@ -30,23 +32,18 @@ func (p *RkToolParser) Reset() {
 	p.inToolCall = false
 }
 
-// ProcessChunk returns text safe to display and every complete, valid tool call
-// found in the chunk. Invalid calls are returned as ordinary text so they can
-// never be executed accidentally.
-func (p *RkToolParser) ProcessChunk(text string) (string, []ToolCall) {
+func (p *RkToolParser) ProcessChunk(text string) (string, []types.ToolCall) {
 	p.buffer.WriteString(text)
 
 	var visible strings.Builder
-	var calls []ToolCall
+	var calls []types.ToolCall
 
 	for {
 		content := p.buffer.String()
 		if !p.inToolCall {
-			start := strings.Index(content, toolCallStartTag)
+			start := strings.Index(content, ToolCallStartTag)
 			if start == -1 {
-				// Keep only a suffix that could become the opening marker in the
-				// next streamed chunk. This prevents leaking split markers.
-				keep := partialTagSuffix(content, toolCallStartTag)
+				keep := partialTagSuffix(content, ToolCallStartTag)
 				visible.WriteString(content[:len(content)-keep])
 				p.buffer.Reset()
 				if keep > 0 {
@@ -58,15 +55,15 @@ func (p *RkToolParser) ProcessChunk(text string) (string, []ToolCall) {
 			visible.WriteString(content[:start])
 			p.inToolCall = true
 			p.buffer.Reset()
-			p.buffer.WriteString(content[start+len(toolCallStartTag):])
+			p.buffer.WriteString(content[start+len(ToolCallStartTag):])
 			continue
 		}
 
-		end := strings.Index(content, toolCallEndTag)
+		end := strings.Index(content, ToolCallEndTag)
 		if end == -1 {
 			if len(content) > MaxToolCallSize {
-				logDebug("Tool call exceeded %d bytes; rendering it as text.", MaxToolCallSize)
-				visible.WriteString(toolCallStartTag)
+				LogDebug("Tool call exceeded %d bytes; rendering it as text.", MaxToolCallSize)
+				visible.WriteString(ToolCallStartTag)
 				visible.WriteString(content)
 				p.Reset()
 			}
@@ -74,17 +71,15 @@ func (p *RkToolParser) ProcessChunk(text string) (string, []ToolCall) {
 		}
 
 		rawCall := strings.TrimSpace(content[:end])
-		remaining := content[end+len(toolCallEndTag):]
+		remaining := content[end+len(ToolCallEndTag):]
 		p.inToolCall = false
 		p.buffer.Reset()
 		p.buffer.WriteString(remaining)
 
 		call, err := parseToolCall(rawCall)
 		if err != nil {
-			// Do not repair or execute malformed JSON. Return a tool error call
-			// so the model receives structured feedback via role: tool.
-			logDebug("Invalid tool call: %v; payload: %s", err, rawCall)
-			call = ToolCall{
+			LogDebug("Invalid tool call: %v; payload: %s", err, rawCall)
+			call = types.ToolCall{
 				Function: struct {
 					Name      string          `json:"name"`
 					Arguments json.RawMessage `json:"arguments"`
@@ -113,7 +108,7 @@ func partialTagSuffix(text, tag string) int {
 	return 0
 }
 
-func parseToolCall(raw string) (ToolCall, error) {
+func parseToolCall(raw string) (types.ToolCall, error) {
 	clean := strings.TrimSpace(raw)
 	clean = strings.TrimPrefix(clean, "```json")
 	clean = strings.TrimPrefix(clean, "```")
@@ -126,14 +121,14 @@ func parseToolCall(raw string) (ToolCall, error) {
 	}
 	decoder := json.NewDecoder(strings.NewReader(clean))
 	if err := decoder.Decode(&envelope); err != nil {
-		return ToolCall{}, fmt.Errorf("invalid JSON: %w", err)
+		return types.ToolCall{}, fmt.Errorf("invalid JSON: %w", err)
 	}
 	var trailing any
 	if err := decoder.Decode(&trailing); err != io.EOF {
 		if err == nil {
-			return ToolCall{}, fmt.Errorf("tool call contains multiple JSON values")
+			return types.ToolCall{}, fmt.Errorf("tool call contains multiple JSON values")
 		}
-		return ToolCall{}, fmt.Errorf("invalid trailing JSON: %w", err)
+		return types.ToolCall{}, fmt.Errorf("invalid trailing JSON: %w", err)
 	}
 
 	name := envelope.Name
@@ -144,12 +139,12 @@ func parseToolCall(raw string) (ToolCall, error) {
 			Arguments json.RawMessage `json:"arguments"`
 		}
 		if err := json.Unmarshal(envelope.Function, &function); err != nil {
-			return ToolCall{}, fmt.Errorf("invalid function object: %w", err)
+			return types.ToolCall{}, fmt.Errorf("invalid function object: %w", err)
 		}
 		name, arguments = function.Name, function.Arguments
 	}
 	if strings.TrimSpace(name) == "" {
-		return ToolCall{}, fmt.Errorf("missing function name")
+		return types.ToolCall{}, fmt.Errorf("missing function name")
 	}
 	arguments = bytes.TrimSpace(arguments)
 	if len(arguments) == 0 || bytes.Equal(arguments, []byte("null")) {
@@ -158,16 +153,16 @@ func parseToolCall(raw string) (ToolCall, error) {
 	if arguments[0] == '"' {
 		var encoded string
 		if err := json.Unmarshal(arguments, &encoded); err != nil {
-			return ToolCall{}, fmt.Errorf("invalid encoded arguments: %w", err)
+			return types.ToolCall{}, fmt.Errorf("invalid encoded arguments: %w", err)
 		}
 		arguments = json.RawMessage(encoded)
 	}
 	var object map[string]json.RawMessage
 	if err := json.Unmarshal(arguments, &object); err != nil {
-		return ToolCall{}, fmt.Errorf("arguments must be a JSON object: %w", err)
+		return types.ToolCall{}, fmt.Errorf("arguments must be a JSON object: %w", err)
 	}
 
-	var call ToolCall
+	var call types.ToolCall
 	call.Function.Name = name
 	call.Function.Arguments = arguments
 	return call, nil

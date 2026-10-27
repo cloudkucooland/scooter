@@ -8,10 +8,30 @@ import (
 	"path/filepath"
 	"regexp"
 	"strings"
+	"sync"
 	"time"
 
+	"codeberg.org/indievisible/scooter/pkg/knowledge"
 	"google.golang.org/genai"
 )
+
+var (
+	sharedKnowledgeDB *knowledge.KnowledgeDB
+	knowledgeMu       sync.Mutex
+)
+
+func getSharedKnowledgeDB() (*knowledge.KnowledgeDB, error) {
+	knowledgeMu.Lock()
+	defer knowledgeMu.Unlock()
+	if sharedKnowledgeDB == nil {
+		kdb, err := knowledge.Open()
+		if err != nil {
+			return nil, err
+		}
+		sharedKnowledgeDB = kdb
+	}
+	return sharedKnowledgeDB, nil
+}
 
 func dispatchToolCall(name string, rawArgs json.RawMessage) string {
 	logDebug("dispatchToolCall called: %s, Args: %s", name, string(rawArgs))
@@ -25,6 +45,149 @@ func dispatchToolCall(name string, rawArgs json.RawMessage) string {
 			errMsg = string(rawArgs)
 		}
 		return fmt.Sprintf("Tool Error: %s", errMsg)
+
+	case "search_knowledge":
+		var args SearchKnowledgeArgs
+		if err := json.Unmarshal(rawArgs, &args); err != nil {
+			return fmt.Sprintf("System Error parsing arguments: %v", err)
+		}
+		if strings.TrimSpace(args.Query) == "" {
+			return "System Error: query is required"
+		}
+		kdb, err := getSharedKnowledgeDB()
+		if err != nil {
+			return fmt.Sprintf("System Error opening knowledge base: %v", err)
+		}
+		results, err := kdb.Search(args.Query, args.Collection, args.Limit)
+		if err != nil {
+			return fmt.Sprintf("Search Error: %v", err)
+		}
+		if len(results) == 0 {
+			return "No matching knowledge found."
+		}
+		var sb strings.Builder
+		sb.WriteString("Knowledge Search Results:\n")
+		for i, r := range results {
+			sb.WriteString(fmt.Sprintf("[%d] %s (%s)\n%s\n\n", i+1, r.Title, r.Collection, r.Content))
+		}
+		return sb.String()
+
+	case "ingest_knowledge":
+		var args IngestKnowledgeArgs
+		if err := json.Unmarshal(rawArgs, &args); err != nil {
+			return fmt.Sprintf("System Error parsing arguments: %v", err)
+		}
+		if strings.TrimSpace(args.FilePath) == "" {
+			return "System Error: file_path is required"
+		}
+		absPath, err := validatePath(args.FilePath)
+		if err != nil {
+			return fmt.Sprintf("System Error: %v", err)
+		}
+		kdb, err := getSharedKnowledgeDB()
+		if err != nil {
+			return fmt.Sprintf("System Error opening knowledge base: %v", err)
+		}
+		coll := args.Collection
+		if coll == "" {
+			coll = "main"
+		}
+		docID, err := kdb.IngestFile(absPath, coll)
+		if err != nil {
+			return fmt.Sprintf("Ingest Error: %v", err)
+		}
+		return fmt.Sprintf("Successfully ingested %s into collection %q (Doc ID: %s)", args.FilePath, coll, docID)
+
+	case "search_knowledge_hybrid":
+		var args SearchKnowledgeHybridArgs
+		if err := json.Unmarshal(rawArgs, &args); err != nil {
+			return fmt.Sprintf("System Error parsing arguments: %v", err)
+		}
+		if strings.TrimSpace(args.Query) == "" {
+			return "System Error: query is required"
+		}
+		kdb, err := getSharedKnowledgeDB()
+		if err != nil {
+			return fmt.Sprintf("System Error opening knowledge base: %v", err)
+		}
+		results, err := kdb.SearchHybrid(args.Query, args.Collection, args.Limit)
+		if err != nil {
+			return fmt.Sprintf("Hybrid Search Error: %v", err)
+		}
+		if len(results) == 0 {
+			return "No matching knowledge found."
+		}
+		var sb strings.Builder
+		sb.WriteString("Hybrid Knowledge Search Results:\n")
+		for i, r := range results {
+			sb.WriteString(fmt.Sprintf("[%d] %s (%s)\n%s\n\n", i+1, r.Title, r.Collection, r.Content))
+		}
+		return sb.String()
+
+	case "list_collections":
+		kdb, err := getSharedKnowledgeDB()
+		if err != nil {
+			return fmt.Sprintf("System Error opening knowledge base: %v", err)
+		}
+		cols, err := kdb.ListCollections()
+		if err != nil {
+			return fmt.Sprintf("List Collections Error: %v", err)
+		}
+		if len(cols) == 0 {
+			return "No document collections found."
+		}
+		return fmt.Sprintf("Available Collections:\n- %s", strings.Join(cols, "\n- "))
+
+	case "query_graph":
+		var args QueryGraphArgs
+		if err := json.Unmarshal(rawArgs, &args); err != nil {
+			return fmt.Sprintf("System Error parsing arguments: %v", err)
+		}
+		if strings.TrimSpace(args.SourceID) == "" {
+			return "System Error: source_id is required"
+		}
+		kdb, err := getSharedKnowledgeDB()
+		if err != nil {
+			return fmt.Sprintf("System Error opening knowledge base: %v", err)
+		}
+		edges, err := kdb.QueryGraph(args.SourceID, args.Relation)
+		if err != nil {
+			return fmt.Sprintf("Graph Query Error: %v", err)
+		}
+		if len(edges) == 0 {
+			return "No connected graph relationships found."
+		}
+		var sb strings.Builder
+		sb.WriteString(fmt.Sprintf("Graph Relationships for %q:\n", args.SourceID))
+		for i, e := range edges {
+			sb.WriteString(fmt.Sprintf("[%d] --[%s]--> %s (weight: %.2f)\n", i+1, e.Relation, e.TargetID, e.Weight))
+		}
+		return sb.String()
+
+	case "reembed_knowledge":
+		var args ReembedKnowledgeArgs
+		if err := json.Unmarshal(rawArgs, &args); err != nil {
+			return fmt.Sprintf("System Error parsing arguments: %v", err)
+		}
+		if strings.TrimSpace(args.ModelName) == "" {
+			return "System Error: model_name is required"
+		}
+		kdb, err := getSharedKnowledgeDB()
+		if err != nil {
+			return fmt.Sprintf("System Error opening knowledge base: %v", err)
+		}
+		dummyEmbed := func(content string) ([]float32, error) {
+			vec := make([]float32, 128)
+			for i := range vec {
+				vec[i] = float32(len(content)+i) * 0.01
+			}
+			return vec, nil
+		}
+		err = kdb.ReembedChunks(args.ModelName, dummyEmbed)
+		if err != nil {
+			return fmt.Sprintf("Reembed Error: %v", err)
+		}
+		return fmt.Sprintf("Successfully re-embedded knowledge chunks for model %q.", args.ModelName)
 
 	case "apply_patch":
 		var args ApplyPatchArgs
@@ -110,12 +273,7 @@ func dispatchToolCall(name string, rawArgs json.RawMessage) string {
 		if err := json.Unmarshal(rawArgs, &args); err != nil {
 			return fmt.Sprintf("System Error parsing arguments: %v", err)
 		}
-		targetPrompt := args.Prompt
-		if targetPrompt == "" && args.URL != "" {
-			targetPrompt = args.URL
-		}
-
-		return webFetch(targetPrompt)
+		return webFetch(args.Prompt, rawArgs)
 
 	case "git_status", "git_diff":
 		var args GitPathArgs

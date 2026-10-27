@@ -9,6 +9,9 @@ import (
 	"strings"
 	"time"
 
+	"codeberg.org/indievisible/scooter/pkg/knowledge"
+	"codeberg.org/indievisible/scooter/pkg/rkllm"
+	"github.com/charmbracelet/bubbles/textarea"
 	tea "github.com/charmbracelet/bubbletea"
 )
 
@@ -64,7 +67,7 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 					if cancel != nil {
 						cancel()
 					}
-					abortRKLLM()
+					rkllm.AbortRKLLM()
 				}()
 			}
 			return m, tea.Quit
@@ -107,7 +110,7 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				if strings.HasPrefix(lowerVal, "/model ") {
 					query = strings.TrimSpace(val[len("/model "):])
 				}
-				models := listRKLLMModels()
+				models := rkllm.ListRKLLMModels()
 				for _, mdl := range models {
 					if query == "" || strings.Contains(strings.ToLower(mdl), strings.ToLower(query)) {
 						m.textarea.SetValue("/model " + mdl)
@@ -133,7 +136,7 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			return m, tea.ClearScreen
 		case tea.KeyEsc:
 			if m.isStreaming {
-				abortRKLLM()
+				rkllm.AbortRKLLM()
 				if m.streamCancel != nil {
 					m.streamCancel()
 					m.streamCancel = nil
@@ -350,7 +353,7 @@ func (m *model) handleCommand(input string) tea.Cmd {
 - /models: List available RKLLM models
 - /model <name>: Switch active RKLLM model
 - /toolsets: List available toolsets
-- /toolset <name>: Switch active toolset (development, home/iot, web, all)
+- /toolset <name>: Switch active toolset (development, web, all)
 - /context [size]: View or change context limit (e.g. /context 8k, /context 16384)
 - /compress: Manually compress/summarize older conversation history
 - /clear: Clear conversation history and session cache
@@ -410,7 +413,7 @@ func (m *model) handleCommand(input string) tea.Cmd {
 
 	if strings.HasPrefix(input, "/model ") {
 		newModel := strings.TrimSpace(strings.TrimPrefix(input, "/model "))
-		resolved := getRKLLMModelPath(newModel)
+		resolved := rkllm.GetRKLLMModelPath(newModel)
 		m.modelName = resolved
 		detected := detectContextLength(resolved)
 		m.contextLen = detected
@@ -516,6 +519,49 @@ func (m *model) handleCommand(input string) tea.Cmd {
 		return nil
 	}
 
+	if strings.HasPrefix(input, "/ingest ") {
+		filePath := strings.TrimSpace(strings.TrimPrefix(input, "/ingest "))
+		kdb, err := knowledge.Open()
+		if err != nil {
+			m.chatHistory = append(m.chatHistory, Message{Role: "system", Content: "Error opening knowledge db: " + err.Error()})
+		} else {
+			defer kdb.Close()
+			docID, err := kdb.IngestFile(filePath, "main")
+			if err != nil {
+				m.chatHistory = append(m.chatHistory, Message{Role: "system", Content: "Error ingesting file " + filePath + ": " + err.Error()})
+			} else {
+				m.chatHistory = append(m.chatHistory, Message{Role: "system", Content: fmt.Sprintf("Successfully ingested %s (Doc ID: %s) into knowledge base.", filePath, docID)})
+			}
+		}
+		m.refreshViewport()
+		return nil
+	}
+
+	if strings.HasPrefix(input, "/knowledge ") {
+		query := strings.TrimSpace(strings.TrimPrefix(input, "/knowledge "))
+		kdb, err := knowledge.Open()
+		if err != nil {
+			m.chatHistory = append(m.chatHistory, Message{Role: "system", Content: "Error opening knowledge db: " + err.Error()})
+		} else {
+			defer kdb.Close()
+			results, err := kdb.Search(query, "", 5)
+			if err != nil {
+				m.chatHistory = append(m.chatHistory, Message{Role: "system", Content: "Knowledge search error: " + err.Error()})
+			} else if len(results) == 0 {
+				m.chatHistory = append(m.chatHistory, Message{Role: "system", Content: "No matching knowledge found for: " + query})
+			} else {
+				var sb strings.Builder
+				sb.WriteString(fmt.Sprintf("Knowledge search results for %q:\n\n", query))
+				for i, r := range results {
+					sb.WriteString(fmt.Sprintf("[%d] **%s** (%s)\n%s\n\n", i+1, r.Title, r.Collection, r.Content))
+				}
+				m.chatHistory = append(m.chatHistory, Message{Role: "system", Content: sb.String()})
+			}
+		}
+		m.refreshViewport()
+		return nil
+	}
+
 	if strings.HasPrefix(input, "/compress") {
 		return compressHistoryCmd(m.modelName, m.chatHistory, true, m.historyGeneration)
 	}
@@ -536,7 +582,7 @@ func (m *model) handleCommand(input string) tea.Cmd {
 	ctx, cancel := context.WithCancel(context.Background())
 	m.streamCancel = cancel
 
-	go streamRKLLM(ctx, m.modelName, m.chatHistory, m.streamChan)
+	go rkllm.StreamRKLLM(ctx, m.modelName, m.chatHistory, m.streamChan)
 	return waitForStream(m.streamChan)
 }
 
@@ -594,7 +640,7 @@ func (m *model) resumeOrProcessNextTools() tea.Cmd {
 	m.streamChan = make(chan StreamMessage, 10)
 	ctx, cancel := context.WithCancel(context.Background())
 	m.streamCancel = cancel
-	go streamRKLLM(ctx, m.modelName, m.chatHistory, m.streamChan)
+	go rkllm.StreamRKLLM(ctx, m.modelName, m.chatHistory, m.streamChan)
 	return waitForStream(m.streamChan)
 }
 

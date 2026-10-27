@@ -306,6 +306,93 @@ func getDevelopmentTools() []Tool {
 				},
 			},
 		},
+		{
+			Type: "function",
+			Function: FunctionDefinition{
+				Name:        "search_knowledge",
+				Description: "Searches the local knowledge base for relevant content.",
+				Parameters: Parameters{
+					Type: "object",
+					Properties: map[string]Property{
+						"query":      {Type: "string", Description: "Search query or keywords to find matching content."},
+						"collection": {Type: "string", Description: "Optional collection or series filter."},
+						"limit":      {Type: "integer", Description: "Optional maximum number of results to return (defaults to 5)."},
+					},
+					Required: []string{"query"},
+				},
+			},
+		},
+		{
+			Type: "function",
+			Function: FunctionDefinition{
+				Name:        "ingest_knowledge",
+				Description: "Ingests a local file into the knowledge base so it can be searched and analyzed later.",
+				Parameters: Parameters{
+					Type: "object",
+					Properties: map[string]Property{
+						"file_path":  {Type: "string", Description: "Path to the file to ingest."},
+						"collection": {Type: "string", Description: "Optional collection or series name."},
+					},
+					Required: []string{"file_path"},
+				},
+			},
+		},
+		{
+			Type: "function",
+			Function: FunctionDefinition{
+				Name:        "search_knowledge_hybrid",
+				Description: "Searches the knowledge base using semantic vector similarity and keyword search combined.",
+				Parameters: Parameters{
+					Type: "object",
+					Properties: map[string]Property{
+						"query":      {Type: "string", Description: "Natural language query or concept."},
+						"collection": {Type: "string", Description: "Optional collection or series filter."},
+						"limit":      {Type: "integer", Description: "Max results to return (default 5)."},
+					},
+					Required: []string{"query"},
+				},
+			},
+		},
+		{
+			Type: "function",
+			Function: FunctionDefinition{
+				Name:        "list_collections",
+				Description: "Lists all available document collections and sermon series in the knowledge base.",
+				Parameters: Parameters{
+					Type:       "object",
+					Properties: map[string]Property{},
+				},
+			},
+		},
+		{
+			Type: "function",
+			Function: FunctionDefinition{
+				Name:        "query_graph",
+				Description: "Queries outgoing relationships and connected entities for a graph node (e.g., scripture references or metaphors tied to a sermon or preacher).",
+				Parameters: Parameters{
+					Type: "object",
+					Properties: map[string]Property{
+						"source_id": {Type: "string", Description: "ID of the root node (e.g., 'preacher_scot' or 'passage_exodus_16_1')."},
+						"relation":  {Type: "string", Description: "Optional relation filter ('EXPOUNDS', 'USES_METAPHOR', 'PREACHED')."},
+					},
+					Required: []string{"source_id"},
+				},
+			},
+		},
+		{
+			Type: "function",
+			Function: FunctionDefinition{
+				Name:        "reembed_knowledge",
+				Description: "Triggers re-embedding of text chunks in the knowledge base using a specified embedding model.",
+				Parameters: Parameters{
+					Type: "object",
+					Properties: map[string]Property{
+						"model_name": {Type: "string", Description: "Name of the embedding model being used."},
+					},
+					Required: []string{"model_name"},
+				},
+			},
+		},
 	}
 }
 
@@ -410,3 +497,31 @@ type SetBrightnessArgs struct {
 type DeviceIPOnlyArgs struct {
 	IP string `json:"ip"`
 }
+
+type SearchKnowledgeArgs struct {
+	Query      string `json:"query"`
+	Collection string `json:"collection,omitempty"`
+	Limit      int    `json:"limit,omitempty"`
+}
+
+type IngestKnowledgeArgs struct {
+	FilePath   string `json:"file_path"`
+	Collection string `json:"collection,omitempty"`
+}
+
+type SearchKnowledgeHybridArgs struct {
+	Query      string `json:"query"`
+	Collection string `json:"collection,omitempty"`
+	Limit      int    `json:"limit,omitempty"`
+}
+
+type QueryGraphArgs struct {
+	SourceID string `json:"source_id"`
+	Relation string `json:"relation,omitempty"`
+}
+
+type ReembedKnowledgeArgs struct {
+	ModelName string `json:"model_name"`
+}
+
+type ListCollectionsArgs struct{}

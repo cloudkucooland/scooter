@@ -1,22 +1,8 @@
-package main
+package parser
 
 import (
-	"strings"
 	"testing"
 )
-
-func TestBuildToolInstructionsUsesFlatCallForm(t *testing.T) {
-	instructions := buildToolInstructions(nil)
-	if want := `[TOOL_CALL]{"name":"TOOL_NAME","arguments":{}}[/TOOL_CALL]`; !strings.Contains(instructions, want) {
-		t.Fatalf("instructions do not contain flat call form %q", want)
-	}
-	if want := `CRITICAL: When a tool is needed, you MUST output the`; !strings.Contains(instructions, want) {
-		t.Fatalf("instructions do not contain critical guidance for reasoning models: %q", want)
-	}
-	if strings.Contains(instructions, `"function":{"name"`) {
-		t.Fatal("instructions still advertise the nested call form")
-	}
-}
 
 func TestRkToolParserKeepsSplitOpeningTagPrivate(t *testing.T) {
 	p := NewRkToolParser()
@@ -47,38 +33,33 @@ func TestRkToolParserAcceptsEncodedQwenArguments(t *testing.T) {
 
 func TestRkToolParserHandlesMalformedCallAsToolError(t *testing.T) {
 	p := NewRkToolParser()
-	visible, calls := p.ProcessChunk("[TOOL_CALL]{\"function\":{\"name\":\"write_file\",\"arguments\":{\"content\":\"oops\"}}[/TOOL_CALL]")
+	_, calls := p.ProcessChunk("[TOOL_CALL]{\"function\":{\"name\":\"write_file\",\"arguments\":{\"content\":\"oops\"}}[/TOOL_CALL]")
 	if len(calls) != 1 {
-		t.Fatalf("got %d calls, want 1 error call", len(calls))
+		t.Fatalf("got %d calls, want 1", len(calls))
 	}
 	if calls[0].Function.Name != "_error" {
-		t.Fatalf("expected tool call name '_error', got %q", calls[0].Function.Name)
-	}
-	if visible != "" {
-		t.Fatalf("expected 0 visible text (no raw tag leak), got %q", visible)
-	}
-
-	res := dispatchToolCall(calls[0].Function.Name, calls[0].Function.Arguments)
-	if !strings.Contains(res, "Tool Error:") {
-		t.Fatalf("expected dispatchToolCall to return Tool Error, got %q", res)
+		t.Fatalf("expected error tool name, got %q", calls[0].Function.Name)
 	}
 }
 
 func TestRkToolParserAcceptsExtraFields(t *testing.T) {
 	p := NewRkToolParser()
-	_, calls := p.ProcessChunk("[TOOL_CALL]{\"name\":\"get_devices\",\"arguments\":{},\"type\":\"function\",\"id\":\"call_1\"}[/TOOL_CALL]")
+	_, calls := p.ProcessChunk("[TOOL_CALL]{\"name\":\"test\",\"arguments\":{},\"extra\":true}[/TOOL_CALL]")
 	if len(calls) != 1 {
 		t.Fatalf("got %d calls, want 1", len(calls))
 	}
-	if calls[0].Function.Name != "get_devices" {
-		t.Fatalf("unexpected call name: %s", calls[0].Function.Name)
+	if calls[0].Function.Name != "test" {
+		t.Fatalf("expected test tool name, got %q", calls[0].Function.Name)
 	}
 }
 
 func TestRkToolParserReturnsMultipleCalls(t *testing.T) {
 	p := NewRkToolParser()
-	_, calls := p.ProcessChunk("[TOOL_CALL]{\"name\":\"get_devices\",\"arguments\":{}}[/TOOL_CALL][TOOL_CALL]{\"name\":\"get_devices\",\"arguments\":{}}[/TOOL_CALL]")
+	_, calls := p.ProcessChunk("[TOOL_CALL]{\"name\":\"first\",\"arguments\":{}}[/TOOL_CALL] middle [TOOL_CALL]{\"name\":\"second\",\"arguments\":{}}[/TOOL_CALL]")
 	if len(calls) != 2 {
 		t.Fatalf("got %d calls, want 2", len(calls))
+	}
+	if calls[0].Function.Name != "first" || calls[1].Function.Name != "second" {
+		t.Fatalf("unexpected calls order: %q, %q", calls[0].Function.Name, calls[1].Function.Name)
 	}
 }

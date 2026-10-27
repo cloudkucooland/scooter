@@ -1,4 +1,4 @@
-package main
+package rkllm
 
 import (
 	"bytes"
@@ -17,8 +17,21 @@ import (
 	"syscall"
 	"unsafe"
 
+	"codeberg.org/indievisible/scooter/pkg/parser"
+	"codeberg.org/indievisible/scooter/pkg/types"
 	"github.com/ebitengine/purego"
 )
+
+var (
+	GetActiveContextLimit = func() int { return 4096 }
+	GetActiveToolset      = func() string { return "all" }
+	GetCacheFile          = func() (string, error) { return os.UserCacheDir() }
+	BuildSystemPrompt     = func() string { return "" }
+)
+
+type Message = types.Message
+type StreamMessage = types.StreamMessage
+type ToolCall = types.ToolCall
 
 type LLMHandle unsafe.Pointer
 type LLMCallState int32
@@ -116,9 +129,6 @@ func getRKLLMLibPath() string {
 	if path := os.Getenv("RKLLM_LIB"); path != "" {
 		return path
 	}
-	if cfgLib := loadConfig().RKLLMLib; cfgLib != "" {
-		return cfgLib
-	}
 	return "librkllmrt.so"
 }
 
@@ -126,26 +136,20 @@ func getRKLLMModelsDir() string {
 	if dir := os.Getenv("RKLLM_MODELS_DIR"); dir != "" {
 		return dir
 	}
-	if cfgDir := loadConfig().RKLLMModelsDir; cfgDir != "" {
-		return cfgDir
-	}
 	if homeDir, err := os.UserHomeDir(); err == nil {
 		return filepath.Join(homeDir, "rkllama-models")
 	}
 	return "rkllama-models"
 }
 
-func getDefaultModelName() string {
+func GetDefaultModelName() string {
 	if env := os.Getenv("RKLLM_MODEL"); env != "" {
-		return env
+		return GetRKLLMModelPath(env)
 	}
-	if cfgModel := loadConfig().DefaultModel; cfgModel != "" {
-		return getRKLLMModelPath(cfgModel)
-	}
-	return getRKLLMModelPath("qwen3-4b")
+	return GetRKLLMModelPath("qwen3-4b")
 }
 
-func getRKLLMModelPath(modelName string) string {
+func GetRKLLMModelPath(modelName string) string {
 	if path := os.Getenv("RKLLM_MODEL"); path != "" {
 		if _, err := os.Stat(path); err == nil {
 			return path
@@ -213,7 +217,7 @@ type rkllmSession struct {
 	// Active request state
 	activeChan    chan<- StreamMessage
 	activeBuilder *strings.Builder
-	activeParser  *RkToolParser
+	activeParser  *parser.RkToolParser
 	activeCtx     context.Context
 	lastStderr    string
 	justLoaded    bool
@@ -292,7 +296,7 @@ func getRKLLMCallback() RKLLMCallback {
 	}
 }
 
-func abortRKLLM() {
+func AbortRKLLM() {
 	globalSession.mu.Lock()
 	handle := globalSession.handle
 	abortFn := globalSession.rkllmAbort
@@ -304,7 +308,7 @@ func abortRKLLM() {
 	}
 }
 
-func closeRKLLMSession() {
+func CloseRKLLMSession() {
 	globalSession.inferMu.Lock()
 	defer globalSession.inferMu.Unlock()
 
@@ -358,10 +362,10 @@ func captureStderr(fn func() error) (string, error) {
 
 func ensureSession(modelName string, contextLen int) error {
 	if contextLen <= 0 {
-		contextLen = getActiveContextLimit()
+		contextLen = GetActiveContextLimit()
 	}
 	libPath := getRKLLMLibPath()
-	modelPath := getRKLLMModelPath(modelName)
+	modelPath := GetRKLLMModelPath(modelName)
 
 	globalSession.mu.Lock()
 	if globalSession.initialized && globalSession.modelPath == modelPath && globalSession.libPath == libPath && globalSession.contextLen == contextLen {
@@ -454,15 +458,15 @@ func ensureSession(modelName string, contextLen int) error {
 }
 
 func getPromptCacheFile(modelPath string, contextLen int) string {
-	if custom := loadConfig().RKLLMCachePath; custom != "" {
+	if custom := os.Getenv("RKLLM_CACHE_PATH"); custom != "" {
 		return custom
 	}
 
 	if modelPath == "" {
-		modelPath = getDefaultModelName()
+		modelPath = GetDefaultModelName()
 	}
 	if contextLen <= 0 {
-		contextLen = getActiveContextLimit()
+		contextLen = GetActiveContextLimit()
 	}
 
 	toolset := GetActiveToolset()
@@ -479,7 +483,7 @@ func getPromptCacheFile(modelPath string, contextLen int) string {
 
 	cacheFileName := fmt.Sprintf("%s_%s_ctx%d_%s.rkllm_cache", baseName, toolset, contextLen, shortHash)
 
-	if cacheDir, err := getCacheFile(); err == nil && cacheDir != "" {
+	if cacheDir, err := GetCacheFile(); err == nil && cacheDir != "" {
 		return filepath.Join(filepath.Dir(cacheDir), cacheFileName)
 	}
 
@@ -496,11 +500,11 @@ func getPromptCacheFileForSystemPrompt(modelPath string, contextLen int, systemP
 	return base + "_" + suffix + ext
 }
 
-func streamRKLLM(ctx context.Context, modelName string, history []Message, channel chan<- StreamMessage) {
+func StreamRKLLM(ctx context.Context, modelName string, history []Message, channel chan<- StreamMessage) {
 	globalSession.inferMu.Lock()
 	defer globalSession.inferMu.Unlock()
 
-	contextLen := getActiveContextLimit()
+	contextLen := GetActiveContextLimit()
 	if err := ensureSession(modelName, contextLen); err != nil {
 		channel <- StreamMessage{Err: err, Done: true}
 		return
@@ -512,7 +516,7 @@ func streamRKLLM(ctx context.Context, modelName string, history []Message, chann
 	lastStderr := globalSession.lastStderr
 	globalSession.justLoaded = false
 
-	rkParser := NewRkToolParser()
+	rkParser := parser.NewRkToolParser()
 	globalSession.activeChan = channel
 	globalSession.activeBuilder = nil
 	globalSession.activeParser = rkParser
@@ -568,7 +572,7 @@ func streamRKLLM(ctx context.Context, modelName string, history []Message, chann
 					Arguments json.RawMessage `json:"arguments"`
 				}{Name: call.Function.Name, Arguments: arguments})
 				if err == nil {
-					fmt.Fprintf(&prompt, "%s%s%s\n", toolCallStartTag, payload, toolCallEndTag)
+					fmt.Fprintf(&prompt, "%s%s%s\n", parser.ToolCallStartTag, payload, parser.ToolCallEndTag)
 				}
 			}
 		case "tool":
@@ -579,20 +583,20 @@ func streamRKLLM(ctx context.Context, modelName string, history []Message, chann
 			}
 		}
 	}
-	systemParts = append(systemParts, buildToolInstructions(getSystemTools()))
+	systemParts = append(systemParts, BuildSystemPrompt())
 	prompt.WriteString("Assistant: ")
 
 	inferParams := RKLLMInferParam{
 		Mode: RKLLM_INFER_GENERATE,
 	}
 
-	cfg := loadConfig()
+	cacheEnabled := os.Getenv("RKLLM_CACHE_ENABLED") != "false"
 	var cacheParam RKLLMPromptCacheParam
 	systemPrompt := "System:\n" + strings.Join(systemParts, "\n\n") + "\n\n"
 	cacheFile := getPromptCacheFileForSystemPrompt(activeModelPath, contextLen, systemPrompt)
 	// cacheLoaded := false
 
-	if cfg.RKLLMCacheEnabled && loadPromptCacheFn != nil {
+	if cacheEnabled && loadPromptCacheFn != nil {
 		if _, err := os.Stat(cacheFile); err != nil {
 			if dir := filepath.Dir(cacheFile); dir != "." {
 				if mkdirErr := os.MkdirAll(dir, 0755); mkdirErr != nil {
@@ -629,7 +633,7 @@ func streamRKLLM(ctx context.Context, modelName string, history []Message, chann
 	}
 
 	/* librkllmrt.so prompt caching does NOT work by loading a static file into memory and letting you append arbitrary context on the fly without system wrappers.
-In librkllmrt, rkllm_load_prompt_cache expects the incoming prompt in rkllm_run to contain the exact prefix matching the cached tokens, or the transformer position embeddings ($pos_0, pos_1, ...$  ) alignment breaks!
+	In librkllmrt, rkllm_load_prompt_cache expects the incoming prompt in rkllm_run to contain the exact prefix matching the cached tokens, or the transformer position embeddings ($pos_0, pos_1, ...$  ) alignment breaks!
 	*/
 	/* var conversationPrompt string
 	if cacheLoaded {
@@ -637,7 +641,7 @@ In librkllmrt, rkllm_load_prompt_cache expects the incoming prompt in rkllm_run 
 	} else {
 		conversationPrompt = systemPrompt + prompt.String()
 	} */
-	// Always include systemPrompt in the text so positional embeddings align with the cache, 
+	// Always include systemPrompt in the text so positional embeddings align with the cache,
 	conversationPrompt := systemPrompt + prompt.String()
 
 	promptPtr, promptSlice := stringToBytePtr(conversationPrompt)
@@ -656,11 +660,11 @@ In librkllmrt, rkllm_load_prompt_cache expects the incoming prompt in rkllm_run 
 	}
 }
 
-func runRKLLMSummary(modelName string, messages []Message) (string, error) {
+func RunRKLLMSummary(modelName string, messages []Message) (string, error) {
 	globalSession.inferMu.Lock()
 	defer globalSession.inferMu.Unlock()
 
-	contextLen := getActiveContextLimit()
+	contextLen := GetActiveContextLimit()
 	if err := ensureSession(modelName, contextLen); err != nil {
 		return "", err
 	}
@@ -705,7 +709,7 @@ func runRKLLMSummary(modelName string, messages []Message) (string, error) {
 	return sb.String(), nil
 }
 
-func checkRKLLMStatus(modelName string) string {
+func CheckRKLLMStatus(modelName string) string {
 	libPath := getRKLLMLibPath()
 	globalSession.mu.Lock()
 	loaded := globalSession.initialized
@@ -715,7 +719,7 @@ func checkRKLLMStatus(modelName string) string {
 	globalSession.mu.Unlock()
 
 	if modelPath == "" {
-		modelPath = getRKLLMModelPath(modelName)
+		modelPath = GetRKLLMModelPath(modelName)
 	}
 
 	status := "Loaded in NPU memory"
@@ -730,7 +734,7 @@ func checkRKLLMStatus(modelName string) string {
 	return res
 }
 
-func listRKLLMModels() []string {
+func ListRKLLMModels() []string {
 	var models []string
 	seen := make(map[string]bool)
 
@@ -810,4 +814,40 @@ func createSystemPromptCache(
 	}
 
 	return nil
+}
+
+func toolCallSummaryText(call ToolCall) string {
+	arguments := call.Function.Arguments
+	if len(arguments) == 0 {
+		arguments = json.RawMessage(`{}`)
+	}
+	payload, err := json.Marshal(struct {
+		Name      string          `json:"name"`
+		Arguments json.RawMessage `json:"arguments"`
+	}{Name: call.Function.Name, Arguments: arguments})
+	if err == nil {
+		return string(payload)
+	}
+	return fmt.Sprintf("name=%q arguments=%q", call.Function.Name, string(arguments))
+}
+
+func renderMessages(messages []Message) string {
+	var sb strings.Builder
+	for _, msg := range messages {
+		sb.WriteString("[")
+		sb.WriteString(msg.Role)
+		if msg.Role == "tool" && msg.ToolName != "" {
+			sb.WriteString(" result from ")
+			sb.WriteString(msg.ToolName)
+		}
+		sb.WriteString("] ")
+		sb.WriteString(msg.Content)
+		sb.WriteString("\n")
+		for _, call := range msg.ToolCalls {
+			sb.WriteString("[assistant tool call] ")
+			sb.WriteString(toolCallSummaryText(call))
+			sb.WriteString("\n")
+		}
+	}
+	return sb.String()
 }

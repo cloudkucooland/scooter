@@ -8,9 +8,8 @@
 - **Interactive TUI:** Built with Charm Bracelet (`bubbletea`, `bubbles`, `lipgloss`) for a rich terminal experience.
 - **Modular Toolsets:**
   - **Development (`dev`):** Workspace tools for reading/writing files, searching (`grep`), running shell commands, and managing codebases.
-  - **Home Automation (`iot` / `home`):** Smart home control for TP-Link Kasa devices via `go-kasa`.
   - **Web (`web`):** URL fetching and web content retrieval tool (`web_fetch`).
-  - **All (`all`):** Combines development, home, and web toolsets.
+  - **All (`all`):** Combines development and web toolsets.
 - **Context Management & Auto-Compaction:** Intelligent context window handling with automatic history summarization and JSONL session caching per workspace.
 - **Hybrid / Fallback Support:** Optional integration with Google GenAI SDK (`google.golang.org/genai`).
 

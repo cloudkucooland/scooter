@@ -7,6 +7,7 @@ import (
 	"strings"
 	"time"
 
+	"codeberg.org/indievisible/scooter/pkg/rkllm"
 	"github.com/charmbracelet/bubbles/textarea"
 	"github.com/charmbracelet/bubbles/viewport"
 	"github.com/charmbracelet/lipgloss"
@@ -92,7 +93,7 @@ func initialModel() model {
 		}
 	}
 
-	modelName := getDefaultModelName()
+	modelName := rkllm.GetDefaultModelName()
 	initialCtx := detectContextLength(modelName)
 	setActiveContextLimit(initialCtx)
 

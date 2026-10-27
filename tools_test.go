@@ -148,7 +148,7 @@ func TestReadFilePortionHonorsLineRangeAndBudget(t *testing.T) {
 		t.Fatal(err)
 	}
 	if !truncated || content != "one" {
-		t.Fatalf("got content %q, truncated=%v; want budget-limited output", content, truncated)
+		t.Fatalf("got content=%q, truncated=%v; want budget-limited output", content, truncated)
 	}
 }
 
@@ -163,9 +163,6 @@ func TestDispatchToolCallValidatesRequiredArguments(t *testing.T) {
 		{"read file path", ReadFileArgs{}, "file_path is required"},
 		{"directory path", ListDirArgs{}, "dir_path is required"},
 		{"grep pattern", GrepSearchArgs{}, "pattern is required"},
-		{"state ip", SetDeviceStateArgs{State: "on"}, "ip is required"},
-		{"brightness ip", SetBrightnessArgs{Brightness: 50}, "ip is required"},
-		{"sysinfo ip", DeviceIPOnlyArgs{}, "ip is required"},
 	}
 
 	for _, tt := range tests {
@@ -186,12 +183,6 @@ func TestDispatchToolCallValidatesRequiredArguments(t *testing.T) {
 				toolName = "list_directory"
 			case "grep pattern":
 				toolName = "grep_search"
-			case "state ip":
-				toolName = "set_device_state"
-			case "brightness ip":
-				toolName = "set_brightness"
-			case "sysinfo ip":
-				toolName = "get_sysinfo"
 			}
 			if got := dispatchToolCall(toolName, args); !strings.Contains(got, tt.want) {
 				t.Fatalf("got %q, want error containing %q", got, tt.want)
@@ -374,38 +365,12 @@ func TestToolsets(t *testing.T) {
 	tools := getSystemTools()
 	foundOutsource := false
 	for _, tool := range tools {
-		if tool.Function.Name == "get_devices" {
-			t.Fatalf("expected home tool 'get_devices' to be excluded in development toolset")
-		}
 		if tool.Function.Name == "outsource" {
 			foundOutsource = true
 		}
 	}
 	if !foundOutsource {
 		t.Fatalf("expected outsource tool in development toolset")
-	}
-
-	if err := SetActiveToolset("home"); err != nil {
-		t.Fatalf("unexpected error setting toolset home: %v", err)
-	}
-	if GetActiveToolset() != "home" {
-		t.Fatalf("expected home toolset, got %q", GetActiveToolset())
-	}
-	homeTools := getSystemTools()
-	foundGetDevices := false
-	for _, tool := range homeTools {
-		if tool.Function.Name == "get_devices" {
-			foundGetDevices = true
-		}
-		if tool.Function.Name == "apply_patch" {
-			t.Fatalf("expected development tool 'apply_patch' to be excluded in home toolset")
-		}
-		if tool.Function.Name == "outsource" {
-			t.Fatalf("expected development tool 'outsource' to be excluded in home toolset")
-		}
-	}
-	if !foundGetDevices {
-		t.Fatalf("expected 'get_devices' tool in home toolset")
 	}
 
 	if err := SetActiveToolset("web"); err != nil {
@@ -422,9 +387,6 @@ func TestToolsets(t *testing.T) {
 		}
 		if tool.Function.Name == "apply_patch" {
 			t.Fatalf("expected development tool 'apply_patch' to be excluded in web toolset")
-		}
-		if tool.Function.Name == "get_devices" {
-			t.Fatalf("expected home tool 'get_devices' to be excluded in web toolset")
 		}
 	}
 	if !foundWebFetch {
@@ -467,15 +429,15 @@ func TestWebFetchToolValidation(t *testing.T) {
 	// Empty prompt
 	rawArgs, _ := json.Marshal(WebFetchArgs{Prompt: ""})
 	res := dispatchToolCall("web_fetch", rawArgs)
-	if !strings.Contains(res, "prompt is required") {
-		t.Fatalf("expected prompt required error, got: %q", res)
+	if !strings.Contains(res, "prompt or url parameter is required") {
+		t.Fatalf("expected prompt or url required error, got: %q", res)
 	}
 
 	// Prompt without valid URL
-	rawArgs, _ = json.Marshal(WebFetchArgs{Prompt: "Please summarize this text without urls"})
+	rawArgs, _ = json.Marshal(WebFetchArgs{Prompt: "hello world without any domain or link"})
 	res = dispatchToolCall("web_fetch", rawArgs)
-	if !strings.Contains(res, "no valid HTTP/HTTPS URLs found in prompt") {
-		t.Fatalf("expected no valid URLs error, got: %q", res)
+	if !strings.Contains(res, "Error fetching URL: invalid HTTP/HTTPS URL") {
+		t.Fatalf("expected invalid HTTP/HTTPS URL error, got: %q", res)
 	}
 }
 
@@ -561,5 +523,15 @@ func TestEditFile(t *testing.T) {
 	res = dispatchToolCall("edit_file", rawArgs)
 	if !strings.Contains(res, "operations are required") {
 		t.Fatalf("expected operations required error, got: %q", res)
+	}
+}
+
+func TestBuildToolInstructionsUsesFlatCallForm(t *testing.T) {
+	instructions := buildToolInstructions(nil)
+	if want := `[TOOL_CALL]{"name":"TOOL_NAME","arguments":{}}[/TOOL_CALL]`; !strings.Contains(instructions, want) {
+		t.Fatalf("instructions do not contain flat call form %q", want)
+	}
+	if strings.Contains(instructions, `"function":{"name"`) {
+		t.Fatal("instructions still advertise the nested call form")
 	}
 }

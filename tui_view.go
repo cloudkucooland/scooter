@@ -5,6 +5,7 @@ import (
 	"path/filepath"
 	"strings"
 
+	"codeberg.org/indievisible/scooter/pkg/rkllm"
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/charmbracelet/glamour"
 	"github.com/charmbracelet/lipgloss"
@@ -66,13 +67,15 @@ var availableCommands = []struct {
 	{"/models", "List available RKLLM models"},
 	{"/model", "Switch active RKLLM model"},
 	{"/toolsets", "List available toolsets"},
-	{"/toolset", "Switch active toolset (dev, home, all)"},
+	{"/toolset", "Switch active toolset (dev, web, all)"},
 	{"/context", "View or change context size"},
 	{"/compress", "Manually compress conversation history"},
 	{"/clear", "Clear conversation history and cache"},
 	{"/enablecache", "Enable prompt caching"},
 	{"/disablecache", "Disable prompt caching"},
 	{"/file", "Load a local file into context"},
+	{"/ingest", "Ingest a file into knowledge base"},
+	{"/knowledge", "Search knowledge base for content"},
 	{"/status", "Check RKLLM backend status"},
 	{"/quit", "Exit Scooter"},
 }
@@ -117,7 +120,7 @@ func (m model) renderAutocompletePopup() string {
 			query = strings.TrimSpace(val[len("/model"):])
 		}
 
-		models := listRKLLMModels()
+		models := rkllm.ListRKLLMModels()
 		var matches []string
 		for _, mdl := range models {
 			if query == "" || strings.Contains(strings.ToLower(mdl), strings.ToLower(query)) {

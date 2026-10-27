@@ -4,6 +4,7 @@ import (
 	"context"
 	"time"
 
+	"codeberg.org/indievisible/scooter/pkg/rkllm"
 	tea "github.com/charmbracelet/bubbletea"
 )
 
@@ -22,7 +23,7 @@ func summarizeCmd(modelName string, messages, retained []Message, generation uin
 		_, cancel := context.WithTimeout(context.Background(), 60*time.Minute)
 		defer cancel()
 
-		summaryText, err := runRKLLMSummary(modelName, messages)
+		summaryText, err := rkllm.RunRKLLMSummary(modelName, messages)
 		if err != nil {
 			return SummaryMessage{Err: err, Generation: generation}
 		}
@@ -36,7 +37,7 @@ func summarizeCmd(modelName string, messages, retained []Message, generation uin
 
 func listModelsCmd() tea.Cmd {
 	return func() tea.Msg {
-		models := listRKLLMModels()
+		models := rkllm.ListRKLLMModels()
 		return ModelsMessage{Models: models}
 	}
 }
@@ -50,7 +51,7 @@ func listToolsetsCmd() tea.Cmd {
 
 func statusCmd(modelName string) tea.Cmd {
 	return func() tea.Msg {
-		status := checkRKLLMStatus(modelName)
+		status := rkllm.CheckRKLLMStatus(modelName)
 		return StatusMessage{Status: status}
 	}
 }

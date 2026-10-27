@@ -11,6 +11,7 @@ import (
 	"strings"
 	"time"
 
+	"codeberg.org/indievisible/scooter/pkg/rkllm"
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/urfave/cli/v3"
 )
@@ -160,14 +161,10 @@ func buildToolInstructions(tools []Tool) string {
 	sb.WriteString("2. When a tool is required to fulfill a user's request, you MUST invoke it immediately. Do NOT explain, discuss, or speculate about tool availability, network access, or limitations in conversational text.\n")
 	sb.WriteString("3. NEVER claim a tool failed or is unavailable without attempting the execution first.\n")
 	sb.WriteString("4. To invoke a tool, output ONLY the JSON request wrapped in exact `[TOOL_CALL]` and `[/TOOL_CALL]` tags:\n")
-	sb.WriteString("   [TOOL_CALL]{\"name\": \"TOOL_NAME\", \"arguments\": {}}[/TOOL_CALL]\n")
+	sb.WriteString("   [TOOL_CALL]{\"name\":\"TOOL_NAME\",\"arguments\":{}}[/TOOL_CALL]\n")
 	sb.WriteString("5. Arguments must be a valid, single-line JSON object with double-quoted keys and string values.\n\n")
 
 	fmt.Fprintf(&sb, "File and directory operations are restricted to: %s\n\n", workingDir)
-
-	if GetActiveToolset() == "home" || GetActiveToolset() == "all" {
-		sb.WriteString("IMPORTANT (Smart Home Control): You have active control over local smart home devices via set_device_state, set_brightness, and get_sysinfo. Execute the tool call immediately when asked to adjust devices.\n\n")
-	}
 
 	sb.WriteString("Available tools:\n")
 
@@ -214,7 +211,7 @@ func main() {
 	defer func() {
 		closed := make(chan struct{})
 		go func() {
-			closeRKLLMSession()
+			rkllm.CloseRKLLMSession()
 			close(closed)
 		}()
 		select {
@@ -233,6 +230,13 @@ func main() {
 		panic(err)
 	}
 
+	rkllm.GetActiveContextLimit = getActiveContextLimit
+	rkllm.GetActiveToolset = GetActiveToolset
+	rkllm.GetCacheFile = getCacheFile
+	rkllm.BuildSystemPrompt = func() string {
+		return buildToolInstructions(getSystemTools())
+	}
+
 	app := &cli.Command{
 		Name:  "scooter",
 		Usage: "Local-first AI agent for RK3588",
@@ -241,7 +245,7 @@ func main() {
 				Name:    "toolset",
 				Aliases: []string{"t"},
 				Value:   "all",
-				Usage:   "Active toolset (dev, home, web, all)",
+				Usage:   "Active toolset (dev, web, all)",
 			},
 			&cli.StringFlag{
 				Name:    "model",
@@ -301,7 +305,7 @@ func main() {
 
 func runNonInteractive(modelName, toolset, promptText string) error {
 	SetActiveToolset(toolset)
-	resolvedModel := getRKLLMModelPath(modelName)
+	resolvedModel := rkllm.GetRKLLMModelPath(modelName)
 	detected := detectContextLength(resolvedModel)
 	setActiveContextLimit(detected)
 
@@ -311,7 +315,7 @@ func runNonInteractive(modelName, toolset, promptText string) error {
 	for rounds := 0; rounds < 5; rounds++ {
 		ch := make(chan StreamMessage, 10)
 		ctx := context.Background()
-		go streamRKLLM(ctx, resolvedModel, history, ch)
+		go rkllm.StreamRKLLM(ctx, resolvedModel, history, ch)
 
 		var assistantContent strings.Builder
 		var toolCalls []ToolCall

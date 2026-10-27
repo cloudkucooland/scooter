@@ -19,19 +19,36 @@ import (
 	"time"
 )
 
-func webFetch(prompt string) string {
+func webFetch(prompt string, rawArgs json.RawMessage) string {
 	prompt = strings.TrimSpace(prompt)
+
+	// Fallback to "url" key if "prompt" key was empty in JSON
+	if prompt == "" && len(rawArgs) > 0 {
+		var generic map[string]interface{}
+		if err := json.Unmarshal(rawArgs, &generic); err == nil {
+			if u, ok := generic["url"].(string); ok {
+				prompt = u
+			}
+		}
+	}
+
 	if prompt == "" {
-		return "System Error: prompt is required"
+		return "System Error: prompt or url parameter is required"
 	}
 
 	urlRegex := regexp.MustCompile(`https?://[^\s"'<>]+`)
 	matches := urlRegex.FindAllString(prompt, 20)
+
+	// Fallback: If no explicit http(s):// found, check if a domain was passed (e.g. "indievisible.org")
 	if len(matches) == 0 {
-		if strings.HasPrefix(prompt, "http://") || strings.HasPrefix(prompt, "https://") {
+		domainRegex := regexp.MustCompile(`\b([a-zA-Z0-9-]+\.[a-zA-Z]{2,})\b`)
+		if domainMatches := domainRegex.FindAllString(prompt, 1); len(domainMatches) > 0 {
+			matches = []string{"https://" + domainMatches[0]}
+		} else if strings.HasPrefix(prompt, "http://") || strings.HasPrefix(prompt, "https://") {
 			matches = []string{prompt}
 		} else {
-			return "System Error: no valid HTTP/HTTPS URLs found in prompt"
+			// As a last resort, assume the whole prompt string is a URL or domain
+			matches = []string{"https://" + strings.TrimPrefix(prompt, "http://")}
 		}
 	}
 
@@ -39,6 +56,9 @@ func webFetch(prompt string) string {
 	var uniqueUrls []string
 	for _, u := range matches {
 		u = strings.TrimRight(u, ".,;:!?)")
+		if !strings.HasPrefix(u, "http://") && !strings.HasPrefix(u, "https://") {
+			u = "https://" + u
+		}
 		if !seen[u] {
 			seen[u] = true
 			uniqueUrls = append(uniqueUrls, u)
@@ -48,7 +68,7 @@ func webFetch(prompt string) string {
 	var sb strings.Builder
 	dialer := &net.Dialer{Timeout: 10 * time.Second}
 	transport := http.DefaultTransport.(*http.Transport).Clone()
-	transport.DialContext = func(ctx context.Context, network, address string) (net.Conn, error) {
+	transport.DialContext = func(ctx context.Context, network string, address string) (net.Conn, error) {
 		host, port, err := net.SplitHostPort(address)
 		if err != nil {
 			return nil, err
@@ -242,7 +262,7 @@ func readFilePortion(path string, startLine, endLine, tokenBudget int) (string, 
 	}
 	defer f.Close()
 
-	maxBytes := tokenBudget * 2
+	maxBytes := tokenBudget * 3
 	if maxBytes > 16384 {
 		maxBytes = 16384
 	}
