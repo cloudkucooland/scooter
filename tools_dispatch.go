@@ -33,6 +33,22 @@ func getSharedKnowledgeDB() (*knowledge.KnowledgeDB, error) {
 	return sharedKnowledgeDB, nil
 }
 
+func googleEmbeddingFunc(client *genai.Client, model, taskType string) func(string) ([]float32, error) {
+	return func(text string) ([]float32, error) {
+		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+		defer cancel()
+
+		result, err := client.Models.EmbedContent(ctx, model, genai.Text(text), &genai.EmbedContentConfig{TaskType: taskType})
+		if err != nil {
+			return nil, err
+		}
+		if result == nil || len(result.Embeddings) != 1 || result.Embeddings[0] == nil || len(result.Embeddings[0].Values) == 0 {
+			return nil, fmt.Errorf("embedding model %q returned no vector", model)
+		}
+		return result.Embeddings[0].Values, nil
+	}
+}
+
 func dispatchToolCall(name string, rawArgs json.RawMessage) string {
 	logDebug("dispatchToolCall called: %s, Args: %s", name, string(rawArgs))
 	if strings.TrimSpace(name) == "" {
@@ -68,7 +84,7 @@ func dispatchToolCall(name string, rawArgs json.RawMessage) string {
 		var sb strings.Builder
 		sb.WriteString("Knowledge Search Results:\n")
 		for i, r := range results {
-			sb.WriteString(fmt.Sprintf("[%d] %s (%s)\n%s\n\n", i+1, r.Title, r.Collection, r.Content))
+			sb.WriteString(fmt.Sprintf("[%d] %s (%s)\n%s\n\n", i+1, r.Title, r.Collection, truncateSnippet(r.Content, 400)))
 		}
 		return sb.String()
 
@@ -80,10 +96,21 @@ func dispatchToolCall(name string, rawArgs json.RawMessage) string {
 		if strings.TrimSpace(args.FilePath) == "" {
 			return "System Error: file_path is required"
 		}
-		absPath, err := validatePath(args.FilePath)
-		if err != nil {
-			return fmt.Sprintf("System Error: %v", err)
+		baseDir := workingDir
+		if baseDir == "" {
+			if cwd, err := os.Getwd(); err == nil {
+				baseDir, _ = filepath.Abs(cwd)
+			}
 		}
+		pattern := args.FilePath
+		if !filepath.IsAbs(pattern) {
+			pattern = filepath.Join(baseDir, pattern)
+		}
+		matches, _ := filepath.Glob(pattern)
+		if len(matches) == 0 {
+			matches = []string{filepath.Join(baseDir, args.FilePath)}
+		}
+
 		kdb, err := getSharedKnowledgeDB()
 		if err != nil {
 			return fmt.Sprintf("System Error opening knowledge base: %v", err)
@@ -92,11 +119,35 @@ func dispatchToolCall(name string, rawArgs json.RawMessage) string {
 		if coll == "" {
 			coll = "main"
 		}
-		docID, err := kdb.IngestFile(absPath, coll)
-		if err != nil {
-			return fmt.Sprintf("Ingest Error: %v", err)
+
+		count := 0
+		var errors []string
+		var lastDocID string
+		for _, file := range matches {
+			absPath, valErr := validatePath(file)
+			if valErr != nil {
+				errors = append(errors, fmt.Sprintf("%s: %v", filepath.Base(file), valErr))
+				continue
+			}
+			docID, ingestErr := kdb.IngestFile(absPath, coll)
+			if ingestErr != nil {
+				errors = append(errors, fmt.Sprintf("%s: %v", filepath.Base(file), ingestErr))
+			} else {
+				count++
+				lastDocID = docID
+			}
 		}
-		return fmt.Sprintf("Successfully ingested %s into collection %q (Doc ID: %s)", args.FilePath, coll, docID)
+
+		if count == 0 && len(errors) > 0 {
+			return fmt.Sprintf("Ingest Error: %s", strings.Join(errors, "; "))
+		}
+		if len(errors) > 0 {
+			return fmt.Sprintf("Successfully ingested %d file(s) into collection %q (Last Doc ID: %s). Errors (%d): %s", count, coll, lastDocID, len(errors), strings.Join(errors, "; "))
+		}
+		if count == 1 {
+			return fmt.Sprintf("Successfully ingested %s into collection %q (Doc ID: %s)", args.FilePath, coll, lastDocID)
+		}
+		return fmt.Sprintf("Successfully ingested %d file(s) into collection %q.", count, coll)
 
 	case "search_knowledge_hybrid":
 		var args SearchKnowledgeHybridArgs
@@ -120,7 +171,7 @@ func dispatchToolCall(name string, rawArgs json.RawMessage) string {
 		var sb strings.Builder
 		sb.WriteString("Hybrid Knowledge Search Results:\n")
 		for i, r := range results {
-			sb.WriteString(fmt.Sprintf("[%d] %s (%s)\n%s\n\n", i+1, r.Title, r.Collection, r.Content))
+			sb.WriteString(fmt.Sprintf("[%d] %s (%s)\n%s\n\n", i+1, r.Title, r.Collection, truncateSnippet(r.Content, 400)))
 		}
 		return sb.String()
 
@@ -172,22 +223,63 @@ func dispatchToolCall(name string, rawArgs json.RawMessage) string {
 		if strings.TrimSpace(args.ModelName) == "" {
 			return "System Error: model_name is required"
 		}
+		args.ModelName = strings.TrimSpace(args.ModelName)
 		kdb, err := getSharedKnowledgeDB()
 		if err != nil {
 			return fmt.Sprintf("System Error opening knowledge base: %v", err)
 		}
-		dummyEmbed := func(content string) ([]float32, error) {
-			vec := make([]float32, 128)
-			for i := range vec {
-				vec[i] = float32(len(content)+i) * 0.01
-			}
-			return vec, nil
+		apiKey := getGoogleAPIKey()
+		if apiKey == "" {
+			return "Reembed Error: Google API key is not configured. Set GOOGLE_API_KEY or google_api_key in your config. No vectors were changed."
 		}
-		err = kdb.ReembedChunks(args.ModelName, dummyEmbed)
+		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+		defer cancel()
+		client, err := genai.NewClient(ctx, &genai.ClientConfig{APIKey: apiKey, Backend: genai.BackendGeminiAPI})
 		if err != nil {
-			return fmt.Sprintf("Reembed Error: %v", err)
+			return fmt.Sprintf("Reembed Error creating GenAI client: %v. No vectors were changed.", err)
 		}
-		return fmt.Sprintf("Successfully re-embedded knowledge chunks for model %q.", args.ModelName)
+		documentEmbed := googleEmbeddingFunc(client, args.ModelName, "RETRIEVAL_DOCUMENT")
+		if err := kdb.ReembedChunks(args.ModelName, documentEmbed); err != nil {
+			return fmt.Sprintf("Reembed Error: %v. No vectors were changed.", err)
+		}
+		kdb.EmbeddingModel = args.ModelName
+		kdb.EmbedFunc = documentEmbed
+		kdb.QueryEmbedFunc = googleEmbeddingFunc(client, args.ModelName, "RETRIEVAL_QUERY")
+		return fmt.Sprintf("Successfully re-embedded knowledge chunks with Google GenAI model %q.", args.ModelName)
+
+	case "add_knowledge_node":
+		var args AddKnowledgeNodeArgs
+		if err := json.Unmarshal(rawArgs, &args); err != nil {
+			return fmt.Sprintf("System Error parsing arguments: %v", err)
+		}
+		if strings.TrimSpace(args.ID) == "" || strings.TrimSpace(args.Label) == "" {
+			return "System Error: id and label are required"
+		}
+		kdb, err := getSharedKnowledgeDB()
+		if err != nil {
+			return fmt.Sprintf("System Error opening knowledge base: %v", err)
+		}
+		if err := kdb.AddNode(args.ID, args.Label, args.Properties); err != nil {
+			return fmt.Sprintf("Add Knowledge Node Error: %v", err)
+		}
+		return fmt.Sprintf("Successfully added/updated knowledge node %q (label: %s).", args.ID, args.Label)
+
+	case "add_knowledge_edge":
+		var args AddKnowledgeEdgeArgs
+		if err := json.Unmarshal(rawArgs, &args); err != nil {
+			return fmt.Sprintf("System Error parsing arguments: %v", err)
+		}
+		if strings.TrimSpace(args.SourceID) == "" || strings.TrimSpace(args.TargetID) == "" || strings.TrimSpace(args.Relation) == "" {
+			return "System Error: source_id, target_id, and relation are required"
+		}
+		kdb, err := getSharedKnowledgeDB()
+		if err != nil {
+			return fmt.Sprintf("System Error opening knowledge base: %v", err)
+		}
+		if err := kdb.AddEdge(args.SourceID, args.TargetID, args.Relation, args.Weight); err != nil {
+			return fmt.Sprintf("Add Knowledge Edge Error: %v", err)
+		}
+		return fmt.Sprintf("Successfully added/updated knowledge edge: %s --[%s]--> %s.", args.SourceID, args.Relation, args.TargetID)
 
 	case "apply_patch":
 		var args ApplyPatchArgs
@@ -532,8 +624,80 @@ func dispatchToolCall(name string, rawArgs json.RawMessage) string {
 			fmt.Fprintf(&sb, "[results limited to %d matching lines]\n", maxResults)
 		}
 		return sb.String()
+
+	case "set_tasks":
+		var args SetTasksArgs
+		if err := json.Unmarshal(rawArgs, &args); err != nil {
+			return fmt.Sprintf("System Error parsing arguments: %v", err)
+		}
+		if len(args.Steps) == 0 {
+			return "System Error: steps list cannot be empty"
+		}
+		if err := SetTasks(args.Steps); err != nil {
+			return fmt.Sprintf("Set Tasks Error: %v", err)
+		}
+		return fmt.Sprintf("Successfully set task checklist (%d steps).", len(args.Steps))
+
+	case "add_task":
+		var args AddTaskArgs
+		if err := json.Unmarshal(rawArgs, &args); err != nil {
+			return fmt.Sprintf("System Error parsing arguments: %v", err)
+		}
+		if strings.TrimSpace(args.Step) == "" {
+			return "System Error: step description is required"
+		}
+		if err := AddTask(args.Step); err != nil {
+			return fmt.Sprintf("Add Task Error: %v", err)
+		}
+		return fmt.Sprintf("Successfully added task: %q", args.Step)
+
+	case "complete_task":
+		var args CompleteTaskArgs
+		if err := json.Unmarshal(rawArgs, &args); err != nil {
+			return fmt.Sprintf("System Error parsing arguments: %v", err)
+		}
+		if args.ID <= 0 {
+			return "System Error: valid task id is required"
+		}
+		if err := CompleteTask(args.ID); err != nil {
+			return fmt.Sprintf("Complete Task Error: %v", err)
+		}
+		return fmt.Sprintf("Successfully marked task #%d as complete.", args.ID)
+
+	case "get_tasks":
+		tasks, err := LoadTasks()
+		if err != nil {
+			return fmt.Sprintf("Get Tasks Error: %v", err)
+		}
+		if len(tasks) == 0 {
+			return "No active tasks in progress."
+		}
+		var sb strings.Builder
+		sb.WriteString("Current Task Checklist:\n")
+		for _, t := range tasks {
+			status := "[ ]"
+			if t.Completed {
+				status = "[x]"
+			}
+			sb.WriteString(fmt.Sprintf("%s [%d] %s\n", status, t.ID, t.Description))
+		}
+		return sb.String()
+
+	case "clear_tasks":
+		if err := ClearTasks(); err != nil {
+			return fmt.Sprintf("Clear Tasks Error: %v", err)
+		}
+		return "Successfully cleared task checklist."
 	}
 
 	logDebug("dispatchToolCall failed for: %s", name)
 	return fmt.Sprintf("System Error: Tool %s not implemented.", name)
+}
+
+func truncateSnippet(s string, maxLen int) string {
+	s = strings.TrimSpace(s)
+	if len(s) <= maxLen {
+		return s
+	}
+	return s[:maxLen] + " ... [truncated]"
 }

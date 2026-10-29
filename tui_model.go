@@ -51,8 +51,8 @@ type model struct {
 const streamRenderInterval = 75 * time.Millisecond
 
 const (
-	maxToolRoundsPerTurn = 5
-	maxToolCallsPerTurn  = 10
+	maxToolRoundsPerTurn = 10
+	maxToolCallsPerTurn  = 20
 )
 
 type streamRenderTick struct{}

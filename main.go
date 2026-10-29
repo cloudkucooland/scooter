@@ -11,6 +11,7 @@ import (
 	"strings"
 	"time"
 
+	"codeberg.org/indievisible/scooter/pkg/knowledge"
 	"codeberg.org/indievisible/scooter/pkg/rkllm"
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/urfave/cli/v3"
@@ -233,8 +234,15 @@ func main() {
 	rkllm.GetActiveContextLimit = getActiveContextLimit
 	rkllm.GetActiveToolset = GetActiveToolset
 	rkllm.GetCacheFile = getCacheFile
+	rkllm.IsCacheEnabled = func() bool {
+		return loadConfig().RKLLMCacheEnabled
+	}
 	rkllm.BuildSystemPrompt = func() string {
-		return buildToolInstructions(getSystemTools())
+		base := buildToolInstructions(getSystemTools())
+		if reminder := FormatTasksReminder(); reminder != "" {
+			base += "\n\n" + reminder
+		}
+		return base
 	}
 
 	app := &cli.Command{
@@ -244,8 +252,8 @@ func main() {
 			&cli.StringFlag{
 				Name:    "toolset",
 				Aliases: []string{"t"},
-				Value:   "all",
-				Usage:   "Active toolset (dev, web, all)",
+				Value:   "",
+				Usage:   "Active toolset (dev, web, research, all)",
 			},
 			&cli.StringFlag{
 				Name:    "model",
@@ -256,6 +264,16 @@ func main() {
 				Name:    "prompt",
 				Aliases: []string{"p"},
 				Usage:   "Run a single prompt non-interactively and exit",
+			},
+			&cli.StringFlag{
+				Name:    "ingest",
+				Aliases: []string{"i"},
+				Usage:   "Ingest a file or glob pattern directly into knowledge base",
+			},
+			&cli.StringFlag{
+				Name:    "collection",
+				Aliases: []string{"c"},
+				Usage:   "Collection name for direct ingestion (defaults to 'main')",
 			},
 			&cli.BoolFlag{
 				Name:    "debug",
@@ -272,11 +290,18 @@ func main() {
 				_ = os.Setenv("RKLLM_LOG_LEVEL", "0")
 			}
 
-			toolset := cmd.String("toolset")
-			if toolset != "" {
-				if err := SetActiveToolset(toolset); err != nil {
-					return err
+			toolset := resolveToolset(cmd.String("toolset"))
+			if err := SetActiveToolset(toolset); err != nil {
+				return err
+			}
+
+			ingestPath := cmd.String("ingest")
+			if ingestPath != "" {
+				collection := cmd.String("collection")
+				if collection == "" {
+					collection = "main"
 				}
+				return runDirectIngest(ingestPath, cmd.Args().Slice(), collection)
 			}
 
 			modelName := cmd.String("model")
@@ -304,7 +329,9 @@ func main() {
 }
 
 func runNonInteractive(modelName, toolset, promptText string) error {
-	SetActiveToolset(toolset)
+	if err := SetActiveToolset(resolveToolset(toolset)); err != nil {
+		return err
+	}
 	resolvedModel := rkllm.GetRKLLMModelPath(modelName)
 	detected := detectContextLength(resolvedModel)
 	setActiveContextLimit(detected)
@@ -364,6 +391,82 @@ func runNonInteractive(modelName, toolset, promptText string) error {
 			history = append(history, toolMsg)
 			fmt.Fprintf(os.Stderr, "[Tool result: %s]\n", result)
 		}
+	}
+	return nil
+}
+
+func runDirectIngest(ingestVal string, extraArgs []string, collection string) error {
+	var patterns []string
+	if ingestVal != "" {
+		patterns = append(patterns, ingestVal)
+	}
+	patterns = append(patterns, extraArgs...)
+
+	baseDir, err := os.Getwd()
+	if err != nil {
+		return err
+	}
+
+	var allFiles []string
+	seen := make(map[string]bool)
+
+	for _, pat := range patterns {
+		fullPattern := pat
+		if !filepath.IsAbs(fullPattern) {
+			fullPattern = filepath.Join(baseDir, fullPattern)
+		}
+		matches, err := filepath.Glob(fullPattern)
+		if err != nil || len(matches) == 0 {
+			literal := filepath.Join(baseDir, pat)
+			if _, statErr := os.Stat(literal); statErr == nil {
+				matches = []string{literal}
+			} else {
+				matches = []string{pat}
+			}
+		}
+
+		for _, m := range matches {
+			if !seen[m] {
+				seen[m] = true
+				allFiles = append(allFiles, m)
+			}
+		}
+	}
+
+	if len(allFiles) == 0 {
+		return fmt.Errorf("no files found matching ingest pattern(s)")
+	}
+
+	kdb, err := knowledge.Open()
+	if err != nil {
+		return fmt.Errorf("open knowledge base: %w", err)
+	}
+	defer kdb.Close()
+
+	count := 0
+	var errors []string
+	for _, file := range allFiles {
+		absPath, valErr := validatePath(file)
+		if valErr != nil {
+			errors = append(errors, fmt.Sprintf("%s: %v", filepath.Base(file), valErr))
+			continue
+		}
+		docID, ingestErr := kdb.IngestFile(absPath, collection)
+		if ingestErr != nil {
+			errors = append(errors, fmt.Sprintf("%s: %v", filepath.Base(file), ingestErr))
+		} else {
+			fmt.Printf("Successfully ingested %s into collection %q (Doc ID: %s)\n", filepath.Base(file), collection, docID)
+			count++
+		}
+	}
+
+	if count == 0 && len(errors) > 0 {
+		return fmt.Errorf("ingest failed: %s", strings.Join(errors, "; "))
+	}
+	if len(errors) > 0 {
+		fmt.Printf("Completed with %d success(es) and %d error(s).\n", count, len(errors))
+	} else {
+		fmt.Printf("Successfully ingested %d file(s) into collection %q.\n", count, collection)
 	}
 	return nil
 }

@@ -3,6 +3,7 @@ package knowledge
 import (
 	"database/sql"
 	"encoding/binary"
+	"errors"
 	"fmt"
 	"math"
 	"os"
@@ -43,8 +44,10 @@ type SearchResult struct {
 }
 
 type KnowledgeDB struct {
-	db        *sql.DB
-	EmbedFunc func(string) ([]float32, error)
+	db             *sql.DB
+	EmbedFunc      func(string) ([]float32, error)
+	QueryEmbedFunc func(string) ([]float32, error)
+	EmbeddingModel string
 }
 
 func GetDBPath() string {
@@ -189,9 +192,12 @@ func (k *KnowledgeDB) ListCollections() ([]string, error) {
 	for rows.Next() {
 		var c string
 		if err := rows.Scan(&c); err != nil {
-			continue
+			return nil, err
 		}
 		cols = append(cols, c)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
 	}
 	return cols, nil
 }
@@ -220,8 +226,16 @@ func (k *KnowledgeDB) IngestText(title, content, collection, sourcePath string) 
 		var embBlob []byte
 		embModel := ""
 		if k.EmbedFunc != nil {
-			if vec, err := k.EmbedFunc(chunkContent); err == nil && len(vec) > 0 {
-				embBlob = serializeEmbedding(vec)
+			vec, err := k.EmbedFunc(chunkContent)
+			if err != nil {
+				return "", fmt.Errorf("embed chunk %d: %w", i, err)
+			}
+			if len(vec) == 0 {
+				return "", fmt.Errorf("embed chunk %d: embedding is empty", i)
+			}
+			embBlob = serializeEmbedding(vec)
+			embModel = k.EmbeddingModel
+			if embModel == "" {
 				embModel = "default-embedding"
 			}
 		}
@@ -284,6 +298,9 @@ func (k *KnowledgeDB) Search(query string, collection string, limit int) ([]Sear
 		`, query, limit)
 	}
 	if err != nil {
+		if !strings.Contains(strings.ToLower(err.Error()), "fts5:") {
+			return nil, err
+		}
 		return k.searchLike(query, collection, limit)
 	}
 	defer rows.Close()
@@ -293,10 +310,13 @@ func (k *KnowledgeDB) Search(query string, collection string, limit int) ([]Sear
 		var sr SearchResult
 		var rank float64
 		if err := rows.Scan(&sr.ChunkID, &sr.DocumentID, &sr.Title, &sr.Collection, &sr.Content, &rank); err != nil {
-			continue
+			return nil, err
 		}
 		sr.Score = rank
 		results = append(results, sr)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
 	}
 	if len(results) == 0 {
 		return k.searchLike(query, collection, limit)
@@ -340,7 +360,8 @@ func (k *KnowledgeDB) VectorSearch(queryVec []float32, embeddingModel string, co
 		var chunkID, docID string
 		var embBlob []byte
 		if err := rows.Scan(&chunkID, &docID, &embBlob); err != nil {
-			continue
+			rows.Close()
+			return nil, err
 		}
 		vec := deserializeEmbedding(embBlob)
 		score := cosineSimilarity(queryVec, vec)
@@ -350,7 +371,13 @@ func (k *KnowledgeDB) VectorSearch(queryVec []float32, embeddingModel string, co
 			score:      score,
 		})
 	}
-	rows.Close()
+	if err := rows.Err(); err != nil {
+		rows.Close()
+		return nil, err
+	}
+	if err := rows.Close(); err != nil {
+		return nil, err
+	}
 
 	sort.Slice(candidates, func(i, j int) bool {
 		return candidates[i].score > candidates[j].score
@@ -390,10 +417,13 @@ func (k *KnowledgeDB) VectorSearch(queryVec []float32, embeddingModel string, co
 	for batchRows.Next() {
 		var sr SearchResult
 		if err := batchRows.Scan(&sr.ChunkID, &sr.DocumentID, &sr.Title, &sr.Collection, &sr.Content); err != nil {
-			continue
+			return nil, err
 		}
 		sr.Score = chunkScores[sr.ChunkID]
 		results = append(results, sr)
+	}
+	if err := batchRows.Err(); err != nil {
+		return nil, err
 	}
 
 	sort.Slice(results, func(i, j int) bool {
@@ -408,23 +438,41 @@ func (k *KnowledgeDB) SearchHybrid(query string, collection string, limit int) (
 		limit = 5
 	}
 
-	ftsRes, err := k.Search(query, collection, limit*2)
-	if err != nil {
-		ftsRes = nil
-	}
+	ftsRes, ftsErr := k.Search(query, collection, limit*2)
 
 	var vecRes []SearchResult
 	var embModel string
-	_ = k.db.QueryRow(`SELECT embedding_model FROM chunks WHERE embedding_model != '' AND embedding IS NOT NULL LIMIT 1`).Scan(&embModel)
+	modelErr := k.db.QueryRow(`SELECT embedding_model FROM chunks WHERE embedding_model != '' AND embedding IS NOT NULL LIMIT 1`).Scan(&embModel)
+	var vectorErr error
 
-	if embModel != "" && k.EmbedFunc != nil {
-		if qVec, err := k.EmbedFunc(query); err == nil && len(qVec) > 0 {
-			vecRes, _ = k.VectorSearch(qVec, embModel, collection, limit*2)
+	embedQuery := k.QueryEmbedFunc
+	if embedQuery == nil {
+		embedQuery = k.EmbedFunc
+	}
+
+	if modelErr != nil && !errors.Is(modelErr, sql.ErrNoRows) {
+		vectorErr = fmt.Errorf("find embedding model: %w", modelErr)
+	} else if embModel != "" {
+		if embedQuery == nil {
+			vectorErr = errors.New("embedding function is not configured")
+		} else {
+			qVec, err := embedQuery(query)
+			if err != nil {
+				vectorErr = fmt.Errorf("embed search query: %w", err)
+			} else if len(qVec) == 0 {
+				vectorErr = errors.New("query embedding is empty")
+			} else {
+				vecRes, vectorErr = k.VectorSearch(qVec, embModel, collection, limit*2)
+			}
 		}
 	}
 
 	if len(ftsRes) == 0 && len(vecRes) == 0 {
-		return k.searchLike(query, collection, limit)
+		results, likeErr := k.searchLike(query, collection, limit)
+		if ftsErr != nil && (vectorErr != nil || errors.Is(modelErr, sql.ErrNoRows)) {
+			return nil, errors.Join(fmt.Errorf("full-text search: %w", ftsErr), vectorErr, fmt.Errorf("LIKE search: %w", likeErr))
+		}
+		return results, likeErr
 	}
 
 	scores := make(map[string]float64)
@@ -470,6 +518,9 @@ func (k *KnowledgeDB) SearchHybrid(query string, collection string, limit int) (
 }
 
 func (k *KnowledgeDB) ReembedChunks(embeddingModel string, embedFunc func(string) ([]float32, error)) error {
+	if embedFunc == nil {
+		return errors.New("embedding function is required")
+	}
 	rows, err := k.db.Query(`SELECT id, content FROM chunks`)
 	if err != nil {
 		return err
@@ -484,9 +535,18 @@ func (k *KnowledgeDB) ReembedChunks(embeddingModel string, embedFunc func(string
 		var p pendingChunk
 		if err := rows.Scan(&p.id, &p.content); err == nil {
 			pending = append(pending, p)
+		} else {
+			rows.Close()
+			return err
 		}
 	}
-	rows.Close()
+	if err := rows.Err(); err != nil {
+		rows.Close()
+		return err
+	}
+	if err := rows.Close(); err != nil {
+		return err
+	}
 
 	type chunkUpdate struct {
 		id  string
@@ -496,7 +556,10 @@ func (k *KnowledgeDB) ReembedChunks(embeddingModel string, embedFunc func(string
 	for _, item := range pending {
 		vec, err := embedFunc(item.content)
 		if err != nil {
-			continue
+			return fmt.Errorf("embed chunk %s: %w", item.id, err)
+		}
+		if len(vec) == 0 {
+			return fmt.Errorf("embed chunk %s: embedding is empty", item.id)
 		}
 		updates = append(updates, chunkUpdate{id: item.id, vec: vec})
 	}
@@ -552,10 +615,13 @@ func (k *KnowledgeDB) searchLike(query string, collection string, limit int) ([]
 	for rows.Next() {
 		var sr SearchResult
 		if err := rows.Scan(&sr.ChunkID, &sr.DocumentID, &sr.Title, &sr.Collection, &sr.Content); err != nil {
-			continue
+			return nil, err
 		}
 		sr.Score = 1.0
 		results = append(results, sr)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
 	}
 	return results, nil
 }
@@ -584,46 +650,76 @@ func (k *KnowledgeDB) QueryGraph(sourceID, relation string) ([]EdgeResult, error
 	for rows.Next() {
 		var e EdgeResult
 		if err := rows.Scan(&e.SourceID, &e.TargetID, &e.Relation, &e.Weight); err != nil {
-			continue
+			return nil, err
 		}
 		edges = append(edges, e)
 	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
 	return edges, nil
+}
+
+func (k *KnowledgeDB) AddNode(id, label, properties string) error {
+	if properties == "" {
+		properties = "{}"
+	}
+	_, err := k.db.Exec(`INSERT OR REPLACE INTO nodes (id, label, properties) VALUES (?, ?, ?)`, id, label, properties)
+	return err
+}
+
+func (k *KnowledgeDB) AddEdge(sourceID, targetID, relation string, weight float64) error {
+	if weight == 0 {
+		weight = 1.0
+	}
+	_, err := k.db.Exec(`INSERT OR REPLACE INTO edges (source_id, target_id, relation, weight) VALUES (?, ?, ?, ?)`, sourceID, targetID, relation, weight)
+	return err
 }
 
 func splitIntoChunks(text string, maxChars int) []string {
 	paragraphs := strings.Split(text, "\n\n")
 	var chunks []string
 	var current strings.Builder
+	var currentRunes int
 
 	for _, p := range paragraphs {
 		p = strings.TrimSpace(p)
 		if p == "" {
 			continue
 		}
-		if len(p) > maxChars {
+		pRunes := []rune(p)
+		if len(pRunes) > maxChars {
 			if current.Len() > 0 {
 				chunks = append(chunks, strings.TrimSpace(current.String()))
 				current.Reset()
+				currentRunes = 0
 			}
-			for i := 0; i < len(p); i += maxChars {
+			for i := 0; i < len(pRunes); i += maxChars {
 				end := i + maxChars
-				if end > len(p) {
-					end = len(p)
+				if end > len(pRunes) {
+					end = len(pRunes)
 				}
-				chunks = append(chunks, strings.TrimSpace(p[i:end]))
+				chunks = append(chunks, strings.TrimSpace(string(pRunes[i:end])))
 			}
 			continue
 		}
 
-		if current.Len()+len(p)+2 > maxChars && current.Len() > 0 {
+		extra := 0
+		if current.Len() > 0 {
+			extra = 2
+		}
+		if currentRunes+len(pRunes)+extra > maxChars && current.Len() > 0 {
 			chunks = append(chunks, strings.TrimSpace(current.String()))
 			current.Reset()
+			currentRunes = 0
+			extra = 0
 		}
 		if current.Len() > 0 {
 			current.WriteString("\n\n")
+			currentRunes += 2
 		}
 		current.WriteString(p)
+		currentRunes += len(pRunes)
 	}
 	if current.Len() > 0 {
 		chunks = append(chunks, strings.TrimSpace(current.String()))

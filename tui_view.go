@@ -71,6 +71,7 @@ var availableCommands = []struct {
 	{"/context", "View or change context size"},
 	{"/compress", "Manually compress conversation history"},
 	{"/clear", "Clear conversation history and cache"},
+	{"/cleartasks", "Clear and reset task checklist"},
 	{"/enablecache", "Enable prompt caching"},
 	{"/disablecache", "Disable prompt caching"},
 	{"/file", "Load a local file into context"},
@@ -240,7 +241,7 @@ func (m *model) buildDisplayString() string {
 			if msg.ToolName != "" {
 				toolLabel += " [" + msg.ToolName + "]"
 			}
-			summary := fmt.Sprintf("⚙️ %s [%d lines / %d chars]\n  %s", toolLabel, len(lines), len(msg.Content), preview)
+			summary := fmt.Sprintf("⚙️  %s [%d lines / %d chars]\n  %s", toolLabel, len(lines), len(msg.Content), preview)
 			sb.WriteString(toolBoxStyle.Render(summary) + "\n\n")
 		}
 	}

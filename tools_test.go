@@ -368,9 +368,32 @@ func TestToolsets(t *testing.T) {
 		if tool.Function.Name == "outsource" {
 			foundOutsource = true
 		}
+		if tool.Function.Name == "search_knowledge" {
+			t.Fatalf("expected knowledge tool 'search_knowledge' to be excluded in development toolset")
+		}
 	}
 	if !foundOutsource {
 		t.Fatalf("expected outsource tool in development toolset")
+	}
+
+	if err := SetActiveToolset("research"); err != nil {
+		t.Fatalf("unexpected error setting toolset research: %v", err)
+	}
+	if GetActiveToolset() != "research" {
+		t.Fatalf("expected research toolset, got %q", GetActiveToolset())
+	}
+	researchTools := getSystemTools()
+	foundSearch := false
+	for _, tool := range researchTools {
+		if tool.Function.Name == "search_knowledge" {
+			foundSearch = true
+		}
+		if tool.Function.Name == "apply_patch" {
+			t.Fatalf("expected development tool 'apply_patch' to be excluded in research toolset")
+		}
+	}
+	if !foundSearch {
+		t.Fatalf("expected 'search_knowledge' tool in research toolset")
 	}
 
 	if err := SetActiveToolset("web"); err != nil {
@@ -381,16 +404,20 @@ func TestToolsets(t *testing.T) {
 	}
 	webTools := getSystemTools()
 	foundWebFetch := false
+	foundWriteFile := false
 	for _, tool := range webTools {
 		if tool.Function.Name == "web_fetch" {
 			foundWebFetch = true
+		}
+		if tool.Function.Name == "write_file" {
+			foundWriteFile = true
 		}
 		if tool.Function.Name == "apply_patch" {
 			t.Fatalf("expected development tool 'apply_patch' to be excluded in web toolset")
 		}
 	}
-	if !foundWebFetch {
-		t.Fatalf("expected 'web_fetch' tool in web toolset")
+	if !foundWebFetch || !foundWriteFile {
+		t.Fatalf("expected 'web_fetch' and 'write_file' tools in web toolset")
 	}
 
 	if err := SetActiveToolset("invalid_set"); err == nil {

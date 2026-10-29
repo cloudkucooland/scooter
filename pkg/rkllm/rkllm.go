@@ -27,6 +27,7 @@ var (
 	GetActiveToolset      = func() string { return "all" }
 	GetCacheFile          = func() (string, error) { return os.UserCacheDir() }
 	BuildSystemPrompt     = func() string { return "" }
+	IsCacheEnabled        = func() bool { return os.Getenv("RKLLM_CACHE_ENABLED") != "false" }
 )
 
 type Message = types.Message
@@ -56,29 +57,52 @@ const (
 	RKLLM_INFER_GENERATE RKLLMInferMode = 0
 )
 
+type RKLLMResultLastHiddenLayer struct {
+	HiddenStates *float32
+	EmbdSize     int32
+	NumTokens    int32
+}
+
+type RKLLMResultLogits struct {
+	Logits    *float32
+	VocabSize int32
+	NumTokens int32
+}
+
+type RKLLMPerfStat struct {
+	PrefillTimeMs  float32
+	PrefillTokens  int32
+	GenerateTimeMs float32
+	GenerateTokens int32
+	MemoryUsageMB  float32
+}
+
 type RKLLMResult struct {
-	Text        *byte
-	TokenID     int32
-	PerfContext unsafe.Pointer
+	Text            *byte
+	TokenID         int32
+	LastHiddenLayer RKLLMResultLastHiddenLayer
+	Logits          RKLLMResultLogits
+	Perf            RKLLMPerfStat
 }
 
 type RKLLMParam struct {
-	ModelPath     *byte
-	MaxContextLen int32
-	MaxNewTokens  int32
-	TopK          int32
-	TopP          float32
-	Temperature   float32
-	RepeatPenalty float32
-	FrequencyPen  float32
-	PresencePen   float32
-	Mirostat      int32
-	MirostatTau   float32
-	MirostatEta   float32
-	LogitBias     unsafe.Pointer
-	LogitBiasLen  int32
-	IsAsync       bool
-	ExtendParam   [128]byte
+	ModelPath        *byte
+	MaxContextLen    int32
+	MaxNewTokens     int32
+	TopK             int32
+	NKeep            int32
+	TopP             float32
+	Temperature      float32
+	RepeatPenalty    float32
+	FrequencyPen     float32
+	PresencePen      float32
+	Mirostat         int32
+	MirostatTau      float32
+	MirostatEta      float32
+	SkipSpecialToken bool
+	IgnoreEosToken   bool
+	IsAsync          bool
+	ExtendParam      [128]byte
 }
 
 type RKLLMInput struct {
@@ -89,8 +113,12 @@ type RKLLMInput struct {
 }
 
 type RKLLMCallback struct {
-	Callback functionPointer
-	Userdata unsafe.Pointer
+	ResultCallback    functionPointer
+	ResultUserdata    unsafe.Pointer
+	TokenizerCallback functionPointer
+	TokenizerUserdata unsafe.Pointer
+	EmbedCallback     functionPointer
+	EmbedUserdata     unsafe.Pointer
 }
 
 type RKLLMPromptCacheParam struct {
@@ -98,11 +126,25 @@ type RKLLMPromptCacheParam struct {
 	CachePath       *byte
 }
 
+type RKLLMSamplingParam struct {
+	TopK             int32
+	TopP             float32
+	Temperature      float32
+	RepeatPenalty    float32
+	FrequencyPenalty float32
+	PresencePenalty  float32
+	Mirostat         int32
+	MirostatTau      float32
+	MirostatEta      float32
+}
+
 type RKLLMInferParam struct {
 	Mode              RKLLMInferMode
 	LoraParams        unsafe.Pointer
 	PromptCacheParams *RKLLMPromptCacheParam
-	ModelParams       unsafe.Pointer
+	SamplingParams    *RKLLMSamplingParam
+	KeepHistory       int32
+	MaxNewTokens      int32
 }
 
 type functionPointer uintptr
@@ -291,8 +333,12 @@ func getRKLLMCallback() RKLLMCallback {
 	})
 
 	return RKLLMCallback{
-		Callback: functionPointer(globalCallbackPtr),
-		Userdata: nil,
+		ResultCallback:    functionPointer(globalCallbackPtr),
+		ResultUserdata:    nil,
+		TokenizerCallback: 0,
+		TokenizerUserdata: nil,
+		EmbedCallback:     0,
+		EmbedUserdata:     nil,
 	}
 }
 
@@ -590,11 +636,11 @@ func StreamRKLLM(ctx context.Context, modelName string, history []Message, chann
 		Mode: RKLLM_INFER_GENERATE,
 	}
 
-	cacheEnabled := os.Getenv("RKLLM_CACHE_ENABLED") != "false"
+	cacheEnabled := IsCacheEnabled() && os.Getenv("RKLLM_CACHE_ENABLED") != "false"
 	var cacheParam RKLLMPromptCacheParam
 	systemPrompt := "System:\n" + strings.Join(systemParts, "\n\n") + "\n\n"
 	cacheFile := getPromptCacheFileForSystemPrompt(activeModelPath, contextLen, systemPrompt)
-	// cacheLoaded := false
+	cacheLoaded := false
 
 	if cacheEnabled && loadPromptCacheFn != nil {
 		if _, err := os.Stat(cacheFile); err != nil {
@@ -624,12 +670,17 @@ func StreamRKLLM(ctx context.Context, modelName string, history []Message, chann
 			if ret := loadPromptCacheFn(handle, cachePathPtr); ret != 0 {
 				fmt.Fprintf(os.Stderr, "Warning: rkllm_load_prompt_cache failed: %d\n", ret)
 			} else {
-				// cacheLoaded = true
+				// Explicitly set 0 for read-only generation mode when using an existing cache file
 				cacheParam.SavePromptCache = 0
 				cacheParam.CachePath = cachePathPtr
 				inferParams.PromptCacheParams = &cacheParam
+				cacheLoaded = true
 			}
 		}
+	}
+
+	if !cacheLoaded {
+		inferParams.PromptCacheParams = nil
 	}
 
 	/* librkllmrt.so prompt caching does NOT work by loading a static file into memory and letting you append arbitrary context on the fly without system wrappers.
@@ -643,6 +694,16 @@ func StreamRKLLM(ctx context.Context, modelName string, history []Message, chann
 	} */
 	// Always include systemPrompt in the text so positional embeddings align with the cache,
 	conversationPrompt := systemPrompt + prompt.String()
+
+	// XXX testing
+	maxChars := contextLen * 3 // Rough byte-budget fallback (approx 3-4 chars per token)
+	if len(conversationPrompt) > maxChars {
+		// Truncate from the middle/older conversation turns to protect system prompt & latest turn
+		conversationPrompt = systemPrompt + "[...older context truncated to fit context limit...]\n\n" + prompt.String()
+		if len(conversationPrompt) > maxChars {
+			conversationPrompt = conversationPrompt[len(conversationPrompt)-maxChars:]
+		}
+	}
 
 	promptPtr, promptSlice := stringToBytePtr(conversationPrompt)
 	defer runtime.KeepAlive(promptSlice)

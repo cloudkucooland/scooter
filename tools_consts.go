@@ -59,6 +59,16 @@ type Tool struct {
 
 var activeToolset = "all"
 
+func resolveToolset(name string) string {
+	if name = strings.TrimSpace(name); name != "" {
+		return name
+	}
+	if configured := strings.TrimSpace(loadConfig().DefaultToolset); configured != "" {
+		return configured
+	}
+	return "all"
+}
+
 func GetActiveToolset() string {
 	if activeToolset == "" {
 		return "all"
@@ -71,12 +81,14 @@ func SetActiveToolset(name string) error {
 	switch normalized {
 	case "dev", "development":
 		activeToolset = "development"
+	case "research", "knowledge", "memo":
+		activeToolset = "research"
 	case "web", "net", "internet":
 		activeToolset = "web"
 	case "all", "every":
 		activeToolset = "all"
 	default:
-		return fmt.Errorf("unknown toolset %q (available: development, web, all)", name)
+		return fmt.Errorf("unknown toolset %q (available: development, research, web, all)", name)
 	}
 	return nil
 }
@@ -84,30 +96,236 @@ func SetActiveToolset(name string) error {
 func listToolsetsNames() []string {
 	return []string{
 		"development (dev)",
+		"research (knowledge)",
 		"web (internet)",
 		"all (default)",
 	}
 }
 
 func getWebTools() []Tool {
+	webFetchTool := Tool{
+		Type: "function",
+		Function: FunctionDefinition{
+			Name:        "web_fetch",
+			Description: "Processes content from URL(s) embedded in a prompt. Include up to 20 URLs and instructions (e.g., summarize, extract specific data) directly in the 'prompt' parameter OR a single URL via the url parameter",
+			Parameters: Parameters{
+				Type: "object",
+				Properties: map[string]Property{
+					"prompt": {
+						Type:        "string",
+						Description: "A prompt containing URL(s) (up to 20) to fetch and instructions on how to process their content. URLs must start with http:// or https://.",
+					},
+					"url": {
+						Type:        "string",
+						Description: "A single URL to fetch",
+					},
+				},
+			},
+		},
+	}
+	writeFileTool := Tool{
+		Type: "function",
+		Function: FunctionDefinition{
+			Name:        "write_file",
+			Description: "Writes text contents directly to a file on disk instead of outputting chat text.",
+			Parameters: Parameters{
+				Type: "object",
+				Properties: map[string]Property{
+					"file_path": {Type: "string", Description: "Path of the file to write (relative to working directory or absolute within it)."},
+					"content":   {Type: "string", Description: "Raw text or code contents for the file."},
+				},
+				Required: []string{"file_path", "content"},
+			},
+		},
+	}
+	tools := []Tool{webFetchTool, writeFileTool}
+	tools = append(tools, getResearchTools()...)
+	return tools
+}
+
+func getResearchTools() []Tool {
 	return []Tool{
 		{
 			Type: "function",
 			Function: FunctionDefinition{
-				Name:        "web_fetch",
-				Description: "Processes content from URL(s) embedded in a prompt. Include up to 20 URLs and instructions (e.g., summarize, extract specific data) directly in the 'prompt' parameter OR a single URL via the url parameter",
+				Name:        "search_knowledge",
+				Description: "Searches the local knowledge base for relevant content.",
 				Parameters: Parameters{
 					Type: "object",
 					Properties: map[string]Property{
-						"prompt": {
-							Type:        "string",
-							Description: "A prompt containing URL(s) (up to 20) to fetch and instructions on how to process their content. URLs must start with http:// or https://.",
-						},
-						"url": {
-							Type:        "string",
-							Description: "A single URL to fetch",
-						},
+						"query":      {Type: "string", Description: "Search query or keywords to find matching content."},
+						"collection": {Type: "string", Description: "Optional collection or series filter."},
+						"limit":      {Type: "integer", Description: "Optional maximum number of results to return (defaults to 5)."},
 					},
+					Required: []string{"query"},
+				},
+			},
+		},
+		{
+			Type: "function",
+			Function: FunctionDefinition{
+				Name:        "ingest_knowledge",
+				Description: "Ingests local file(s) into the knowledge base so they can be searched and analyzed later.",
+				Parameters: Parameters{
+					Type: "object",
+					Properties: map[string]Property{
+						"file_path":  {Type: "string", Description: "Single file path or glob pattern (e.g., 'sermons/*.md') to ingest."},
+						"collection": {Type: "string", Description: "Optional collection name."},
+					},
+					Required: []string{"file_path"},
+				},
+			},
+		},
+		{
+			Type: "function",
+			Function: FunctionDefinition{
+				Name:        "search_knowledge_hybrid",
+				Description: "Searches the knowledge base using semantic vector similarity and keyword search combined.",
+				Parameters: Parameters{
+					Type: "object",
+					Properties: map[string]Property{
+						"query":      {Type: "string", Description: "Natural language query or concept."},
+						"collection": {Type: "string", Description: "Optional collection or series filter."},
+						"limit":      {Type: "integer", Description: "Max results to return (default 5)."},
+					},
+					Required: []string{"query"},
+				},
+			},
+		},
+		{
+			Type: "function",
+			Function: FunctionDefinition{
+				Name:        "list_collections",
+				Description: "Lists all available document collections and sermon series in the knowledge base.",
+				Parameters: Parameters{
+					Type:       "object",
+					Properties: map[string]Property{},
+				},
+			},
+		},
+		{
+			Type: "function",
+			Function: FunctionDefinition{
+				Name:        "query_graph",
+				Description: "Queries outgoing relationships and connected entities for a graph node (e.g., scripture references or metaphors tied to a sermon or preacher).",
+				Parameters: Parameters{
+					Type: "object",
+					Properties: map[string]Property{
+						"source_id": {Type: "string", Description: "ID of the root node (e.g., 'preacher_scot' or 'passage_exodus_16_1')."},
+						"relation":  {Type: "string", Description: "Optional relation filter ('EXPOUNDS', 'USES_METAPHOR', 'PREACHED')."},
+					},
+					Required: []string{"source_id"},
+				},
+			},
+		},
+		{
+			Type: "function",
+			Function: FunctionDefinition{
+				Name:        "reembed_knowledge",
+				Description: "Re-embeds every knowledge chunk with a Google GenAI embedding model. Sends chunk text to Google and requires GOOGLE_API_KEY. Example model: gemini-embedding-001.",
+				Parameters: Parameters{
+					Type: "object",
+					Properties: map[string]Property{
+						"model_name": {Type: "string", Description: "Google GenAI embedding model name, such as gemini-embedding-001."},
+					},
+					Required: []string{"model_name"},
+				},
+			},
+		},
+		{
+			Type: "function",
+			Function: FunctionDefinition{
+				Name:        "add_knowledge_node",
+				Description: "Adds or updates a node in the knowledge graph (e.g., a metaphor, topic, sermon, or entity).",
+				Parameters: Parameters{
+					Type: "object",
+					Properties: map[string]Property{
+						"id":         {Type: "string", Description: "Unique identifier for the node (e.g., 'metaphor_anchor' or 'doc_123')."},
+						"label":      {Type: "string", Description: "Node label or category (e.g., 'Metaphor', 'Concept', 'Sermon')."},
+						"properties": {Type: "string", Description: "Optional JSON string or description of node properties."},
+					},
+					Required: []string{"id", "label"},
+				},
+			},
+		},
+		{
+			Type: "function",
+			Function: FunctionDefinition{
+				Name:        "add_knowledge_edge",
+				Description: "Adds or updates a directed relationship edge between two nodes in the knowledge graph (e.g., USES_METAPHOR, EXPOUNDS).",
+				Parameters: Parameters{
+					Type: "object",
+					Properties: map[string]Property{
+						"source_id": {Type: "string", Description: "Source node ID."},
+						"target_id": {Type: "string", Description: "Target node ID."},
+						"relation":  {Type: "string", Description: "Relationship type (e.g., 'USES_METAPHOR', 'EXPOUNDS', 'PREACHED')."},
+						"weight":    {Type: "number", Description: "Optional relationship weight (defaults to 1.0)."},
+					},
+					Required: []string{"source_id", "target_id", "relation"},
+				},
+			},
+		},
+		{
+			Type: "function",
+			Function: FunctionDefinition{
+				Name:        "set_tasks",
+				Description: "Sets or resets the active task/step checklist for multi-step tasks to stay organized and prevent context drift.",
+				Parameters: Parameters{
+					Type: "object",
+					Properties: map[string]Property{
+						"steps": {Type: "array", Description: "List of step descriptions."},
+					},
+					Required: []string{"steps"},
+				},
+			},
+		},
+		{
+			Type: "function",
+			Function: FunctionDefinition{
+				Name:        "add_task",
+				Description: "Appends a newly discovered task or sub-step to the active task checklist.",
+				Parameters: Parameters{
+					Type: "object",
+					Properties: map[string]Property{
+						"step": {Type: "string", Description: "Description of the new task or step."},
+					},
+					Required: []string{"step"},
+				},
+			},
+		},
+		{
+			Type: "function",
+			Function: FunctionDefinition{
+				Name:        "complete_task",
+				Description: "Marks a specific task step as completed by its ID number.",
+				Parameters: Parameters{
+					Type: "object",
+					Properties: map[string]Property{
+						"id": {Type: "integer", Description: "ID number of the task step to mark complete."},
+					},
+					Required: []string{"id"},
+				},
+			},
+		},
+		{
+			Type: "function",
+			Function: FunctionDefinition{
+				Name:        "get_tasks",
+				Description: "Retrieves the current task checklist and progress status.",
+				Parameters: Parameters{
+					Type:       "object",
+					Properties: map[string]Property{},
+				},
+			},
+		},
+		{
+			Type: "function",
+			Function: FunctionDefinition{
+				Name:        "clear_tasks",
+				Description: "Clears and resets the task checklist once all multi-step goals are complete.",
+				Parameters: Parameters{
+					Type:       "object",
+					Properties: map[string]Property{},
 				},
 			},
 		},
@@ -306,93 +524,6 @@ func getDevelopmentTools() []Tool {
 				},
 			},
 		},
-		{
-			Type: "function",
-			Function: FunctionDefinition{
-				Name:        "search_knowledge",
-				Description: "Searches the local knowledge base for relevant content.",
-				Parameters: Parameters{
-					Type: "object",
-					Properties: map[string]Property{
-						"query":      {Type: "string", Description: "Search query or keywords to find matching content."},
-						"collection": {Type: "string", Description: "Optional collection or series filter."},
-						"limit":      {Type: "integer", Description: "Optional maximum number of results to return (defaults to 5)."},
-					},
-					Required: []string{"query"},
-				},
-			},
-		},
-		{
-			Type: "function",
-			Function: FunctionDefinition{
-				Name:        "ingest_knowledge",
-				Description: "Ingests a local file into the knowledge base so it can be searched and analyzed later.",
-				Parameters: Parameters{
-					Type: "object",
-					Properties: map[string]Property{
-						"file_path":  {Type: "string", Description: "Path to the file to ingest."},
-						"collection": {Type: "string", Description: "Optional collection or series name."},
-					},
-					Required: []string{"file_path"},
-				},
-			},
-		},
-		{
-			Type: "function",
-			Function: FunctionDefinition{
-				Name:        "search_knowledge_hybrid",
-				Description: "Searches the knowledge base using semantic vector similarity and keyword search combined.",
-				Parameters: Parameters{
-					Type: "object",
-					Properties: map[string]Property{
-						"query":      {Type: "string", Description: "Natural language query or concept."},
-						"collection": {Type: "string", Description: "Optional collection or series filter."},
-						"limit":      {Type: "integer", Description: "Max results to return (default 5)."},
-					},
-					Required: []string{"query"},
-				},
-			},
-		},
-		{
-			Type: "function",
-			Function: FunctionDefinition{
-				Name:        "list_collections",
-				Description: "Lists all available document collections and sermon series in the knowledge base.",
-				Parameters: Parameters{
-					Type:       "object",
-					Properties: map[string]Property{},
-				},
-			},
-		},
-		{
-			Type: "function",
-			Function: FunctionDefinition{
-				Name:        "query_graph",
-				Description: "Queries outgoing relationships and connected entities for a graph node (e.g., scripture references or metaphors tied to a sermon or preacher).",
-				Parameters: Parameters{
-					Type: "object",
-					Properties: map[string]Property{
-						"source_id": {Type: "string", Description: "ID of the root node (e.g., 'preacher_scot' or 'passage_exodus_16_1')."},
-						"relation":  {Type: "string", Description: "Optional relation filter ('EXPOUNDS', 'USES_METAPHOR', 'PREACHED')."},
-					},
-					Required: []string{"source_id"},
-				},
-			},
-		},
-		{
-			Type: "function",
-			Function: FunctionDefinition{
-				Name:        "reembed_knowledge",
-				Description: "Triggers re-embedding of text chunks in the knowledge base using a specified embedding model.",
-				Parameters: Parameters{
-					Type: "object",
-					Properties: map[string]Property{
-						"model_name": {Type: "string", Description: "Name of the embedding model being used."},
-					},
-					Required: []string{"model_name"},
-				},
-			},
-		},
 	}
 }
 
@@ -400,12 +531,27 @@ func getSystemTools() []Tool {
 	switch GetActiveToolset() {
 	case "development":
 		return getDevelopmentTools()
+	case "research":
+		return getResearchTools()
 	case "web":
 		return getWebTools()
 	case "all":
 		fallthrough
 	default:
-		return append(getDevelopmentTools(), getWebTools()...)
+		dev := getDevelopmentTools()
+		res := getResearchTools()
+		web := getWebTools()
+		seen := make(map[string]bool)
+		var combined []Tool
+		for _, toolsList := range [][]Tool{dev, res, web} {
+			for _, t := range toolsList {
+				if !seen[t.Function.Name] {
+					seen[t.Function.Name] = true
+					combined = append(combined, t)
+				}
+			}
+		}
+		return combined
 	}
 }
 
@@ -525,3 +671,30 @@ type ReembedKnowledgeArgs struct {
 }
 
 type ListCollectionsArgs struct{}
+
+type AddKnowledgeNodeArgs struct {
+	ID         string `json:"id"`
+	Label      string `json:"label"`
+	Properties string `json:"properties,omitempty"`
+}
+
+type AddKnowledgeEdgeArgs struct {
+	SourceID string  `json:"source_id"`
+	TargetID string  `json:"target_id"`
+	Relation string  `json:"relation"`
+	Weight   float64 `json:"weight,omitempty"`
+}
+
+type SetTasksArgs struct {
+	Steps []string `json:"steps"`
+}
+
+type AddTaskArgs struct {
+	Step string `json:"step"`
+}
+
+type CompleteTaskArgs struct {
+	ID int `json:"id"`
+}
+
+type GetTasksArgs struct{}

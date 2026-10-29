@@ -353,10 +353,11 @@ func (m *model) handleCommand(input string) tea.Cmd {
 - /models: List available RKLLM models
 - /model <name>: Switch active RKLLM model
 - /toolsets: List available toolsets
-- /toolset <name>: Switch active toolset (development, web, all)
+- /toolset <name>: Switch active toolset (development, research, web, all)
 - /context [size]: View or change context limit (e.g. /context 8k, /context 16384)
 - /compress: Manually compress/summarize older conversation history
 - /clear: Clear conversation history and session cache
+- /cleartasks: Clear and reset active task checklist
 - /disablecache: Disable prompt caching and remove cache files
 - /enablecache: Enable prompt caching for the next request
 - /file <path>: Load a local file into the conversation
@@ -378,6 +379,7 @@ func (m *model) handleCommand(input string) tea.Cmd {
 		cfg.RKLLMCacheEnabled = false
 		_ = saveConfig(cfg)
 		removePromptCacheFiles()
+		_ = os.Setenv("RKLLM_CACHE_ENABLED", "false")
 		m.chatHistory = append(m.chatHistory, Message{
 			Role:    "system",
 			Content: "Prompt caching disabled (`rkllm_cache_enabled` set to false) and existing cache files removed.",
@@ -390,6 +392,7 @@ func (m *model) handleCommand(input string) tea.Cmd {
 		cfg := loadConfig()
 		cfg.RKLLMCacheEnabled = true
 		_ = saveConfig(cfg)
+		_ = os.Setenv("RKLLM_CACHE_ENABLED", "true")
 
 		m.chatHistory = append(m.chatHistory, Message{
 			Role:    "system",
@@ -501,6 +504,22 @@ func (m *model) handleCommand(input string) tea.Cmd {
 			m.saveMessage(*hydration)
 		}
 
+		m.refreshViewport()
+		return nil
+	}
+
+	if strings.HasPrefix(input, "/cleartasks") {
+		if err := ClearTasks(); err != nil {
+			m.chatHistory = append(m.chatHistory, Message{
+				Role:    "system",
+				Content: fmt.Sprintf("Error clearing tasks: %v", err),
+			})
+		} else {
+			m.chatHistory = append(m.chatHistory, Message{
+				Role:    "system",
+				Content: "Task checklist cleared successfully.",
+			})
+		}
 		m.refreshViewport()
 		return nil
 	}
