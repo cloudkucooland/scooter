@@ -33,22 +33,6 @@ func getSharedKnowledgeDB() (*knowledge.KnowledgeDB, error) {
 	return sharedKnowledgeDB, nil
 }
 
-func googleEmbeddingFunc(client *genai.Client, model, taskType string) func(string) ([]float32, error) {
-	return func(text string) ([]float32, error) {
-		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
-		defer cancel()
-
-		result, err := client.Models.EmbedContent(ctx, model, genai.Text(text), &genai.EmbedContentConfig{TaskType: taskType})
-		if err != nil {
-			return nil, err
-		}
-		if result == nil || len(result.Embeddings) != 1 || result.Embeddings[0] == nil || len(result.Embeddings[0].Values) == 0 {
-			return nil, fmt.Errorf("embedding model %q returned no vector", model)
-		}
-		return result.Embeddings[0].Values, nil
-	}
-}
-
 func dispatchToolCall(name string, rawArgs json.RawMessage) string {
 	logDebug("dispatchToolCall called: %s, Args: %s", name, string(rawArgs))
 	if strings.TrimSpace(name) == "" {
@@ -149,32 +133,6 @@ func dispatchToolCall(name string, rawArgs json.RawMessage) string {
 		}
 		return fmt.Sprintf("Successfully ingested %d file(s) into collection %q.", count, coll)
 
-	case "search_knowledge_hybrid":
-		var args SearchKnowledgeHybridArgs
-		if err := json.Unmarshal(rawArgs, &args); err != nil {
-			return fmt.Sprintf("System Error parsing arguments: %v", err)
-		}
-		if strings.TrimSpace(args.Query) == "" {
-			return "System Error: query is required"
-		}
-		kdb, err := getSharedKnowledgeDB()
-		if err != nil {
-			return fmt.Sprintf("System Error opening knowledge base: %v", err)
-		}
-		results, err := kdb.SearchHybrid(args.Query, args.Collection, args.Limit)
-		if err != nil {
-			return fmt.Sprintf("Hybrid Search Error: %v", err)
-		}
-		if len(results) == 0 {
-			return "No matching knowledge found."
-		}
-		var sb strings.Builder
-		sb.WriteString("Hybrid Knowledge Search Results:\n")
-		for i, r := range results {
-			sb.WriteString(fmt.Sprintf("[%d] %s (%s)\n%s\n\n", i+1, r.Title, r.Collection, truncateSnippet(r.Content, 400)))
-		}
-		return sb.String()
-
 	case "list_collections":
 		kdb, err := getSharedKnowledgeDB()
 		if err != nil {
@@ -214,38 +172,6 @@ func dispatchToolCall(name string, rawArgs json.RawMessage) string {
 			sb.WriteString(fmt.Sprintf("[%d] --[%s]--> %s (weight: %.2f)\n", i+1, e.Relation, e.TargetID, e.Weight))
 		}
 		return sb.String()
-
-	case "reembed_knowledge":
-		var args ReembedKnowledgeArgs
-		if err := json.Unmarshal(rawArgs, &args); err != nil {
-			return fmt.Sprintf("System Error parsing arguments: %v", err)
-		}
-		if strings.TrimSpace(args.ModelName) == "" {
-			return "System Error: model_name is required"
-		}
-		args.ModelName = strings.TrimSpace(args.ModelName)
-		kdb, err := getSharedKnowledgeDB()
-		if err != nil {
-			return fmt.Sprintf("System Error opening knowledge base: %v", err)
-		}
-		apiKey := getGoogleAPIKey()
-		if apiKey == "" {
-			return "Reembed Error: Google API key is not configured. Set GOOGLE_API_KEY or google_api_key in your config. No vectors were changed."
-		}
-		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
-		defer cancel()
-		client, err := genai.NewClient(ctx, &genai.ClientConfig{APIKey: apiKey, Backend: genai.BackendGeminiAPI})
-		if err != nil {
-			return fmt.Sprintf("Reembed Error creating GenAI client: %v. No vectors were changed.", err)
-		}
-		documentEmbed := googleEmbeddingFunc(client, args.ModelName, "RETRIEVAL_DOCUMENT")
-		if err := kdb.ReembedChunks(args.ModelName, documentEmbed); err != nil {
-			return fmt.Sprintf("Reembed Error: %v. No vectors were changed.", err)
-		}
-		kdb.EmbeddingModel = args.ModelName
-		kdb.EmbedFunc = documentEmbed
-		kdb.QueryEmbedFunc = googleEmbeddingFunc(client, args.ModelName, "RETRIEVAL_QUERY")
-		return fmt.Sprintf("Successfully re-embedded knowledge chunks with Google GenAI model %q.", args.ModelName)
 
 	case "add_knowledge_node":
 		var args AddKnowledgeNodeArgs

@@ -176,22 +176,7 @@ func getResearchTools() []Tool {
 				},
 			},
 		},
-		{
-			Type: "function",
-			Function: FunctionDefinition{
-				Name:        "search_knowledge_hybrid",
-				Description: "Searches the knowledge base using semantic vector similarity and keyword search combined.",
-				Parameters: Parameters{
-					Type: "object",
-					Properties: map[string]Property{
-						"query":      {Type: "string", Description: "Natural language query or concept."},
-						"collection": {Type: "string", Description: "Optional collection or series filter."},
-						"limit":      {Type: "integer", Description: "Max results to return (default 5)."},
-					},
-					Required: []string{"query"},
-				},
-			},
-		},
+
 		{
 			Type: "function",
 			Function: FunctionDefinition{
@@ -218,20 +203,7 @@ func getResearchTools() []Tool {
 				},
 			},
 		},
-		{
-			Type: "function",
-			Function: FunctionDefinition{
-				Name:        "reembed_knowledge",
-				Description: "Re-embeds every knowledge chunk with a Google GenAI embedding model. Sends chunk text to Google and requires GOOGLE_API_KEY. Example model: gemini-embedding-001.",
-				Parameters: Parameters{
-					Type: "object",
-					Properties: map[string]Property{
-						"model_name": {Type: "string", Description: "Google GenAI embedding model name, such as gemini-embedding-001."},
-					},
-					Required: []string{"model_name"},
-				},
-			},
-		},
+
 		{
 			Type: "function",
 			Function: FunctionDefinition{
