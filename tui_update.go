@@ -171,7 +171,7 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				m.textarea.Reset()
 				return m, nil
 			}
-			if m.isStreaming || m.isProcessingTool {
+			if m.isStreaming || m.isProcessingTool || m.isGeneratingImage {
 				return m, nil
 			}
 
@@ -314,6 +314,24 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		}
 		m.refreshViewport()
 		return m, nil
+
+	case ImageGeneratedMessage:
+		m.isGeneratingImage = false
+		if msg.Err != nil {
+			m.chatHistory = append(m.chatHistory, Message{
+				Role:    "system",
+				Content: fmt.Sprintf("Image Generation Error: %v", msg.Err),
+			})
+		} else {
+			sysMsg := Message{
+				Role:    "system",
+				Content: fmt.Sprintf("Generated image: %s (%.1fs)", msg.Summary, msg.Duration.Seconds()),
+			}
+			m.chatHistory = append(m.chatHistory, sysMsg)
+			m.saveMessage(sysMsg)
+		}
+		m.refreshViewport()
+		return m, nil
 	}
 
 	m.textarea, tiCmd = m.textarea.Update(msg)
@@ -353,7 +371,7 @@ func (m *model) handleCommand(input string) tea.Cmd {
 - /models: List available RKLLM models
 - /model <name>: Switch active RKLLM model
 - /toolsets: List available toolsets
-- /toolset <name>: Switch active toolset (development, research, web, all)
+- /toolset <name>: Switch active toolset (development, research, web, image, all)
 - /context [size]: View or change context limit (e.g. /context 8k, /context 16384)
 - /compress: Manually compress/summarize older conversation history
 - /clear: Clear conversation history and session cache
@@ -362,6 +380,7 @@ func (m *model) handleCommand(input string) tea.Cmd {
 - /enablecache: Enable prompt caching for the next request
 - /file <path>: Load a local file into the conversation
 - /status: Check RKLLM backend status
+- /imagine: Generate an image locally (--out <file.png>)
 - /quit: Exit Scooter
 - !<command>: Execute a shell command directly (e.g. !ls, !/bin/ls)
 - [Esc]: Abort generation or cancel pending tool confirmation`
@@ -434,7 +453,7 @@ func (m *model) handleCommand(input string) tea.Cmd {
 		if err := SetActiveToolset(newToolset); err != nil {
 			m.chatHistory = append(m.chatHistory, Message{
 				Role:    "system",
-				Content: fmt.Sprintf("Error switching toolset: %v. Available: development, home, web, all", err),
+				Content: fmt.Sprintf("Error switching toolset: %v. Available: development, research, web, image, all", err),
 			})
 		} else {
 			removePromptCacheFiles()
@@ -585,6 +604,28 @@ func (m *model) handleCommand(input string) tea.Cmd {
 		return compressHistoryCmd(m.modelName, m.chatHistory, true, m.historyGeneration)
 	}
 
+	if strings.HasPrefix(input, "/imagine") || strings.HasPrefix(input, "/image ") || input == "/image" {
+		raw := strings.TrimPrefix(input, "/imagine")
+		if raw == input {
+			raw = strings.TrimPrefix(input, "/image")
+		}
+		prompt, outPath := parseImagineCommandArgs(strings.TrimSpace(raw))
+		if prompt == "" {
+			m.chatHistory = append(m.chatHistory, Message{
+				Role:    "system",
+				Content: "Usage: /imagine [--out filename.png] <prompt>",
+			})
+			m.refreshViewport()
+			return nil
+		}
+		userMsg := Message{Role: "user", Content: input}
+		m.chatHistory = append(m.chatHistory, userMsg)
+		m.saveMessage(userMsg)
+		m.isGeneratingImage = true
+		m.refreshViewport()
+		return imagineCmd(prompt, outPath, 4, 0)
+	}
+
 	userMsg := Message{Role: "user", Content: input}
 	m.chatHistory = append(m.chatHistory, userMsg)
 	m.saveMessage(userMsg)
@@ -706,4 +747,18 @@ func removePromptCacheFiles() {
 	for _, m := range matches {
 		_ = os.Remove(m)
 	}
+}
+
+func parseImagineCommandArgs(raw string) (prompt, outPath string) {
+	fields := strings.Fields(raw)
+	var promptParts []string
+	for i := 0; i < len(fields); i++ {
+		if (fields[i] == "--out" || fields[i] == "-o") && i+1 < len(fields) {
+			outPath = fields[i+1]
+			i++
+			continue
+		}
+		promptParts = append(promptParts, fields[i])
+	}
+	return strings.Join(promptParts, " "), outPath
 }

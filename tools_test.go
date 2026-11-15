@@ -420,6 +420,33 @@ func TestToolsets(t *testing.T) {
 		t.Fatalf("expected 'web_fetch' and 'write_file' tools in web toolset")
 	}
 
+	if err := SetActiveToolset("image"); err != nil {
+		t.Fatalf("unexpected error setting toolset image: %v", err)
+	}
+	if GetActiveToolset() != "image" {
+		t.Fatalf("expected image toolset, got %q", GetActiveToolset())
+	}
+	imageTools := getSystemTools()
+	foundGenerateImage := false
+	for _, tool := range imageTools {
+		if tool.Function.Name == "generate_image" {
+			foundGenerateImage = true
+		}
+		if tool.Function.Name == "apply_patch" {
+			t.Fatalf("expected development tool 'apply_patch' to be excluded in image toolset")
+		}
+	}
+	if !foundGenerateImage {
+		t.Fatalf("expected 'generate_image' tool in image toolset")
+	}
+
+	if err := SetActiveToolset("imagine"); err != nil {
+		t.Fatalf("unexpected error setting toolset imagine: %v", err)
+	}
+	if GetActiveToolset() != "image" {
+		t.Fatalf("expected image toolset for imagine alias, got %q", GetActiveToolset())
+	}
+
 	if err := SetActiveToolset("invalid_set"); err == nil {
 		t.Fatalf("expected error setting invalid toolset, got nil")
 	}

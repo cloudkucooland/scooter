@@ -42,6 +42,7 @@ type model struct {
 	markdownCache       map[string]string
 	streamRenderPending bool
 	isProcessingTool    bool
+	isGeneratingImage   bool
 	toolRounds          int
 	toolCallCount       int
 	seenToolCalls       map[string]bool

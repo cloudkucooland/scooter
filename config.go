@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"os"
 	"path/filepath"
+	"strings"
 	"sync"
 	"time"
 )
@@ -20,6 +21,8 @@ type Config struct {
 	RKLLMLib             string `json:"rkllm_lib"`
 	RKLLMCacheEnabled    bool   `json:"rkllm_cache_enabled"`
 	RKLLMCachePath       string `json:"rkllm_cache_path"`
+	RKNNModelsDir        string `json:"rknn_models_dir"`
+	RKNNLib              string `json:"rknn_lib"`
 	MaxGrepFileSize      int64  `json:"max_grep_file_size"`
 	MaxShellOutputSize   int    `json:"max_shell_output_size"`
 	DefaultToolset       string `json:"default_toolset"`
@@ -38,6 +41,7 @@ var (
 		DefaultModel:         "qwen3-4b",
 		RKLLMLib:             "librkllmrt.so",
 		RKLLMCacheEnabled:    true,
+		RKNNLib:              "/usr/lib/librknnrt.so",
 		MaxGrepFileSize:      2 * 1024 * 1024,
 		MaxShellOutputSize:   64 * 1024,
 		DefaultToolset:       "all",
@@ -216,4 +220,42 @@ func saveConfig(cfg Config) error {
 		cachedModTime = info.ModTime()
 	}
 	return nil
+}
+
+func getRKNNModelsDir() string {
+	for _, envVar := range []string{"SCOOTER_RKNN_MODELS_DIR", "RKNN_MODEL_DIR"} {
+		if dir := strings.TrimSpace(os.Getenv(envVar)); dir != "" {
+			return dir
+		}
+	}
+	if dir := strings.TrimSpace(loadConfig().RKNNModelsDir); dir != "" {
+		return dir
+	}
+
+	candidates := []string{
+		"lcm-ssd-1b-rknn",
+	}
+	if homeDir, err := os.UserHomeDir(); err == nil {
+		candidates = append(candidates,
+			filepath.Join(homeDir, "3588-stuff", "rknn-models", "lcm-ssd-1b-rknn"),
+			filepath.Join(homeDir, "rkllama-models", "rknn-models", "lcm-ssd-1b-rknn"),
+		)
+	}
+	for _, candidate := range candidates {
+		if info, err := os.Stat(filepath.Join(candidate, "unet", "model.rknn")); err == nil && !info.IsDir() {
+			if abs, absErr := filepath.Abs(candidate); absErr == nil {
+				return abs
+			}
+			return candidate
+		}
+	}
+	return filepath.Join("pkg", "rknn", "lcm-ssd-1b-rknn")
+}
+
+func syncRKNNEnv() {
+	if os.Getenv("RKNN_LIB") == "" {
+		if lib := strings.TrimSpace(loadConfig().RKNNLib); lib != "" {
+			_ = os.Setenv("RKNN_LIB", lib)
+		}
+	}
 }

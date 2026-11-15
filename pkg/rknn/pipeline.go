@@ -1,0 +1,331 @@
+package rknn
+
+import (
+	"fmt"
+	"image"
+	"image/color"
+	"math"
+	"math/rand"
+	"path/filepath"
+	"runtime"
+	"unsafe"
+)
+
+const sdxlVAEScaleFactor float32 = 0.13025
+
+type Pipeline struct {
+	ModelDir      string
+	Tok           *Tokenizer
+	Sched         *Scheduler
+	GuidanceScale float32
+
+	Width        int
+	Height       int
+	UNetInIsNHWC bool
+	VAEInIsNHWC  bool
+	VAEIsNHWC    bool
+	UNetOutSize  int
+	VAEOutSize   int
+}
+
+// LoadPipeline validates the RKNN model directory and probes tensor dimensions
+// without keeping all submodels resident in NPU/CMA memory simultaneously.
+func LoadPipeline(modelDir string, tok *Tokenizer, steps int) (*Pipeline, error) {
+	p := &Pipeline{
+		ModelDir:      modelDir,
+		Tok:           tok,
+		Sched:         NewScheduler(steps, "lcm"),
+		GuidanceScale: 1.5,
+	}
+
+	// Probe UNet input resolution, layout, and output count
+	unetCtx, err := p.openSubmodel("unet")
+	if err != nil {
+		return nil, err
+	}
+	unetIn, unetOut, err := unetCtx.QueryIO()
+	_ = unetCtx.Close()
+	if err != nil {
+		return nil, err
+	}
+	if len(unetIn) > 0 && unetIn[0].NDims == 4 {
+		if unetIn[0].Fmt == RKNN_TENSOR_NHWC {
+			p.UNetInIsNHWC = true
+			p.Height = int(unetIn[0].Dims[1]) * 8
+			p.Width = int(unetIn[0].Dims[2]) * 8
+		} else {
+			p.Height = int(unetIn[0].Dims[2]) * 8
+			p.Width = int(unetIn[0].Dims[3]) * 8
+		}
+	}
+	p.UNetOutSize = len(unetOut)
+
+	// Probe VAE input and output layouts (NHWC vs NCHW)
+	vaeCtx, err := p.openSubmodel("vae_decoder")
+	if err != nil {
+		return nil, err
+	}
+	vaeIn, vaeOut, err := vaeCtx.QueryIO()
+	_ = vaeCtx.Close()
+	if err != nil {
+		return nil, err
+	}
+	if len(vaeIn) > 0 && vaeIn[0].Fmt == RKNN_TENSOR_NHWC {
+		p.VAEInIsNHWC = true
+	}
+	p.VAEOutSize = len(vaeOut)
+	if len(vaeOut) > 0 && vaeOut[0].Fmt == RKNN_TENSOR_NHWC {
+		p.VAEIsNHWC = true
+	}
+
+	return p, nil
+}
+
+func (p *Pipeline) openSubmodel(sub string) (*RKNNContext, error) {
+	ctx := &RKNNContext{}
+	path := filepath.Join(p.ModelDir, sub, "model.rknn")
+	if err := ctx.Init(path); err != nil {
+		return nil, err
+	}
+	if err := ctx.SetCoreMask(RKNN_NPU_CORE_0_1_2); err != nil {
+		_ = ctx.Close()
+		return nil, err
+	}
+	return ctx, nil
+}
+
+func (p *Pipeline) Close() {}
+
+func (p *Pipeline) Generate(prompt string, seed int64) (*image.RGBA, error) {
+	ids1, ids2, err := p.Tok.EncodeDual(prompt)
+	if err != nil {
+		return nil, fmt.Errorf("tokenization failed: %w", err)
+	}
+
+	promptEmbeds, pooledEmbeds, err := p.encodeDualText(ids1, ids2)
+	if err != nil {
+		return nil, fmt.Errorf("text encoding failed: %w", err)
+	}
+
+	latents, err := p.runDiffusion(promptEmbeds, pooledEmbeds, seed)
+	if err != nil {
+		return nil, fmt.Errorf("diffusion loop failed: %w", err)
+	}
+
+	img, err := p.decodeVAE(latents)
+	if err != nil {
+		return nil, fmt.Errorf("VAE decode failed: %w", err)
+	}
+	return img, nil
+}
+
+func (p *Pipeline) encodeDualText(ids1, ids2 []int32) (promptEmbeds []float32, pooledEmbeds []float32, err error) {
+	enc1, err := p.openSubmodel("text_encoder")
+	if err != nil {
+		return nil, nil, err
+	}
+	in1 := []Input{{
+		Index: 0,
+		Buf:   unsafe.Pointer(&ids1[0]),
+		Size:  uint32(len(ids1) * 4),
+		Type:  RKNN_TENSOR_INT32,
+		Fmt:   RKNN_TENSOR_UNDEFINED,
+	}}
+	out1, err := enc1.RunFloat32(in1, 1)
+	runtime.KeepAlive(ids1)
+	_ = enc1.Close()
+	if err != nil {
+		return nil, nil, err
+	}
+	hidden1 := out1[0]
+
+	enc2, err := p.openSubmodel("text_encoder_2")
+	if err != nil {
+		return nil, nil, err
+	}
+	ids2Int64 := make([]int64, len(ids2))
+	for i, id := range ids2 {
+		ids2Int64[i] = int64(id)
+	}
+	in2 := []Input{{
+		Index: 0,
+		Buf:   unsafe.Pointer(&ids2Int64[0]),
+		Size:  uint32(len(ids2Int64) * 8),
+		Type:  RKNN_TENSOR_INT64,
+		Fmt:   RKNN_TENSOR_UNDEFINED,
+	}}
+	out2, err := enc2.RunFloat32(in2, 2)
+	runtime.KeepAlive(ids2Int64)
+	_ = enc2.Close()
+	if err != nil {
+		return nil, nil, err
+	}
+	pooledEmbeds = out2[0]
+	hidden2 := out2[1]
+
+	const seqLen = 77
+	promptEmbeds = make([]float32, seqLen*(768+1280))
+	for t := 0; t < seqLen; t++ {
+		copy(promptEmbeds[t*2048:t*2048+768], hidden1[t*768:(t+1)*768])
+		copy(promptEmbeds[t*2048+768:(t+1)*2048], hidden2[t*1280:(t+1)*1280])
+	}
+	return promptEmbeds, pooledEmbeds, nil
+}
+
+func (p *Pipeline) runDiffusion(promptEmbeds, pooledEmbeds []float32, seed int64) ([]float32, error) {
+	unet, err := p.openSubmodel("unet")
+	if err != nil {
+		return nil, err
+	}
+	defer func() { _ = unet.Close() }()
+
+	p.Sched.Reset(seed)
+	rng := rand.New(rand.NewSource(seed))
+	latentH := p.Height / 8
+	latentW := p.Width / 8
+	latents := make([]float32, 4*latentH*latentW)
+
+	initSigma := float32(p.Sched.InitNoiseSigma())
+	for i := range latents {
+		latents[i] = float32(rng.NormFloat64()) * initSigma
+	}
+
+	guidanceScale := p.GuidanceScale
+	if guidanceScale == 0 {
+		guidanceScale = 1.5
+	}
+	timestepCond := getGuidanceScaleEmbedding(guidanceScale)
+
+	timeIDs := []float32{
+		float32(p.Height), float32(p.Width),
+		0, 0,
+		float32(p.Height), float32(p.Width),
+	}
+
+	for {
+		timestep, ok := p.Sched.NextTimestep()
+		if !ok {
+			break
+		}
+		scaledLatents := p.Sched.ScaleModelInput(latents, timestep)
+		sampleFmt := RKNN_TENSOR_NCHW
+		if p.UNetInIsNHWC {
+			scaledLatents = nchwToNHWC4(scaledLatents, latentH, latentW)
+			sampleFmt = RKNN_TENSOR_NHWC
+		}
+
+		tScalar := []int64{int64(timestep)}
+
+		inputs := []Input{
+			{Index: 0, Buf: unsafe.Pointer(&scaledLatents[0]), Size: uint32(len(scaledLatents) * 4), Type: RKNN_TENSOR_FLOAT32, Fmt: sampleFmt},
+			{Index: 1, Buf: unsafe.Pointer(&tScalar[0]), Size: 8, Type: RKNN_TENSOR_INT64, Fmt: RKNN_TENSOR_NCHW},
+			{Index: 2, Buf: unsafe.Pointer(&promptEmbeds[0]), Size: uint32(len(promptEmbeds) * 4), Type: RKNN_TENSOR_FLOAT32, Fmt: RKNN_TENSOR_NCHW},
+			{Index: 3, Buf: unsafe.Pointer(&timestepCond[0]), Size: uint32(len(timestepCond) * 4), Type: RKNN_TENSOR_FLOAT32, Fmt: RKNN_TENSOR_NCHW},
+			{Index: 4, Buf: unsafe.Pointer(&timeIDs[0]), Size: uint32(len(timeIDs) * 4), Type: RKNN_TENSOR_FLOAT32, Fmt: RKNN_TENSOR_NCHW},
+			{Index: 5, Buf: unsafe.Pointer(&pooledEmbeds[0]), Size: uint32(len(pooledEmbeds) * 4), Type: RKNN_TENSOR_FLOAT32, Fmt: RKNN_TENSOR_NCHW},
+		}
+
+		outs, err := unet.RunFloat32(inputs, p.UNetOutSize)
+		runtime.KeepAlive(scaledLatents)
+		runtime.KeepAlive(tScalar)
+		runtime.KeepAlive(promptEmbeds)
+		runtime.KeepAlive(timestepCond)
+		runtime.KeepAlive(timeIDs)
+		runtime.KeepAlive(pooledEmbeds)
+		if err != nil {
+			return nil, err
+		}
+
+		latents = p.Sched.Step(outs[0], timestep, latents)
+	}
+	return latents, nil
+}
+
+func (p *Pipeline) decodeVAE(latents []float32) (*image.RGBA, error) {
+	vae, err := p.openSubmodel("vae_decoder")
+	if err != nil {
+		return nil, err
+	}
+	defer func() { _ = vae.Close() }()
+
+	scaled := make([]float32, len(latents))
+	for i, v := range latents {
+		scaled[i] = v / sdxlVAEScaleFactor
+	}
+
+	latentFmt := RKNN_TENSOR_NCHW
+	if p.VAEInIsNHWC {
+		scaled = nchwToNHWC4(scaled, p.Height/8, p.Width/8)
+		latentFmt = RKNN_TENSOR_NHWC
+	}
+
+	inputs := []Input{{
+		Index: 0,
+		Buf:   unsafe.Pointer(&scaled[0]),
+		Size:  uint32(len(scaled) * 4),
+		Type:  RKNN_TENSOR_FLOAT32,
+		Fmt:   latentFmt,
+	}}
+	outs, err := vae.RunFloat32(inputs, p.VAEOutSize)
+	runtime.KeepAlive(scaled)
+	if err != nil {
+		return nil, err
+	}
+
+	pixels := outs[0]
+	img := image.NewRGBA(image.Rect(0, 0, p.Width, p.Height))
+	planeSize := p.Width * p.Height
+
+	toUint8 := func(v float32) uint8 {
+		clamped := math.Max(0, math.Min(1, float64(v*0.5+0.5)))
+		return uint8(math.Round(clamped * 255.0))
+	}
+
+	for y := 0; y < p.Height; y++ {
+		for x := 0; x < p.Width; x++ {
+			idx := y*p.Width + x
+			var r, g, b float32
+			if p.VAEIsNHWC {
+				r = pixels[idx*3+0]
+				g = pixels[idx*3+1]
+				b = pixels[idx*3+2]
+			} else {
+				r = pixels[0*planeSize+idx]
+				g = pixels[1*planeSize+idx]
+				b = pixels[2*planeSize+idx]
+			}
+			img.SetRGBA(x, y, color.RGBA{R: toUint8(r), G: toUint8(g), B: toUint8(b), A: 255})
+		}
+	}
+	return img, nil
+}
+
+func getGuidanceScaleEmbedding(guidanceScale float32) []float32 {
+	const halfDim = 128
+	w := (guidanceScale - 1.0) * 1000.0
+	emb := make([]float32, 256)
+	logStep := math.Log(10000.0) / float64(halfDim)
+	for i := 0; i < halfDim; i++ {
+		freq := math.Exp(-float64(i) * logStep)
+		angle := float64(w) * freq
+		emb[i] = float32(math.Cos(angle))
+		emb[i+halfDim] = float32(math.Sin(angle))
+	}
+	return emb
+}
+
+func nchwToNHWC4(nchw []float32, h, w int) []float32 {
+	nhwc := make([]float32, len(nchw))
+	plane := h * w
+	for y := 0; y < h; y++ {
+		for x := 0; x < w; x++ {
+			hw := y*w + x
+			dst := hw * 4
+			nhwc[dst+0] = nchw[0*plane+hw]
+			nhwc[dst+1] = nchw[1*plane+hw]
+			nhwc[dst+2] = nchw[2*plane+hw]
+			nhwc[dst+3] = nchw[3*plane+hw]
+		}
+	}
+	return nhwc
+}

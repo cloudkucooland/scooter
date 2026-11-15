@@ -42,7 +42,9 @@ func (m model) renderStatusBar() string {
 	}
 
 	abortHint := "[Esc] Abort"
-	if m.isStreaming {
+	if m.isGeneratingImage {
+		abortHint = "🎨 Generating image..."
+	} else if m.isStreaming {
 		abortHint = "[Esc] ⏳ Generating..."
 	}
 
@@ -67,7 +69,8 @@ var availableCommands = []struct {
 	{"/models", "List available RKLLM models"},
 	{"/model", "Switch active RKLLM model"},
 	{"/toolsets", "List available toolsets"},
-	{"/toolset", "Switch active toolset (dev, web, all)"},
+	{"/toolset", "Switch active toolset (dev, web, image, all)"},
+	{"/imagine", "Generate an image locally (--out <file.png>)"},
 	{"/context", "View or change context size"},
 	{"/compress", "Manually compress conversation history"},
 	{"/clear", "Clear conversation history and cache"},

@@ -614,6 +614,21 @@ func dispatchToolCall(name string, rawArgs json.RawMessage) string {
 			return fmt.Sprintf("Clear Tasks Error: %v", err)
 		}
 		return "Successfully cleared task checklist."
+
+	case "generate_image":
+		var args GenerateImageArgs
+		if err := json.Unmarshal(rawArgs, &args); err != nil {
+			return fmt.Sprintf("System Error parsing arguments: %v", err)
+		}
+		if strings.TrimSpace(args.Prompt) == "" {
+			return "System Error: prompt is required"
+		}
+		summary, elapsed, err := generateImageFile(args.Prompt, args.OutputPath, int(args.Steps), args.Seed)
+		if err != nil {
+			return fmt.Sprintf("Image Generation Error: %v", err)
+		}
+		return fmt.Sprintf("Success: Generated image %s in %.1fs", summary, elapsed.Seconds())
+
 	}
 
 	logDebug("dispatchToolCall failed for: %s", name)

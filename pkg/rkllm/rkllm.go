@@ -17,6 +17,7 @@ import (
 	"syscall"
 	"unsafe"
 
+	"codeberg.org/indievisible/scooter/pkg/npu"
 	"codeberg.org/indievisible/scooter/pkg/parser"
 	"codeberg.org/indievisible/scooter/pkg/types"
 	"github.com/ebitengine/purego"
@@ -354,23 +355,6 @@ func AbortRKLLM() {
 	}
 }
 
-func CloseRKLLMSession() {
-	globalSession.inferMu.Lock()
-	defer globalSession.inferMu.Unlock()
-
-	globalSession.mu.Lock()
-	defer globalSession.mu.Unlock()
-
-	if globalSession.initialized {
-		if globalSession.rkllmDestroy != nil && globalSession.handle != nil {
-			globalSession.rkllmDestroy(globalSession.handle)
-		}
-		globalSession.initialized = false
-		globalSession.handle = nil
-		globalSession.lib = 0
-	}
-}
-
 func captureStderr(fn func() error) (string, error) {
 	r, w, err := os.Pipe()
 	if err != nil {
@@ -547,6 +531,9 @@ func getPromptCacheFileForSystemPrompt(modelPath string, contextLen int, systemP
 }
 
 func StreamRKLLM(ctx context.Context, modelName string, history []Message, channel chan<- StreamMessage) {
+	npu.Lock()
+	defer npu.Unlock()
+
 	globalSession.inferMu.Lock()
 	defer globalSession.inferMu.Unlock()
 
@@ -722,6 +709,9 @@ func StreamRKLLM(ctx context.Context, modelName string, history []Message, chann
 }
 
 func RunRKLLMSummary(modelName string, messages []Message) (string, error) {
+	npu.Lock()
+	defer npu.Unlock()
+
 	globalSession.inferMu.Lock()
 	defer globalSession.inferMu.Unlock()
 
@@ -911,4 +901,24 @@ func renderMessages(messages []Message) string {
 		}
 	}
 	return sb.String()
+}
+
+func CloseRKLLMSession() {
+	npu.Lock()
+	defer npu.Unlock()
+
+	globalSession.inferMu.Lock()
+	defer globalSession.inferMu.Unlock()
+
+	globalSession.mu.Lock()
+	defer globalSession.mu.Unlock()
+
+	if globalSession.initialized {
+		if globalSession.rkllmDestroy != nil && globalSession.handle != nil {
+			globalSession.rkllmDestroy(globalSession.handle)
+		}
+		globalSession.initialized = false
+		globalSession.handle = nil
+		globalSession.lib = 0
+	}
 }

@@ -85,10 +85,12 @@ func SetActiveToolset(name string) error {
 		activeToolset = "research"
 	case "web", "net", "internet":
 		activeToolset = "web"
+	case "image", "imagine":
+		activeToolset = "image"
 	case "all", "every":
 		activeToolset = "all"
 	default:
-		return fmt.Errorf("unknown toolset %q (available: development, research, web, all)", name)
+		return fmt.Errorf("unknown toolset %q (available: development, research, web, image, all)", name)
 	}
 	return nil
 }
@@ -98,6 +100,7 @@ func listToolsetsNames() []string {
 		"development (dev)",
 		"research (knowledge)",
 		"web (internet)",
+		"image (imagine)",
 		"all (default)",
 	}
 }
@@ -502,20 +505,23 @@ func getDevelopmentTools() []Tool {
 func getSystemTools() []Tool {
 	switch GetActiveToolset() {
 	case "development":
-		return getDevelopmentTools()
+		return append(getDevelopmentTools(), getImageTools()...)
 	case "research":
 		return getResearchTools()
 	case "web":
-		return getWebTools()
+		return append(getWebTools(), getImageTools()...)
+	case "image":
+		return getImageTools()
 	case "all":
 		fallthrough
 	default:
 		dev := getDevelopmentTools()
 		res := getResearchTools()
 		web := getWebTools()
+		img := getImageTools()
 		seen := make(map[string]bool)
 		var combined []Tool
-		for _, toolsList := range [][]Tool{dev, res, web} {
+		for _, toolsList := range [][]Tool{dev, res, web, img} {
 			for _, t := range toolsList {
 				if !seen[t.Function.Name] {
 					seen[t.Function.Name] = true
@@ -670,3 +676,44 @@ type CompleteTaskArgs struct {
 }
 
 type GetTasksArgs struct{}
+
+func getImageTools() []Tool {
+	return []Tool{
+		{
+			Type: "function",
+			Function: FunctionDefinition{
+				Name:        "generate_image",
+				Description: "Generates a PNG image locally on the NPU from a text prompt using LCM-SSD-1B and saves it to disk.",
+				Parameters: Parameters{
+					Type: "object",
+					Properties: map[string]Property{
+						"prompt": {
+							Type:        "string",
+							Description: "Detailed visual description of the image to generate.",
+						},
+						"output_path": {
+							Type:        "string",
+							Description: "Optional output PNG file path relative to the working directory (defaults to scooter_<timestamp>.png).",
+						},
+						"steps": {
+							Type:        "integer",
+							Description: "Optional number of LCM denoising steps (default 4, range 1-8).",
+						},
+						"seed": {
+							Type:        "integer",
+							Description: "Optional integer random seed for reproducible generation.",
+						},
+					},
+					Required: []string{"prompt"},
+				},
+			},
+		},
+	}
+}
+
+type GenerateImageArgs struct {
+	Prompt     string      `json:"prompt"`
+	OutputPath string      `json:"output_path,omitempty"`
+	Steps      FlexibleInt `json:"steps,omitempty"`
+	Seed       int64       `json:"seed,omitempty"`
+}

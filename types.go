@@ -1,6 +1,8 @@
 package main
 
 import (
+	"time"
+	
 	"codeberg.org/indievisible/scooter/pkg/types"
 )
 
@@ -33,4 +35,10 @@ type StatusMessage struct {
 type ToolExecutionResult struct {
 	Call   ToolCall
 	Result string
+}
+
+type ImageGeneratedMessage struct {
+	Summary  string
+	Duration time.Duration
+	Err      error
 }

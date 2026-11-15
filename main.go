@@ -253,7 +253,7 @@ func main() {
 				Name:    "toolset",
 				Aliases: []string{"t"},
 				Value:   "",
-				Usage:   "Active toolset (dev, web, research, all)",
+				Usage:   "Active toolset (dev, web, research, image, all)",
 			},
 			&cli.StringFlag{
 				Name:    "model",
@@ -279,6 +279,26 @@ func main() {
 				Name:    "debug",
 				Aliases: []string{"d"},
 				Usage:   "Enable RKNN and RKLLM debug logging output",
+			},
+			&cli.StringFlag{
+				Name:    "imagine",
+				Aliases: []string{"g"},
+				Usage:   "Generate an image locally on the NPU from a text prompt and exit",
+			},
+			&cli.StringFlag{
+				Name:    "output",
+				Aliases: []string{"o"},
+				Usage:   "Output PNG file path for --imagine (defaults to scooter_<timestamp>.png)",
+			},
+			&cli.IntFlag{
+				Name:  "steps",
+				Value: 4,
+				Usage: "Number of LCM denoising steps for --imagine (1-12)",
+			},
+			&cli.IntFlag{
+				Name:  "seed",
+				Value: 0,
+				Usage: "Random seed for --imagine (0 = random)",
 			},
 		},
 		Action: func(ctx context.Context, cmd *cli.Command) error {
@@ -312,6 +332,21 @@ func main() {
 			promptText := cmd.String("prompt")
 			if promptText != "" {
 				return runNonInteractive(modelName, toolset, promptText)
+			}
+
+			imaginePrompt := cmd.String("imagine")
+			if imaginePrompt != "" {
+				summary, elapsed, err := generateImageFile(
+					imaginePrompt,
+					cmd.String("output"),
+					int(cmd.Int("steps")),
+					int64(cmd.Int("seed")),
+				)
+				if err != nil {
+					return err
+				}
+				fmt.Printf("Generated %s in %.1fs\n", summary, elapsed.Seconds())
+				return nil
 			}
 
 			p := tea.NewProgram(initialModel(), tea.WithAltScreen())

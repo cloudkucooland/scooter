@@ -198,3 +198,15 @@ func TestCacheCommandsInAvailableCommands(t *testing.T) {
 		t.Errorf("expected /disablecache in availableCommands")
 	}
 }
+
+func TestImagineCommandInAvailableCommands(t *testing.T) {
+	foundImagine := false
+	for _, c := range availableCommands {
+		if c.cmd == "/imagine" {
+			foundImagine = true
+		}
+	}
+	if !foundImagine {
+		t.Errorf("expected /imagine in availableCommands")
+	}
+}
