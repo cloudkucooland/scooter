@@ -138,7 +138,7 @@ func (p *Pipeline) encodeDualText(ids1, ids2 []int32) (promptEmbeds []float32, p
 		Type:  RKNN_TENSOR_INT32,
 		Fmt:   RKNN_TENSOR_UNDEFINED,
 	}}
-	out1, err := enc1.RunFloat32(in1, 1)
+	out1, err := enc1.RunFloat32Indices(in1, []int{0})
 	runtime.KeepAlive(ids1)
 	_ = enc1.Close()
 	if err != nil {
@@ -161,7 +161,7 @@ func (p *Pipeline) encodeDualText(ids1, ids2 []int32) (promptEmbeds []float32, p
 		Type:  RKNN_TENSOR_INT64,
 		Fmt:   RKNN_TENSOR_UNDEFINED,
 	}}
-	out2, err := enc2.RunFloat32(in2, 2)
+	out2, err := enc2.RunFloat32Indices(in2, []int{0, 1})
 	runtime.KeepAlive(ids2Int64)
 	_ = enc2.Close()
 	if err != nil {
@@ -223,6 +223,14 @@ func (p *Pipeline) runDiffusion(ctx context.Context, promptEmbeds, pooledEmbeds 
 			if size < reqSize {
 				size = reqSize
 			}
+		} else if i == 2 && uint32(len(promptEmbeds)*4) > size {
+			size = uint32(len(promptEmbeds) * 4)
+		} else if i == 3 && uint32(len(timestepCond)*4) > size {
+			size = uint32(len(timestepCond) * 4)
+		} else if i == 4 && uint32(len(timeIDs)*4) > size {
+			size = uint32(len(timeIDs) * 4)
+		} else if i == 5 && uint32(len(pooledEmbeds)*4) > size {
+			size = uint32(len(pooledEmbeds) * 4)
 		}
 		mem, err := unet.CreateMem(size)
 		if err != nil {
@@ -381,31 +389,102 @@ func (p *Pipeline) decodeVAE(latents []float32) (*image.RGBA, error) {
 	}
 	defer func() { _ = vae.Close() }()
 
+	inputsAttr, outputsAttr, err := vae.QueryIO()
+	if err != nil {
+		return nil, err
+	}
+
 	scaled := make([]float32, len(latents))
 	for i, v := range latents {
 		scaled[i] = v / sdxlVAEScaleFactor
 	}
 
-	latentFmt := RKNN_TENSOR_NCHW
 	if p.VAEInIsNHWC {
 		scaled = nchwToNHWC4(scaled, p.Height/8, p.Width/8)
-		latentFmt = RKNN_TENSOR_NHWC
 	}
 
-	inputs := []Input{{
-		Index: 0,
-		Buf:   unsafe.Pointer(&scaled[0]),
-		Size:  uint32(len(scaled) * 4),
-		Type:  RKNN_TENSOR_FLOAT32,
-		Fmt:   latentFmt,
-	}}
-	outs, err := vae.RunFloat32(inputs, p.VAEOutSize)
+	inputMems := make([]*TensorMem, len(inputsAttr))
+	for i, attr := range inputsAttr {
+		size := attr.Size
+		if i == 0 {
+			reqSize := uint32(len(scaled) * 4)
+			if size < reqSize {
+				size = reqSize
+			}
+		}
+		mem, err := vae.CreateMem(size)
+		if err != nil {
+			for j := 0; j < i; j++ {
+				_ = vae.DestroyMem(inputMems[j])
+			}
+			return nil, fmt.Errorf("vae create input mem %d: %w", i, err)
+		}
+		inputMems[i] = mem
+		if err := vae.SetIOMem(mem, &attr); err != nil {
+			for j := 0; j <= i; j++ {
+				_ = vae.DestroyMem(inputMems[j])
+			}
+			return nil, fmt.Errorf("vae set io mem for input %d: %w", i, err)
+		}
+	}
+	defer func() {
+		for _, mem := range inputMems {
+			_ = vae.DestroyMem(mem)
+		}
+	}()
+
+	outputMems := make([]*TensorMem, len(outputsAttr))
+	for i, attr := range outputsAttr {
+		mem, err := vae.CreateMem(attr.Size)
+		if err != nil {
+			for j := 0; j < i; j++ {
+				_ = vae.DestroyMem(outputMems[j])
+			}
+			return nil, fmt.Errorf("vae create output mem %d: %w", i, err)
+		}
+		outputMems[i] = mem
+		if err := vae.SetIOMem(mem, &attr); err != nil {
+			for j := 0; j <= i; j++ {
+				_ = vae.DestroyMem(outputMems[j])
+			}
+			return nil, fmt.Errorf("vae set io mem for output %d: %w", i, err)
+		}
+	}
+	defer func() {
+		for _, mem := range outputMems {
+			_ = vae.DestroyMem(mem)
+		}
+	}()
+
+	if len(inputsAttr) > 0 {
+		copyFloat32ToMem(inputMems[0], scaled)
+	}
 	runtime.KeepAlive(scaled)
-	if err != nil {
-		return nil, err
+
+	npu.Lock()
+	ret := rknnRun(vae.handle, nil)
+	npu.Unlock()
+	if ret != 0 {
+		return nil, fmt.Errorf("vae rknn_run failed: %d", ret)
 	}
 
-	pixels := outs[0]
+	outSize := outputsAttr[0].Size
+	outType := outputsAttr[0].Type
+	var pixels []float32
+	if outType == RKNN_TENSOR_FLOAT16 {
+		nElems := int(outSize) / 2
+		u16Slice := unsafe.Slice((*uint16)(outputMems[0].VirtAddr), nElems)
+		pixels = make([]float32, nElems)
+		for idx, u := range u16Slice {
+			pixels[idx] = float16ToFloat32(u)
+		}
+	} else {
+		nElems := int(outSize) / 4
+		cSlice := unsafe.Slice((*float32)(outputMems[0].VirtAddr), nElems)
+		pixels = make([]float32, nElems)
+		copy(pixels, cSlice)
+	}
+
 	img := image.NewRGBA(image.Rect(0, 0, p.Width, p.Height))
 	planeSize := p.Width * p.Height
 

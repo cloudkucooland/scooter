@@ -81,10 +81,7 @@ func generateImageFileWithContext(ctx context.Context, prompt, outputPath string
 
 	start := time.Now()
 
-	// Serialize NPU access and release active RKLLM CMA memory before loading UNet/VAE
-	rknn.Lock()
-	defer rknn.Unlock()
-
+	// Release active RKLLM CMA memory before loading UNet/VAE
 	rkllm.CloseRKLLMSession()
 
 	pipe, err := rknn.LoadPipeline(modelDir, tok, steps)

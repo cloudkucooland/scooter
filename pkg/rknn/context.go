@@ -79,6 +79,15 @@ func (c *RKNNContext) QueryIO() (inputs []TensorAttr, outputs []TensorAttr, err 
 // RunFloat32 executes a forward pass and copies all outputs as []float32 slices
 // before releasing the C runtime buffers.
 func (c *RKNNContext) RunFloat32(inputs []Input, nOutputs int) ([][]float32, error) {
+	indices := make([]int, nOutputs)
+	for i := 0; i < nOutputs; i++ {
+		indices[i] = i
+	}
+	return c.RunFloat32Indices(inputs, indices)
+}
+
+// RunFloat32Indices executes a forward pass and queries specific output tensor indices.
+func (c *RKNNContext) RunFloat32Indices(inputs []Input, outputIndices []int) ([][]float32, error) {
 	npu.Lock()
 	defer npu.Unlock()
 
@@ -92,26 +101,70 @@ func (c *RKNNContext) RunFloat32(inputs []Input, nOutputs int) ([][]float32, err
 		return nil, fmt.Errorf("rknn_run failed: %d", ret)
 	}
 
-	outputs := make([]Output, nOutputs)
-	for i := 0; i < nOutputs; i++ {
-		outputs[i].Index = uint32(i)
-		outputs[i].WantFloat = 1 // Ask librknnrt to convert FP16 outputs to FP32
+	_, outputAttrs, err := c.queryIOUnlocked()
+	if err != nil {
+		return nil, err
 	}
 
-	if ret := rknnOutputsGet(c.handle, uint32(nOutputs), &outputs[0], nil); ret != 0 {
-		return nil, fmt.Errorf("rknn_outputs_get failed: %d", ret)
-	}
-	defer rknnOutputsRelease(c.handle, uint32(nOutputs), &outputs[0])
+	results := make([][]float32, len(outputIndices))
+	for i, idx := range outputIndices {
+		if idx < 0 || idx >= len(outputAttrs) {
+			return nil, fmt.Errorf("output index %d out of range (0-%d)", idx, len(outputAttrs)-1)
+		}
+		attr := outputAttrs[idx]
+		nElems := int(attr.NElems)
+		if nElems == 0 {
+			nElems = int(attr.Size) / 4
+			if nElems == 0 {
+				nElems = 77 * 1280
+			}
+		}
 
-	results := make([][]float32, nOutputs)
-	for i := 0; i < nOutputs; i++ {
-		count := int(outputs[i].Size) / 4
-		cSlice := unsafe.Slice((*float32)(outputs[i].Buf), count)
+		var out Output
+		buf := make([]float32, nElems*2)
+		out.WantFloat = 1
+		out.IsPrealloc = 1
+		out.Index = uint32(idx)
+		out.Buf = unsafe.Pointer(&buf[0])
+		out.Size = uint32(len(buf) * 4)
+
+		if ret := rknnOutputsGet(c.handle, 1, &out, nil); ret != 0 {
+			return nil, fmt.Errorf("rknn_outputs_get failed for index %d: %d", idx, ret)
+		}
+		count := int(out.Size) / 4
+		if count <= 0 || count > len(buf) {
+			count = len(buf)
+		}
 		goSlice := make([]float32, count)
-		copy(goSlice, cSlice)
+		copy(goSlice, buf[:count])
+		rknnOutputsRelease(c.handle, 1, &out)
 		results[i] = goSlice
 	}
 	return results, nil
+}
+
+func (c *RKNNContext) queryIOUnlocked() (inputs []TensorAttr, outputs []TensorAttr, err error) {
+	var ioNum InputOutputNum
+	if ret := rknnQuery(c.handle, RKNN_QUERY_IN_OUT_NUM, unsafe.Pointer(&ioNum), uint32(unsafe.Sizeof(ioNum))); ret != 0 {
+		return nil, nil, fmt.Errorf("rknn_query IN_OUT_NUM failed: %d", ret)
+	}
+
+	inputs = make([]TensorAttr, ioNum.NInput)
+	for i := uint32(0); i < ioNum.NInput; i++ {
+		inputs[i].Index = i
+		if ret := rknnQuery(c.handle, RKNN_QUERY_INPUT_ATTR, unsafe.Pointer(&inputs[i]), uint32(unsafe.Sizeof(inputs[i]))); ret != 0 {
+			return nil, nil, fmt.Errorf("rknn_query INPUT_ATTR[%d] failed: %d", i, ret)
+		}
+	}
+
+	outputs = make([]TensorAttr, ioNum.NOutput)
+	for i := uint32(0); i < ioNum.NOutput; i++ {
+		outputs[i].Index = i
+		if ret := rknnQuery(c.handle, RKNN_QUERY_OUTPUT_ATTR, unsafe.Pointer(&outputs[i]), uint32(unsafe.Sizeof(outputs[i]))); ret != 0 {
+			return nil, nil, fmt.Errorf("rknn_query OUTPUT_ATTR[%d] failed: %d", i, ret)
+		}
+	}
+	return inputs, outputs, nil
 }
 
 func (c *RKNNContext) CreateMem(size uint32) (*TensorMem, error) {
