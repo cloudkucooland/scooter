@@ -42,3 +42,11 @@ type ImageGeneratedMessage struct {
 	Duration time.Duration
 	Err      error
 }
+
+type ImageProgressMessage struct {
+	Step     int
+	Total    int
+	Summary  string
+	Duration time.Duration
+	Err      error
+}

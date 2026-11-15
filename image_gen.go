@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"fmt"
 	"image/png"
 	"math/rand"
@@ -39,6 +40,10 @@ func getCLIPTokenizer(modelDir string) (*rknn.Tokenizer, error) {
 }
 
 func generateImageFile(prompt, outputPath string, steps int, seed int64) (string, time.Duration, error) {
+	return generateImageFileWithContext(context.Background(), prompt, outputPath, steps, seed, nil)
+}
+
+func generateImageFileWithContext(ctx context.Context, prompt, outputPath string, steps int, seed int64, progressFn func(step, total int)) (string, time.Duration, error) {
 	prompt = strings.TrimSpace(prompt)
 	if prompt == "" {
 		return "", 0, fmt.Errorf("prompt is required")
@@ -88,7 +93,7 @@ func generateImageFile(prompt, outputPath string, steps int, seed int64) (string
 	}
 	defer pipe.Close()
 
-	img, err := pipe.Generate(prompt, seed)
+	img, err := pipe.GenerateWithContext(ctx, prompt, seed, progressFn)
 	if err != nil {
 		return "", 0, err
 	}

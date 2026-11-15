@@ -93,6 +93,15 @@ type Output struct {
 	_          [4]byte
 }
 
+type TensorMem struct {
+	VirtAddr unsafe.Pointer
+	Fd       int32
+	Offset   int32
+	Size     uint32
+	Flag     int32
+	PrivData unsafe.Pointer
+}
+
 var (
 	libOnce sync.Once
 	libErr  error
@@ -106,6 +115,9 @@ var (
 	rknnRun            func(ctx Context, extend unsafe.Pointer) int32
 	rknnOutputsGet     func(ctx Context, nOutputs uint32, outputs *Output, extend unsafe.Pointer) int32
 	rknnOutputsRelease func(ctx Context, nOutputs uint32, outputs *Output) int32
+	rknnCreateMem      func(ctx Context, size uint32) *TensorMem
+	rknnDestroyMem     func(ctx Context, mem *TensorMem) int32
+	rknnSetIOMem       func(ctx Context, mem *TensorMem, attr *TensorAttr) int32
 )
 
 func getRKNNLibPath() string {
@@ -134,6 +146,9 @@ func LoadLibrary() error {
 		purego.RegisterLibFunc(&rknnRun, lib, "rknn_run")
 		purego.RegisterLibFunc(&rknnOutputsGet, lib, "rknn_outputs_get")
 		purego.RegisterLibFunc(&rknnOutputsRelease, lib, "rknn_outputs_release")
+		purego.RegisterLibFunc(&rknnCreateMem, lib, "rknn_create_mem")
+		purego.RegisterLibFunc(&rknnDestroyMem, lib, "rknn_destroy_mem")
+		purego.RegisterLibFunc(&rknnSetIOMem, lib, "rknn_set_io_mem")
 	})
 	return libErr
 }

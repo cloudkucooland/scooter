@@ -43,7 +43,11 @@ func (m model) renderStatusBar() string {
 
 	abortHint := "[Esc] Abort"
 	if m.isGeneratingImage {
-		abortHint = "🎨 Generating image..."
+		abortHint = m.imageProgressText
+		if abortHint == "" {
+			abortHint = "🎨 Generating image..."
+		}
+		abortHint += " ([Esc] Abort)"
 	} else if m.isStreaming {
 		abortHint = "[Esc] ⏳ Generating..."
 	}

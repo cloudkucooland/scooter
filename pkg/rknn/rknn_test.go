@@ -32,6 +32,9 @@ func TestCABIStructLayouts(t *testing.T) {
 	if got := unsafe.Sizeof(TensorAttr{}); got != 376 {
 		t.Errorf("TensorAttr size = %d, want 376", got)
 	}
+	if got := unsafe.Sizeof(TensorMem{}); got != 32 {
+		t.Errorf("TensorMem size = %d, want 32", got)
+	}
 }
 
 func TestSchedulerMath(t *testing.T) {

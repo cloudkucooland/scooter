@@ -43,6 +43,9 @@ type model struct {
 	streamRenderPending bool
 	isProcessingTool    bool
 	isGeneratingImage   bool
+	imageCancel         context.CancelFunc
+	imageChan           chan ImageProgressMessage
+	imageProgressText   string
 	toolRounds          int
 	toolCallCount       int
 	seenToolCalls       map[string]bool

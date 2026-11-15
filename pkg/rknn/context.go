@@ -114,6 +114,37 @@ func (c *RKNNContext) RunFloat32(inputs []Input, nOutputs int) ([][]float32, err
 	return results, nil
 }
 
+func (c *RKNNContext) CreateMem(size uint32) (*TensorMem, error) {
+	npu.Lock()
+	defer npu.Unlock()
+	mem := rknnCreateMem(c.handle, size)
+	if mem == nil {
+		return nil, fmt.Errorf("rknn_create_mem failed for size %d", size)
+	}
+	return mem, nil
+}
+
+func (c *RKNNContext) DestroyMem(mem *TensorMem) error {
+	if mem == nil {
+		return nil
+	}
+	npu.Lock()
+	defer npu.Unlock()
+	if ret := rknnDestroyMem(c.handle, mem); ret != 0 {
+		return fmt.Errorf("rknn_destroy_mem failed: %d", ret)
+	}
+	return nil
+}
+
+func (c *RKNNContext) SetIOMem(mem *TensorMem, attr *TensorAttr) error {
+	npu.Lock()
+	defer npu.Unlock()
+	if ret := rknnSetIOMem(c.handle, mem, attr); ret != 0 {
+		return fmt.Errorf("rknn_set_io_mem failed for tensor index %d: %d", attr.Index, ret)
+	}
+	return nil
+}
+
 func (c *RKNNContext) Close() error {
 	npu.Lock()
 	defer npu.Unlock()
