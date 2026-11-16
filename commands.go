@@ -56,9 +56,9 @@ func statusCmd(modelName string) tea.Cmd {
 	}
 }
 
-func imagineCmd(prompt, outputPath string, steps int, seed int64, guidanceScale float32) tea.Cmd {
+func imagineCmd(prompt, negativePrompt, outputPath string, steps int, seed int64, guidanceScale float32) tea.Cmd {
 	return func() tea.Msg {
-		summary, elapsed, err := generateImageFile(prompt, outputPath, steps, seed, guidanceScale)
+		summary, elapsed, err := generateImageFile(prompt, negativePrompt, outputPath, steps, seed, guidanceScale)
 		return ImageGeneratedMessage{
 			Summary:  summary,
 			Duration: elapsed,

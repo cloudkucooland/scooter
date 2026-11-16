@@ -705,7 +705,7 @@ func getImageTools() []Tool {
 						},
 						"guidance_scale": {
 							Type:        "number",
-							Description: "Optional guidance scale for LCM-SSD-1B (default 1.5, range 1.0-2.0).",
+							Description: "Optional guidance scale for image generation (default 1.5 for LCM, 7.5 for CFG/Euler; range 1.0-2.0 for LCM, 1.0-15.0 for CFG/Euler).",
 						},
 					},
 					Required: []string{"prompt"},

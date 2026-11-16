@@ -7,6 +7,7 @@ import (
 	"image/color"
 	"math"
 	"math/rand"
+	"os"
 	"path/filepath"
 	"runtime"
 	"unsafe"
@@ -14,7 +15,10 @@ import (
 	"codeberg.org/indievisible/scooter/pkg/npu"
 )
 
-const sdxlVAEScaleFactor float32 = 0.13025
+const (
+	sdxlVAEScaleFactor float32 = 0.13025
+	sd15VAEScaleFactor float32 = 0.18215
+)
 
 type Pipeline struct {
 	ModelDir      string
@@ -22,8 +26,12 @@ type Pipeline struct {
 	Sched         *Scheduler
 	GuidanceScale float32
 
+	IsSD15       bool
+	UseCFG       bool
+	VAEScale     float32
 	Width        int
 	Height       int
+	UNetInCount  int
 	UNetInIsNHWC bool
 	VAEInIsNHWC  bool
 	VAEIsNHWC    bool
@@ -31,17 +39,24 @@ type Pipeline struct {
 	VAEOutSize   int
 }
 
-// LoadPipeline validates the RKNN model directory and probes tensor dimensions
-// without keeping all submodels resident in NPU/CMA memory simultaneously.
+// LoadPipeline validates the RKNN model directory and probes architecture,
+// scheduler mode, tensor dimensions, and layouts without keeping all submodels
+// resident in NPU/CMA memory simultaneously.
 func LoadPipeline(modelDir string, tok *Tokenizer, steps int) (*Pipeline, error) {
 	p := &Pipeline{
 		ModelDir:      modelDir,
 		Tok:           tok,
-		Sched:         NewScheduler(steps, "lcm"),
 		GuidanceScale: 1.5,
+		VAEScale:      sdxlVAEScaleFactor,
 	}
 
-	// Probe UNet input resolution, layout, and output count
+	// Detect SD 1.5 vs SDXL by checking for text_encoder_2/model.rknn
+	if _, err := os.Stat(filepath.Join(modelDir, "text_encoder_2", "model.rknn")); os.IsNotExist(err) {
+		p.IsSD15 = true
+		p.VAEScale = sd15VAEScaleFactor
+	}
+
+	// Probe UNet input resolution, layout, and input/output counts
 	unetCtx, err := p.openSubmodel("unet")
 	if err != nil {
 		return nil, err
@@ -51,6 +66,9 @@ func LoadPipeline(modelDir string, tok *Tokenizer, steps int) (*Pipeline, error)
 	if err != nil {
 		return nil, err
 	}
+	p.UNetInCount = len(unetIn)
+	p.UNetOutSize = len(unetOut)
+
 	if len(unetIn) > 0 && unetIn[0].NDims == 4 {
 		if unetIn[0].Fmt == RKNN_TENSOR_NHWC {
 			p.UNetInIsNHWC = true
@@ -61,7 +79,17 @@ func LoadPipeline(modelDir string, tok *Tokenizer, steps int) (*Pipeline, error)
 			p.Width = int(unetIn[0].Dims[3]) * 8
 		}
 	}
-	p.UNetOutSize = len(unetOut)
+
+	// Select scheduler mode:
+	// - 3-input SD 1.5 UNet (sample, timestep, encoder_hidden_states) -> standard Euler with CFG
+	// - 4-input SD 1.5 UNet (+ timestep_cond) or 6-input SDXL UNet -> LCM
+	schedMode := "lcm"
+	if p.IsSD15 && p.UNetInCount == 3 {
+		schedMode = "euler"
+		p.UseCFG = true
+		p.GuidanceScale = 7.5
+	}
+	p.Sched = NewScheduler(steps, schedMode)
 
 	// Probe VAE input and output layouts (NHWC vs NCHW)
 	vaeCtx, err := p.openSubmodel("vae_decoder")
@@ -100,10 +128,45 @@ func (p *Pipeline) openSubmodel(sub string) (*RKNNContext, error) {
 func (p *Pipeline) Close() {}
 
 func (p *Pipeline) Generate(prompt string, seed int64) (*image.RGBA, error) {
-	return p.GenerateWithContext(context.Background(), prompt, seed, nil)
+	return p.GenerateWithNegative(context.Background(), prompt, "", seed, nil)
 }
 
 func (p *Pipeline) GenerateWithContext(ctx context.Context, prompt string, seed int64, progressFn func(step, total int)) (*image.RGBA, error) {
+	return p.GenerateWithNegative(ctx, prompt, "", seed, progressFn)
+}
+
+func (p *Pipeline) GenerateWithNegative(ctx context.Context, prompt, negativePrompt string, seed int64, progressFn func(step, total int)) (*image.RGBA, error) {
+	if p.IsSD15 {
+		ids, _, err := p.Tok.EncodeDual(prompt)
+		if err != nil {
+			return nil, fmt.Errorf("tokenization failed: %w", err)
+		}
+		condEmbeds, err := p.encodeSingleText(ids)
+		if err != nil {
+			return nil, fmt.Errorf("text encoding failed: %w", err)
+		}
+		var uncondEmbeds []float32
+		if p.UseCFG {
+			uncondIDs, _, err := p.Tok.EncodeDual(negativePrompt)
+			if err != nil {
+				return nil, fmt.Errorf("uncond tokenization failed: %w", err)
+			}
+			uncondEmbeds, err = p.encodeSingleText(uncondIDs)
+			if err != nil {
+				return nil, fmt.Errorf("uncond text encoding failed: %w", err)
+			}
+		}
+		latents, err := p.runDiffusionSD15(ctx, condEmbeds, uncondEmbeds, seed, progressFn)
+		if err != nil {
+			return nil, fmt.Errorf("diffusion loop failed: %w", err)
+		}
+		img, err := p.decodeVAE(latents)
+		if err != nil {
+			return nil, fmt.Errorf("VAE decode failed: %w", err)
+		}
+		return img, nil
+	}
+
 	ids1, ids2, err := p.Tok.EncodeDual(prompt)
 	if err != nil {
 		return nil, fmt.Errorf("tokenization failed: %w", err)
@@ -114,7 +177,7 @@ func (p *Pipeline) GenerateWithContext(ctx context.Context, prompt string, seed 
 		return nil, fmt.Errorf("text encoding failed: %w", err)
 	}
 
-	latents, err := p.runDiffusion(ctx, promptEmbeds, pooledEmbeds, seed, progressFn)
+	latents, err := p.runDiffusionSDXL(ctx, promptEmbeds, pooledEmbeds, seed, progressFn)
 	if err != nil {
 		return nil, fmt.Errorf("diffusion loop failed: %w", err)
 	}
@@ -198,31 +261,38 @@ func runSubmodelZeroCopy(ctx *RKNNContext, writeInput func(mem *TensorMem, attr 
 	return results, nil
 }
 
-func (p *Pipeline) encodeDualText(ids1, ids2 []int32) (promptEmbeds []float32, pooledEmbeds []float32, err error) {
-	enc1, err := p.openSubmodel("text_encoder")
+func (p *Pipeline) encodeSingleText(ids []int32) ([]float32, error) {
+	enc, err := p.openSubmodel("text_encoder")
 	if err != nil {
-		return nil, nil, err
+		return nil, err
 	}
-	out1, err := runSubmodelZeroCopy(enc1, func(mem *TensorMem, attr TensorAttr) {
+	out, err := runSubmodelZeroCopy(enc, func(mem *TensorMem, attr TensorAttr) {
 		if attr.Type == RKNN_TENSOR_INT64 {
-			ids64 := make([]int64, len(ids1))
-			for i, v := range ids1 {
+			ids64 := make([]int64, len(ids))
+			for i, v := range ids {
 				ids64[i] = int64(v)
 			}
 			copyInt64ToMem(mem, ids64)
 		} else {
-			dst := unsafe.Slice((*int32)(mem.VirtAddr), len(ids1))
-			copy(dst, ids1)
+			dst := unsafe.Slice((*int32)(mem.VirtAddr), len(ids))
+			copy(dst, ids)
 		}
 	})
-	_ = enc1.Close()
+	_ = enc.Close()
+	if err != nil {
+		return nil, err
+	}
+	if len(out) < 1 {
+		return nil, fmt.Errorf("text_encoder returned no outputs")
+	}
+	return out[0], nil
+}
+
+func (p *Pipeline) encodeDualText(ids1, ids2 []int32) (promptEmbeds []float32, pooledEmbeds []float32, err error) {
+	hidden1, err := p.encodeSingleText(ids1)
 	if err != nil {
 		return nil, nil, err
 	}
-	if len(out1) < 1 {
-		return nil, nil, fmt.Errorf("text_encoder returned no outputs")
-	}
-	hidden1 := out1[0]
 
 	enc2, err := p.openSubmodel("text_encoder_2")
 	if err != nil {
@@ -259,7 +329,190 @@ func (p *Pipeline) encodeDualText(ids1, ids2 []int32) (promptEmbeds []float32, p
 	return promptEmbeds, pooledEmbeds, nil
 }
 
-func (p *Pipeline) runDiffusion(ctx context.Context, promptEmbeds, pooledEmbeds []float32, seed int64, progressFn func(step, total int)) ([]float32, error) {
+func (p *Pipeline) runDiffusionSD15(ctx context.Context, condEmbeds, uncondEmbeds []float32, seed int64, progressFn func(step, total int)) ([]float32, error) {
+	unet, err := p.openSubmodel("unet")
+	if err != nil {
+		return nil, err
+	}
+	defer func() { _ = unet.Close() }()
+
+	inputsAttr, outputsAttr, err := unet.QueryIO()
+	if err != nil {
+		return nil, err
+	}
+
+	p.Sched.Reset(seed)
+	rng := rand.New(rand.NewSource(seed))
+	latentH := p.Height / 8
+	latentW := p.Width / 8
+	latents := make([]float32, 4*latentH*latentW)
+
+	initSigma := float32(p.Sched.InitNoiseSigma())
+	for i := range latents {
+		latents[i] = float32(rng.NormFloat64()) * initSigma
+	}
+
+	guidanceScale := p.GuidanceScale
+	if guidanceScale == 0 {
+		if p.UseCFG {
+			guidanceScale = 7.5
+		} else {
+			guidanceScale = 1.5
+		}
+	}
+	timestepCond := getGuidanceScaleEmbedding(guidanceScale)
+
+	inputMems := make([]*TensorMem, len(inputsAttr))
+	for i, attr := range inputsAttr {
+		size := attr.Size
+		if i == 0 && uint32(len(latents)*4) > size {
+			size = uint32(len(latents) * 4)
+		} else if i == 2 && uint32(len(condEmbeds)*4) > size {
+			size = uint32(len(condEmbeds) * 4)
+		} else if i == 3 && uint32(len(timestepCond)*4) > size {
+			size = uint32(len(timestepCond) * 4)
+		}
+		mem, err := unet.CreateMem(size)
+		if err != nil {
+			for j := 0; j < i; j++ {
+				_ = unet.DestroyMem(inputMems[j])
+			}
+			return nil, fmt.Errorf("create input mem %d: %w", i, err)
+		}
+		inputMems[i] = mem
+		if err := unet.SetIOMem(mem, &attr); err != nil {
+			for j := 0; j <= i; j++ {
+				_ = unet.DestroyMem(inputMems[j])
+			}
+			return nil, fmt.Errorf("set io mem for input %d: %w", i, err)
+		}
+	}
+	defer func() {
+		for _, mem := range inputMems {
+			_ = unet.DestroyMem(mem)
+		}
+	}()
+
+	outputMems := make([]*TensorMem, len(outputsAttr))
+	for i, attr := range outputsAttr {
+		mem, err := unet.CreateMem(attr.Size)
+		if err != nil {
+			for j := 0; j < i; j++ {
+				_ = unet.DestroyMem(outputMems[j])
+			}
+			return nil, fmt.Errorf("create output mem %d: %w", i, err)
+		}
+		outputMems[i] = mem
+		if err := unet.SetIOMem(mem, &attr); err != nil {
+			for j := 0; j <= i; j++ {
+				_ = unet.DestroyMem(outputMems[j])
+			}
+			return nil, fmt.Errorf("set io mem for output %d: %w", i, err)
+		}
+	}
+	defer func() {
+		for _, mem := range outputMems {
+			_ = unet.DestroyMem(mem)
+		}
+	}()
+
+	if len(inputsAttr) > 3 {
+		copyTensorFloat32ToMem(inputMems[3], inputsAttr[3], timestepCond)
+	}
+	if !p.UseCFG && len(inputsAttr) > 2 {
+		copyTensorFloat32ToMem(inputMems[2], inputsAttr[2], condEmbeds)
+	}
+
+	readUNetOut := func() []float32 {
+		outSize := outputsAttr[0].Size
+		if outputsAttr[0].Type == RKNN_TENSOR_FLOAT16 {
+			nElems := int(outSize) / 2
+			u16Slice := unsafe.Slice((*uint16)(outputMems[0].VirtAddr), nElems)
+			out := make([]float32, nElems)
+			for idx, u := range u16Slice {
+				out[idx] = float16ToFloat32(u)
+			}
+			return out
+		}
+		nElems := int(outSize) / 4
+		cSlice := unsafe.Slice((*float32)(outputMems[0].VirtAddr), nElems)
+		out := make([]float32, nElems)
+		copy(out, cSlice)
+		return out
+	}
+
+	writeTimestep := func(t int) {
+		if inputsAttr[1].Type == RKNN_TENSOR_INT64 {
+			copyInt64ToMem(inputMems[1], []int64{int64(t)})
+		} else if inputsAttr[1].Type == RKNN_TENSOR_INT32 {
+			dst := unsafe.Slice((*int32)(inputMems[1].VirtAddr), 1)
+			dst[0] = int32(t)
+		} else {
+			copyTensorFloat32ToMem(inputMems[1], inputsAttr[1], []float32{float32(t)})
+		}
+	}
+
+	for {
+		if err := ctx.Err(); err != nil {
+			return nil, err
+		}
+		timestep, ok := p.Sched.NextTimestep()
+		if !ok {
+			break
+		}
+		if progressFn != nil {
+			progressFn(p.Sched.stepIndex+1, p.Sched.Steps)
+		}
+		scaledLatents := p.Sched.ScaleModelInput(latents, timestep)
+		if p.UNetInIsNHWC {
+			scaledLatents = nchwToNHWC4(scaledLatents, latentH, latentW)
+		}
+
+		copyTensorFloat32ToMem(inputMems[0], inputsAttr[0], scaledLatents)
+		writeTimestep(timestep)
+
+		var noisePred []float32
+		if p.UseCFG {
+			// Unconditional pass
+			copyTensorFloat32ToMem(inputMems[2], inputsAttr[2], uncondEmbeds)
+			npu.Lock()
+			ret := rknnRun(unet.handle, nil)
+			npu.Unlock()
+			if ret != 0 {
+				return nil, fmt.Errorf("rknn_run (uncond) failed: %d", ret)
+			}
+			noiseUncond := readUNetOut()
+
+			// Conditional pass
+			copyTensorFloat32ToMem(inputMems[2], inputsAttr[2], condEmbeds)
+			npu.Lock()
+			ret = rknnRun(unet.handle, nil)
+			npu.Unlock()
+			if ret != 0 {
+				return nil, fmt.Errorf("rknn_run (cond) failed: %d", ret)
+			}
+			noiseCond := readUNetOut()
+
+			noisePred = make([]float32, len(noiseCond))
+			for i := range noisePred {
+				noisePred[i] = noiseUncond[i] + guidanceScale*(noiseCond[i]-noiseUncond[i])
+			}
+		} else {
+			npu.Lock()
+			ret := rknnRun(unet.handle, nil)
+			npu.Unlock()
+			if ret != 0 {
+				return nil, fmt.Errorf("rknn_run failed: %d", ret)
+			}
+			noisePred = readUNetOut()
+		}
+
+		latents = p.Sched.Step(noisePred, timestep, latents)
+	}
+	return latents, nil
+}
+
+func (p *Pipeline) runDiffusionSDXL(ctx context.Context, promptEmbeds, pooledEmbeds []float32, seed int64, progressFn func(step, total int)) ([]float32, error) {
 	unet, err := p.openSubmodel("unet")
 	if err != nil {
 		return nil, err
@@ -466,9 +719,14 @@ func (p *Pipeline) decodeVAE(latents []float32) (*image.RGBA, error) {
 		return nil, err
 	}
 
+	scaleFactor := p.VAEScale
+	if scaleFactor == 0 {
+		scaleFactor = sdxlVAEScaleFactor
+	}
+
 	scaled := make([]float32, len(latents))
 	for i, v := range latents {
-		scaled[i] = v / sdxlVAEScaleFactor
+		scaled[i] = v / scaleFactor
 	}
 
 	if p.VAEInIsNHWC {

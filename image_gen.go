@@ -21,6 +21,8 @@ var (
 	sharedCLIPTokOnce sync.Mutex
 )
 
+const defaultCFGNegativePrompt = "deformed, distorted, disfigured, extra limbs, extra spouts, symmetrical, duplicate, mutated, blurry, low quality, bad anatomy"
+
 func getCLIPTokenizer(modelDir string) (*rknn.Tokenizer, error) {
 	sharedCLIPTokOnce.Lock()
 	defer sharedCLIPTokOnce.Unlock()
@@ -39,11 +41,11 @@ func getCLIPTokenizer(modelDir string) (*rknn.Tokenizer, error) {
 	return tok, nil
 }
 
-func generateImageFile(prompt, outputPath string, steps int, seed int64, guidanceScale float32) (string, time.Duration, error) {
-	return generateImageFileWithContext(context.Background(), prompt, outputPath, steps, seed, guidanceScale, nil)
+func generateImageFile(prompt, negativePrompt, outputPath string, steps int, seed int64, guidanceScale float32) (string, time.Duration, error) {
+	return generateImageFileWithContext(context.Background(), prompt, negativePrompt, outputPath, steps, seed, guidanceScale, nil)
 }
 
-func generateImageFileWithContext(ctx context.Context, prompt, outputPath string, steps int, seed int64, guidanceScale float32, progressFn func(step, total int)) (string, time.Duration, error) {
+func generateImageFileWithContext(ctx context.Context, prompt, negativePrompt, outputPath string, steps int, seed int64, guidanceScale float32, progressFn func(step, total int)) (string, time.Duration, error) {
 	prompt = strings.TrimSpace(prompt)
 	if prompt == "" {
 		return "", 0, fmt.Errorf("prompt is required")
@@ -52,17 +54,8 @@ func generateImageFileWithContext(ctx context.Context, prompt, outputPath string
 	if steps <= 0 {
 		steps = 4
 	}
-	if steps > 12 {
-		steps = 12
-	}
-
-	if guidanceScale <= 0 {
-		guidanceScale = 1.5
-	}
-	if guidanceScale < 1.0 {
-		guidanceScale = 1.0
-	} else if guidanceScale > 2.0 {
-		guidanceScale = 2.0
+	if steps > 30 {
+		steps = 30
 	}
 
 	if seed == 0 {
@@ -99,9 +92,40 @@ func generateImageFileWithContext(ctx context.Context, prompt, outputPath string
 	}
 	defer pipe.Close()
 
-	pipe.GuidanceScale = guidanceScale
+	if guidanceScale > 0 {
+		if pipe.UseCFG {
+			if guidanceScale < 1.0 {
+				guidanceScale = 1.0
+			} else if guidanceScale > 15.0 {
+				guidanceScale = 15.0
+			}
+		} else {
+			if guidanceScale < 1.0 {
+				guidanceScale = 1.0
+			} else if guidanceScale > 2.0 {
+				guidanceScale = 2.0
+			}
+		}
+		pipe.GuidanceScale = guidanceScale
+	}
 
-	img, err := pipe.GenerateWithContext(ctx, prompt, seed, progressFn)
+	effectiveGuidance := pipe.GuidanceScale
+	if effectiveGuidance == 0 {
+		if pipe.UseCFG {
+			effectiveGuidance = 7.5
+		} else {
+			effectiveGuidance = 1.5
+		}
+	}
+
+	neg := strings.TrimSpace(negativePrompt)
+	if strings.EqualFold(neg, "none") {
+		neg = ""
+	} else if neg == "" && pipe.UseCFG {
+		neg = defaultCFGNegativePrompt
+	}
+
+	img, err := pipe.GenerateWithNegative(ctx, prompt, neg, seed, progressFn)
 	if err != nil {
 		return "", 0, err
 	}
@@ -138,5 +162,5 @@ func generateImageFileWithContext(ctx context.Context, prompt, outputPath string
 			relOut = rel
 		}
 	}
-	return fmt.Sprintf("%s (%dx%d, %d steps, guidance %.1f, seed %d)", relOut, img.Bounds().Dx(), img.Bounds().Dy(), steps, guidanceScale, seed), elapsed, nil
+	return fmt.Sprintf("%s (%dx%d, %d steps, guidance %.1f, seed %d)", relOut, img.Bounds().Dx(), img.Bounds().Dy(), steps, effectiveGuidance, seed), elapsed, nil
 }

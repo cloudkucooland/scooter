@@ -302,8 +302,14 @@ func main() {
 			},
 			&cli.Float64Flag{
 				Name:  "guidance",
-				Value: 1.5,
-				Usage: "Guidance scale for --imagine (1.0-2.0)",
+				Value: 0.0,
+				Usage: "Guidance scale for --imagine (1.0-2.0 for LCM, 1.0-15.0 for CFG/Euler, 0 = model default)",
+			},
+			&cli.StringFlag{
+				Name:    "negative",
+				Aliases: []string{"n"},
+				Value:   "",
+				Usage:   "Negative prompt for CFG/Euler models (empty = built-in default, 'none' = blank)",
 			},
 		},
 		Action: func(ctx context.Context, cmd *cli.Command) error {
@@ -343,6 +349,7 @@ func main() {
 			if imaginePrompt != "" {
 				summary, elapsed, err := generateImageFile(
 					imaginePrompt,
+					cmd.String("negative"),
 					cmd.String("output"),
 					int(cmd.Int("steps")),
 					int64(cmd.Int("seed")),

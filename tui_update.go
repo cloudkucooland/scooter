@@ -623,7 +623,7 @@ func (m *model) handleCommand(input string) tea.Cmd {
 		m.saveMessage(userMsg)
 		m.isGeneratingImage = true
 		m.refreshViewport()
-		return imagineCmd(prompt, outPath, 4, 0, guidanceScale)
+		return imagineCmd(prompt, "", outPath, 4, 0, guidanceScale)
 	}
 
 	userMsg := Message{Role: "user", Content: input}
