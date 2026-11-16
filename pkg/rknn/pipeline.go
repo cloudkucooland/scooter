@@ -336,7 +336,7 @@ func (p *Pipeline) runDiffusionSD15(ctx context.Context, condEmbeds, uncondEmbed
 	}
 	defer func() { _ = unet.Close() }()
 
-	inputsAttr, outputsAttr, err := unet.QueryIO()
+	inputsAttr, _, err := unet.QueryIO()
 	if err != nil {
 		return nil, err
 	}
@@ -362,94 +362,132 @@ func (p *Pipeline) runDiffusionSD15(ctx context.Context, condEmbeds, uncondEmbed
 	}
 	timestepCond := getGuidanceScaleEmbedding(guidanceScale)
 
-	inputMems := make([]*TensorMem, len(inputsAttr))
-	for i, attr := range inputsAttr {
-		size := attr.Size
-		if i == 0 && uint32(len(latents)*4) > size {
-			size = uint32(len(latents) * 4)
-		} else if i == 2 && uint32(len(condEmbeds)*4) > size {
-			size = uint32(len(condEmbeds) * 4)
-		} else if i == 3 && uint32(len(timestepCond)*4) > size {
-			size = uint32(len(timestepCond) * 4)
-		}
-		mem, err := unet.CreateMem(size)
-		if err != nil {
-			for j := 0; j < i; j++ {
-				_ = unet.DestroyMem(inputMems[j])
-			}
-			return nil, fmt.Errorf("create input mem %d: %w", i, err)
-		}
-		inputMems[i] = mem
-		if err := unet.SetIOMem(mem, &attr); err != nil {
-			for j := 0; j <= i; j++ {
-				_ = unet.DestroyMem(inputMems[j])
-			}
-			return nil, fmt.Errorf("set io mem for input %d: %w", i, err)
-		}
-	}
-	defer func() {
-		for _, mem := range inputMems {
-			_ = unet.DestroyMem(mem)
-		}
-	}()
+	runUNetStep := func(sample []float32, timestep int, embeds []float32) ([]float32, error) {
+		inputs := make([]Input, len(inputsAttr))
 
-	outputMems := make([]*TensorMem, len(outputsAttr))
-	for i, attr := range outputsAttr {
-		mem, err := unet.CreateMem(attr.Size)
-		if err != nil {
-			for j := 0; j < i; j++ {
-				_ = unet.DestroyMem(outputMems[j])
-			}
-			return nil, fmt.Errorf("create output mem %d: %w", i, err)
+		// Input 0: sample [1, 4, H/8, W/8] in NCHW float32 (librknnrt converts to NHWC/FP16 when PassThrough=0)
+		/* inputs[0] = Input{
+			Index:       0,
+			Buf:         unsafe.Pointer(&sample[0]),
+			Size:        uint32(len(sample) * 4),
+			PassThrough: 0,
+			Type:        RKNN_TENSOR_FLOAT32,
+			Fmt:         RKNN_TENSOR_NCHW,
+		} */
+		inSample := sample
+		inFmt := RKNN_TENSOR_NCHW
+		if p.UNetInIsNHWC {
+			inSample = nchwToNHWC4(sample, latentH, latentW)
+			inFmt = RKNN_TENSOR_NHWC
 		}
-		outputMems[i] = mem
-		if err := unet.SetIOMem(mem, &attr); err != nil {
-			for j := 0; j <= i; j++ {
-				_ = unet.DestroyMem(outputMems[j])
-			}
-			return nil, fmt.Errorf("set io mem for output %d: %w", i, err)
-		}
-	}
-	defer func() {
-		for _, mem := range outputMems {
-			_ = unet.DestroyMem(mem)
-		}
-	}()
 
-	if len(inputsAttr) > 3 {
-		copyTensorFloat32ToMem(inputMems[3], inputsAttr[3], timestepCond)
-	}
-	if !p.UseCFG && len(inputsAttr) > 2 {
-		copyTensorFloat32ToMem(inputMems[2], inputsAttr[2], condEmbeds)
-	}
+		// Input 0: sample [1, H/8, W/8, 4] in NHWC (or [1, 4, H/8, W/8] NCHW)
+		inputs[0] = Input{
+			Index:       0,
+			Buf:         unsafe.Pointer(&inSample[0]),
+			Size:        uint32(len(inSample) * 4),
+			PassThrough: 0,
+			Type:        RKNN_TENSOR_FLOAT32,
+			Fmt:         inFmt,
+		}
 
-	readUNetOut := func() []float32 {
-		outSize := outputsAttr[0].Size
-		if outputsAttr[0].Type == RKNN_TENSOR_FLOAT16 {
-			nElems := int(outSize) / 2
-			u16Slice := unsafe.Slice((*uint16)(outputMems[0].VirtAddr), nElems)
-			out := make([]float32, nElems)
-			for idx, u := range u16Slice {
-				out[idx] = float16ToFloat32(u)
+		// Input 1: timestep [1]
+		var t64 int64
+		var t32 int32
+		var tf32 float32
+		switch inputsAttr[1].Type {
+		case RKNN_TENSOR_INT64:
+			t64 = int64(timestep)
+			inputs[1] = Input{
+				Index:       1,
+				Buf:         unsafe.Pointer(&t64),
+				Size:        8,
+				PassThrough: 0,
+				Type:        RKNN_TENSOR_INT64,
+				Fmt:         RKNN_TENSOR_UNDEFINED,
 			}
-			return out
+		case RKNN_TENSOR_INT32:
+			t32 = int32(timestep)
+			inputs[1] = Input{
+				Index:       1,
+				Buf:         unsafe.Pointer(&t32),
+				Size:        4,
+				PassThrough: 0,
+				Type:        RKNN_TENSOR_INT32,
+				Fmt:         RKNN_TENSOR_UNDEFINED,
+			}
+		default:
+			tf32 = float32(timestep)
+			inputs[1] = Input{
+				Index:       1,
+				Buf:         unsafe.Pointer(&tf32),
+				Size:        4,
+				PassThrough: 0,
+				Type:        RKNN_TENSOR_FLOAT32,
+				Fmt:         RKNN_TENSOR_UNDEFINED,
+			}
 		}
-		nElems := int(outSize) / 4
-		cSlice := unsafe.Slice((*float32)(outputMems[0].VirtAddr), nElems)
-		out := make([]float32, nElems)
-		copy(out, cSlice)
-		return out
-	}
 
-	writeTimestep := func(t int) {
-		if inputsAttr[1].Type == RKNN_TENSOR_INT64 {
-			copyInt64ToMem(inputMems[1], []int64{int64(t)})
-		} else if inputsAttr[1].Type == RKNN_TENSOR_INT32 {
-			dst := unsafe.Slice((*int32)(inputMems[1].VirtAddr), 1)
-			dst[0] = int32(t)
-		} else {
-			copyTensorFloat32ToMem(inputMems[1], inputsAttr[1], []float32{float32(t)})
+		// Input 2: encoder_hidden_states [1, 77, 768]
+		if len(inputsAttr) > 2 && len(embeds) > 0 {
+			inputs[2] = Input{
+				Index:       2,
+				Buf:         unsafe.Pointer(&embeds[0]),
+				Size:        uint32(len(embeds) * 4),
+				PassThrough: 0,
+				Type:        RKNN_TENSOR_FLOAT32,
+				Fmt:         RKNN_TENSOR_UNDEFINED,
+			}
 		}
+
+		// Input 3 (LCM only): timestep_cond [1, 256]
+		if len(inputsAttr) > 3 && len(timestepCond) > 0 {
+			inputs[3] = Input{
+				Index:       3,
+				Buf:         unsafe.Pointer(&timestepCond[0]),
+				Size:        uint32(len(timestepCond) * 4),
+				PassThrough: 0,
+				Type:        RKNN_TENSOR_FLOAT32,
+				Fmt:         RKNN_TENSOR_UNDEFINED,
+			}
+		}
+
+		npu.Lock()
+		defer npu.Unlock()
+
+		if ret := rknnInputsSet(unet.handle, uint32(len(inputs)), &inputs[0]); ret != 0 {
+			return nil, fmt.Errorf("rknn_inputs_set failed: %d", ret)
+		}
+		runtime.KeepAlive(inSample)
+		runtime.KeepAlive(sample)
+		runtime.KeepAlive(embeds)
+		runtime.KeepAlive(timestepCond)
+		runtime.KeepAlive(t64)
+		runtime.KeepAlive(t32)
+		runtime.KeepAlive(tf32)
+
+		if ret := rknnRun(unet.handle, nil); ret != 0 {
+			return nil, fmt.Errorf("rknn_run failed: %d", ret)
+		}
+
+		out := &Output{
+			WantFloat:  1,
+			IsPrealloc: 0,
+			Index:      0,
+		}
+		if ret := callRKNNOutputsGet(unet.handle, 1, out); ret != 0 {
+			return nil, fmt.Errorf("rknn_outputs_get failed: %d", ret)
+		}
+		if out.Buf == nil || out.Size == 0 {
+			callRKNNOutputsRelease(unet.handle, 1, out)
+			return nil, fmt.Errorf("rknn_outputs_get returned empty buffer")
+		}
+		count := int(out.Size) / 4
+		src := unsafe.Slice((*float32)(out.Buf), count)
+		noisePred := make([]float32, count)
+		copy(noisePred, src)
+		callRKNNOutputsRelease(unet.handle, 1, out)
+		return noisePred, nil
 	}
 
 	for {
@@ -464,47 +502,27 @@ func (p *Pipeline) runDiffusionSD15(ctx context.Context, condEmbeds, uncondEmbed
 			progressFn(p.Sched.stepIndex+1, p.Sched.Steps)
 		}
 		scaledLatents := p.Sched.ScaleModelInput(latents, timestep)
-		if p.UNetInIsNHWC {
-			scaledLatents = nchwToNHWC4(scaledLatents, latentH, latentW)
-		}
-
-		copyTensorFloat32ToMem(inputMems[0], inputsAttr[0], scaledLatents)
-		writeTimestep(timestep)
 
 		var noisePred []float32
 		if p.UseCFG {
-			// Unconditional pass
-			copyTensorFloat32ToMem(inputMems[2], inputsAttr[2], uncondEmbeds)
-			npu.Lock()
-			ret := rknnRun(unet.handle, nil)
-			npu.Unlock()
-			if ret != 0 {
-				return nil, fmt.Errorf("rknn_run (uncond) failed: %d", ret)
+			noiseUncond, err := runUNetStep(scaledLatents, timestep, uncondEmbeds)
+			if err != nil {
+				return nil, fmt.Errorf("uncond step: %w", err)
 			}
-			noiseUncond := readUNetOut()
-
-			// Conditional pass
-			copyTensorFloat32ToMem(inputMems[2], inputsAttr[2], condEmbeds)
-			npu.Lock()
-			ret = rknnRun(unet.handle, nil)
-			npu.Unlock()
-			if ret != 0 {
-				return nil, fmt.Errorf("rknn_run (cond) failed: %d", ret)
+			noiseCond, err := runUNetStep(scaledLatents, timestep, condEmbeds)
+			if err != nil {
+				return nil, fmt.Errorf("cond step: %w", err)
 			}
-			noiseCond := readUNetOut()
-
 			noisePred = make([]float32, len(noiseCond))
 			for i := range noisePred {
 				noisePred[i] = noiseUncond[i] + guidanceScale*(noiseCond[i]-noiseUncond[i])
 			}
 		} else {
-			npu.Lock()
-			ret := rknnRun(unet.handle, nil)
-			npu.Unlock()
-			if ret != 0 {
-				return nil, fmt.Errorf("rknn_run failed: %d", ret)
+			var err error
+			noisePred, err = runUNetStep(scaledLatents, timestep, condEmbeds)
+			if err != nil {
+				return nil, err
 			}
-			noisePred = readUNetOut()
 		}
 
 		latents = p.Sched.Step(noisePred, timestep, latents)
