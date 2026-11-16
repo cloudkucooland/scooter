@@ -95,10 +95,11 @@ type Output struct {
 
 type TensorMem struct {
 	VirtAddr unsafe.Pointer
+	PhysAddr uint64
 	Fd       int32
 	Offset   int32
 	Size     uint32
-	Flag     int32
+	Flag     uint32
 	PrivData unsafe.Pointer
 }
 
@@ -107,17 +108,17 @@ var (
 	libErr  error
 	lib     uintptr
 
-	rknnInit           func(ctx *Context, model unsafe.Pointer, size uint32, flag uint32, extend unsafe.Pointer) int32
-	rknnDestroy        func(ctx Context) int32
-	rknnSetCoreMask    func(ctx Context, coreMask uint32) int32
-	rknnQuery          func(ctx Context, cmd uint32, info unsafe.Pointer, size uint32) int32
-	rknnInputsSet      func(ctx Context, nInputs uint32, inputs *Input) int32
-	rknnRun            func(ctx Context, extend unsafe.Pointer) int32
-	rknnOutputsGet     func(ctx Context, nOutputs uint32, outputs *Output, extend unsafe.Pointer) int32
-	rknnOutputsRelease func(ctx Context, nOutputs uint32, outputs *Output) int32
-	rknnCreateMem      func(ctx Context, size uint32) *TensorMem
-	rknnDestroyMem     func(ctx Context, mem *TensorMem) int32
-	rknnSetIOMem       func(ctx Context, mem *TensorMem, attr *TensorAttr) int32
+	rknnInit              func(ctx *Context, model unsafe.Pointer, size uint32, flag uint32, extend unsafe.Pointer) int32
+	rknnDestroy           func(ctx Context) int32
+	rknnSetCoreMask       func(ctx Context, coreMask uint32) int32
+	rknnQuery             func(ctx Context, cmd uint32, info unsafe.Pointer, size uint32) int32
+	rknnInputsSet         func(ctx Context, nInputs uint32, inputs *Input) int32
+	rknnRun               func(ctx Context, extend unsafe.Pointer) int32
+	rknnOutputsGetSym     uintptr
+	rknnOutputsReleaseSym uintptr
+	rknnCreateMem         func(ctx Context, size uint32) *TensorMem
+	rknnDestroyMem        func(ctx Context, mem *TensorMem) int32
+	rknnSetIOMem          func(ctx Context, mem *TensorMem, attr *TensorAttr) int32
 )
 
 func getRKNNLibPath() string {
@@ -133,7 +134,7 @@ func LoadLibrary() error {
 		if !filepath.IsAbs(libPath) {
 			libPath = filepath.Join(".", libPath)
 		}
-		lib, libErr = purego.Dlopen(libPath, purego.RTLD_NOW|purego.RTLD_GLOBAL)
+		lib, libErr = purego.Dlopen(libPath, purego.RTLD_NOW)
 		if libErr != nil {
 			libErr = fmt.Errorf("failed to dlopen %s: %w", libPath, libErr)
 			return
@@ -144,8 +145,14 @@ func LoadLibrary() error {
 		purego.RegisterLibFunc(&rknnQuery, lib, "rknn_query")
 		purego.RegisterLibFunc(&rknnInputsSet, lib, "rknn_inputs_set")
 		purego.RegisterLibFunc(&rknnRun, lib, "rknn_run")
-		purego.RegisterLibFunc(&rknnOutputsGet, lib, "rknn_outputs_get")
-		purego.RegisterLibFunc(&rknnOutputsRelease, lib, "rknn_outputs_release")
+		rknnOutputsGetSym, libErr = purego.Dlsym(lib, "rknn_outputs_get")
+		if libErr != nil {
+			return
+		}
+		rknnOutputsReleaseSym, libErr = purego.Dlsym(lib, "rknn_outputs_release")
+		if libErr != nil {
+			return
+		}
 		purego.RegisterLibFunc(&rknnCreateMem, lib, "rknn_create_mem")
 		purego.RegisterLibFunc(&rknnDestroyMem, lib, "rknn_destroy_mem")
 		purego.RegisterLibFunc(&rknnSetIOMem, lib, "rknn_set_io_mem")

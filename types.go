@@ -2,7 +2,7 @@ package main
 
 import (
 	"time"
-	
+
 	"codeberg.org/indievisible/scooter/pkg/types"
 )
 

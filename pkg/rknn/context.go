@@ -7,6 +7,7 @@ import (
 	"unsafe"
 
 	"codeberg.org/indievisible/scooter/pkg/npu"
+	// "github.com/ebitengine/purego"
 )
 
 type RKNNContext struct {
@@ -119,25 +120,24 @@ func (c *RKNNContext) RunFloat32Indices(inputs []Input, outputIndices []int) ([]
 				nElems = 77 * 1280
 			}
 		}
+		out := &Output{
+			WantFloat:  1,
+			IsPrealloc: 0,
+			Index:      uint32(idx),
+		}
 
-		var out Output
-		buf := make([]float32, nElems*2)
-		out.WantFloat = 1
-		out.IsPrealloc = 1
-		out.Index = uint32(idx)
-		out.Buf = unsafe.Pointer(&buf[0])
-		out.Size = uint32(len(buf) * 4)
-
-		if ret := rknnOutputsGet(c.handle, 1, &out, nil); ret != 0 {
+		if ret := callRKNNOutputsGet(c.handle, 1, out); ret != 0 {
 			return nil, fmt.Errorf("rknn_outputs_get failed for index %d: %d", idx, ret)
 		}
-		count := int(out.Size) / 4
-		if count <= 0 || count > len(buf) {
-			count = len(buf)
+		if out.Buf == nil || out.Size == 0 {
+			callRKNNOutputsRelease(c.handle, 1, out)
+			return nil, fmt.Errorf("rknn_outputs_get returned empty buffer for index %d", idx)
 		}
+		count := int(out.Size) / 4
+		src := unsafe.Slice((*float32)(out.Buf), count)
 		goSlice := make([]float32, count)
-		copy(goSlice, buf[:count])
-		rknnOutputsRelease(c.handle, 1, &out)
+		copy(goSlice, src)
+		callRKNNOutputsRelease(c.handle, 1, out)
 		results[i] = goSlice
 	}
 	return results, nil
@@ -216,3 +216,30 @@ func stringToBytePtr(s string) (*byte, []byte) {
 	b := append([]byte(s), 0)
 	return &b[0], b
 }
+
+/*
+//go:noinline
+func callRKNNOutputsGet(handle Context, nOutputs uint32, out *Output) int32 {
+	r1, _, _ := purego.SyscallN(
+		rknnOutputsGetSym,
+		uintptr(handle),
+		uintptr(nOutputs),
+		uintptr(unsafe.Pointer(out)),
+		0,
+	)
+	runtime.KeepAlive(out)
+	return int32(r1)
+}
+
+//go:noinline
+func callRKNNOutputsRelease(handle Context, nOutputs uint32, out *Output) int32 {
+	r1, _, _ := purego.SyscallN(
+		rknnOutputsReleaseSym,
+		uintptr(handle),
+		uintptr(nOutputs),
+		uintptr(unsafe.Pointer(out)),
+	)
+	runtime.KeepAlive(out)
+	return int32(r1)
+}
+*/
