@@ -350,6 +350,9 @@ func (p *Pipeline) runDiffusionSD15(ctx context.Context, condEmbeds, uncondEmbed
 	if err != nil {
 		return nil, err
 	}
+	if !p.UseCFG && len(inputsAttr) == 4 {
+		return p.runDiffusionSD15LCM(ctx, unet, inputsAttr, condEmbeds, seed, progressFn)
+	}
 
 	p.Sched.Reset(seed)
 	rng := rand.New(rand.NewSource(seed))
@@ -531,6 +534,123 @@ func (p *Pipeline) runDiffusionSD15(ctx context.Context, condEmbeds, uncondEmbed
 	return latents, nil
 }
 
+func (p *Pipeline) runDiffusionSD15LCM(ctx context.Context, unet *RKNNContext, inputsAttr []TensorAttr, embeds []float32, seed int64, progressFn func(step, total int)) ([]float32, error) {
+	if len(inputsAttr) != 4 {
+		return nil, fmt.Errorf("SD 1.5 LCM UNet has %d inputs, expected 4", len(inputsAttr))
+	}
+
+	_, outputsAttr, err := unet.QueryIO()
+	if err != nil {
+		return nil, err
+	}
+	if len(outputsAttr) == 0 {
+		return nil, fmt.Errorf("SD 1.5 LCM UNet has no outputs")
+	}
+
+	inputMems := make([]*TensorMem, len(inputsAttr))
+	for i, attr := range inputsAttr {
+		mem, err := unet.CreateMem(attr.Size)
+		if err != nil {
+			for j := 0; j < i; j++ {
+				_ = unet.DestroyMem(inputMems[j])
+			}
+			return nil, fmt.Errorf("create LCM input mem %d: %w", i, err)
+		}
+		inputMems[i] = mem
+		if err := unet.SetIOMem(mem, &attr); err != nil {
+			for j := 0; j <= i; j++ {
+				_ = unet.DestroyMem(inputMems[j])
+			}
+			return nil, fmt.Errorf("set LCM input io mem %d: %w", i, err)
+		}
+	}
+	defer func() {
+		for _, mem := range inputMems {
+			_ = unet.DestroyMem(mem)
+		}
+	}()
+
+	outputMems := make([]*TensorMem, len(outputsAttr))
+	for i, attr := range outputsAttr {
+		mem, err := unet.CreateMem(attr.Size)
+		if err != nil {
+			for j := 0; j < i; j++ {
+				_ = unet.DestroyMem(outputMems[j])
+			}
+			return nil, fmt.Errorf("create LCM output mem %d: %w", i, err)
+		}
+		outputMems[i] = mem
+		if err := unet.SetIOMem(mem, &attr); err != nil {
+			for j := 0; j <= i; j++ {
+				_ = unet.DestroyMem(outputMems[j])
+			}
+			return nil, fmt.Errorf("set LCM output io mem %d: %w", i, err)
+		}
+	}
+	defer func() {
+		for _, mem := range outputMems {
+			_ = unet.DestroyMem(mem)
+		}
+	}()
+
+	p.Sched.Reset(seed)
+	rng := rand.New(rand.NewSource(seed))
+	latentH, latentW := p.Height/8, p.Width/8
+	latents := make([]float32, 4*latentH*latentW)
+	initSigma := float32(p.Sched.InitNoiseSigma())
+	for i := range latents {
+		latents[i] = float32(rng.NormFloat64()) * initSigma
+	}
+	timestepCond := getGuidanceScaleEmbedding(p.GuidanceScale)
+
+	for {
+		if err := ctx.Err(); err != nil {
+			return nil, err
+		}
+		timestep, ok := p.Sched.NextTimestep()
+		if !ok {
+			break
+		}
+		if progressFn != nil {
+			progressFn(p.Sched.stepIndex+1, p.Sched.Steps)
+		}
+
+		sample := p.Sched.ScaleModelInput(latents, timestep)
+		if inputsAttr[0].Fmt == RKNN_TENSOR_NHWC {
+			sample = nchwToNHWC4(sample, latentH, latentW)
+		}
+		copyTensorFloat32ToMem(inputMems[0], inputsAttr[0], sample)
+		switch inputsAttr[1].Type {
+		case RKNN_TENSOR_INT64:
+			copyInt64ToMem(inputMems[1], []int64{int64(timestep)})
+		case RKNN_TENSOR_INT32:
+			copyInt32ToMem(inputMems[1], []int32{int32(timestep)})
+		case RKNN_TENSOR_FLOAT32, RKNN_TENSOR_FLOAT16:
+			copyTensorFloat32ToMem(inputMems[1], inputsAttr[1], []float32{float32(timestep)})
+		default:
+			return nil, fmt.Errorf("unsupported LCM timestep tensor type %d", inputsAttr[1].Type)
+		}
+		copyTensorFloat32ToMem(inputMems[2], inputsAttr[2], embeds)
+		copyTensorFloat32ToMem(inputMems[3], inputsAttr[3], timestepCond)
+
+		npu.Lock()
+		ret := rknnRun(unet.handle, nil)
+		var modelOutput []float32
+		if ret == 0 {
+			modelOutput, err = tensorMemToFloat32(outputMems[0], outputsAttr[0])
+		}
+		npu.Unlock()
+		if ret != 0 {
+			return nil, fmt.Errorf("LCM unet rknn_run failed: %d", ret)
+		}
+		if err != nil {
+			return nil, err
+		}
+		latents = p.Sched.Step(modelOutput, timestep, latents)
+	}
+	return latents, nil
+}
+
 func (p *Pipeline) runDiffusionSDXL(ctx context.Context, promptEmbeds, pooledEmbeds []float32, seed int64, progressFn func(step, total int)) ([]float32, error) {
 	unet, err := p.openSubmodel("unet")
 	if err != nil {
@@ -698,6 +818,44 @@ func copyInt64ToMem(mem *TensorMem, src []int64) {
 	}
 	dest := unsafe.Slice((*int64)(mem.VirtAddr), len(src))
 	copy(dest, src)
+}
+
+func copyInt32ToMem(mem *TensorMem, src []int32) {
+	if len(src) == 0 || mem.VirtAddr == nil {
+		return
+	}
+	dest := unsafe.Slice((*int32)(mem.VirtAddr), len(src))
+	copy(dest, src)
+}
+
+func tensorMemToFloat32(mem *TensorMem, attr TensorAttr) ([]float32, error) {
+	if mem == nil || mem.VirtAddr == nil {
+		return nil, fmt.Errorf("tensor %d has no bound memory", attr.Index)
+	}
+	switch attr.Type {
+	case RKNN_TENSOR_FLOAT16:
+		if attr.Size%2 != 0 {
+			return nil, fmt.Errorf("tensor %d has invalid float16 byte size %d", attr.Index, attr.Size)
+		}
+		n := int(attr.Size / 2)
+		src := unsafe.Slice((*uint16)(mem.VirtAddr), n)
+		out := make([]float32, n)
+		for i, v := range src {
+			out[i] = float16ToFloat32(v)
+		}
+		return out, nil
+	case RKNN_TENSOR_FLOAT32:
+		if attr.Size%4 != 0 {
+			return nil, fmt.Errorf("tensor %d has invalid float32 byte size %d", attr.Index, attr.Size)
+		}
+		n := int(attr.Size / 4)
+		src := unsafe.Slice((*float32)(mem.VirtAddr), n)
+		out := make([]float32, n)
+		copy(out, src)
+		return out, nil
+	default:
+		return nil, fmt.Errorf("unsupported output tensor type %d for tensor %d", attr.Type, attr.Index)
+	}
 }
 
 func float16ToFloat32(h uint16) float32 {
