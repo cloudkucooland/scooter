@@ -210,3 +210,16 @@ func TestImagineCommandInAvailableCommands(t *testing.T) {
 		t.Errorf("expected /imagine in availableCommands")
 	}
 }
+
+func TestParseImagineCommandArgs(t *testing.T) {
+	prompt, outPath, guidance := parseImagineCommandArgs("a red scooter --out test.png --guidance 1.8")
+	if prompt != "a red scooter" {
+		t.Errorf("expected prompt 'a red scooter', got %q", prompt)
+	}
+	if outPath != "test.png" {
+		t.Errorf("expected outPath 'test.png', got %q", outPath)
+	}
+	if guidance != 1.8 {
+		t.Errorf("expected guidance 1.8, got %f", guidance)
+	}
+}

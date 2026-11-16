@@ -703,6 +703,10 @@ func getImageTools() []Tool {
 							Type:        "integer",
 							Description: "Optional integer random seed for reproducible generation.",
 						},
+						"guidance_scale": {
+							Type:        "number",
+							Description: "Optional guidance scale for LCM-SSD-1B (default 1.5, range 1.0-2.0).",
+						},
 					},
 					Required: []string{"prompt"},
 				},
@@ -712,8 +716,9 @@ func getImageTools() []Tool {
 }
 
 type GenerateImageArgs struct {
-	Prompt     string      `json:"prompt"`
-	OutputPath string      `json:"output_path,omitempty"`
-	Steps      FlexibleInt `json:"steps,omitempty"`
-	Seed       int64       `json:"seed,omitempty"`
+	Prompt        string        `json:"prompt"`
+	OutputPath    string        `json:"output_path,omitempty"`
+	Steps         FlexibleInt   `json:"steps,omitempty"`
+	Seed          int64         `json:"seed,omitempty"`
+	GuidanceScale FlexibleFloat `json:"guidance_scale,omitempty"`
 }

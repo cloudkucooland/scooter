@@ -39,11 +39,11 @@ func getCLIPTokenizer(modelDir string) (*rknn.Tokenizer, error) {
 	return tok, nil
 }
 
-func generateImageFile(prompt, outputPath string, steps int, seed int64) (string, time.Duration, error) {
-	return generateImageFileWithContext(context.Background(), prompt, outputPath, steps, seed, nil)
+func generateImageFile(prompt, outputPath string, steps int, seed int64, guidanceScale float32) (string, time.Duration, error) {
+	return generateImageFileWithContext(context.Background(), prompt, outputPath, steps, seed, guidanceScale, nil)
 }
 
-func generateImageFileWithContext(ctx context.Context, prompt, outputPath string, steps int, seed int64, progressFn func(step, total int)) (string, time.Duration, error) {
+func generateImageFileWithContext(ctx context.Context, prompt, outputPath string, steps int, seed int64, guidanceScale float32, progressFn func(step, total int)) (string, time.Duration, error) {
 	prompt = strings.TrimSpace(prompt)
 	if prompt == "" {
 		return "", 0, fmt.Errorf("prompt is required")
@@ -54,6 +54,15 @@ func generateImageFileWithContext(ctx context.Context, prompt, outputPath string
 	}
 	if steps > 12 {
 		steps = 12
+	}
+
+	if guidanceScale <= 0 {
+		guidanceScale = 1.5
+	}
+	if guidanceScale < 1.0 {
+		guidanceScale = 1.0
+	} else if guidanceScale > 2.0 {
+		guidanceScale = 2.0
 	}
 
 	if seed == 0 {
@@ -89,6 +98,8 @@ func generateImageFileWithContext(ctx context.Context, prompt, outputPath string
 		return "", 0, fmt.Errorf("load RKNN pipeline from %s: %w", modelDir, err)
 	}
 	defer pipe.Close()
+
+	pipe.GuidanceScale = guidanceScale
 
 	img, err := pipe.GenerateWithContext(ctx, prompt, seed, progressFn)
 	if err != nil {
@@ -127,5 +138,5 @@ func generateImageFileWithContext(ctx context.Context, prompt, outputPath string
 			relOut = rel
 		}
 	}
-	return fmt.Sprintf("%s (%dx%d, %d steps, seed %d)", relOut, img.Bounds().Dx(), img.Bounds().Dy(), steps, seed), elapsed, nil
+	return fmt.Sprintf("%s (%dx%d, %d steps, guidance %.1f, seed %d)", relOut, img.Bounds().Dx(), img.Bounds().Dy(), steps, guidanceScale, seed), elapsed, nil
 }

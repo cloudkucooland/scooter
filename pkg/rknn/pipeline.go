@@ -38,7 +38,7 @@ func LoadPipeline(modelDir string, tok *Tokenizer, steps int) (*Pipeline, error)
 		ModelDir:      modelDir,
 		Tok:           tok,
 		Sched:         NewScheduler(steps, "lcm"),
-		GuidanceScale: 1.0,
+		GuidanceScale: 1.5,
 	}
 
 	// Probe UNet input resolution, layout, and output count

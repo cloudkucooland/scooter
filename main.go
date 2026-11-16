@@ -300,6 +300,11 @@ func main() {
 				Value: 0,
 				Usage: "Random seed for --imagine (0 = random)",
 			},
+			&cli.Float64Flag{
+				Name:  "guidance",
+				Value: 1.5,
+				Usage: "Guidance scale for --imagine (1.0-2.0)",
+			},
 		},
 		Action: func(ctx context.Context, cmd *cli.Command) error {
 			if cmd.Bool("debug") {
@@ -341,6 +346,7 @@ func main() {
 					cmd.String("output"),
 					int(cmd.Int("steps")),
 					int64(cmd.Int("seed")),
+					float32(cmd.Float64("guidance")),
 				)
 				if err != nil {
 					return err

@@ -609,11 +609,11 @@ func (m *model) handleCommand(input string) tea.Cmd {
 		if raw == input {
 			raw = strings.TrimPrefix(input, "/image")
 		}
-		prompt, outPath := parseImagineCommandArgs(strings.TrimSpace(raw))
+		prompt, outPath, guidanceScale := parseImagineCommandArgs(strings.TrimSpace(raw))
 		if prompt == "" {
 			m.chatHistory = append(m.chatHistory, Message{
 				Role:    "system",
-				Content: "Usage: /imagine [--out filename.png] <prompt>",
+				Content: "Usage: /imagine [--out filename.png] [--guidance 1.5] <prompt>",
 			})
 			m.refreshViewport()
 			return nil
@@ -623,7 +623,7 @@ func (m *model) handleCommand(input string) tea.Cmd {
 		m.saveMessage(userMsg)
 		m.isGeneratingImage = true
 		m.refreshViewport()
-		return imagineCmd(prompt, outPath, 4, 0)
+		return imagineCmd(prompt, outPath, 4, 0, guidanceScale)
 	}
 
 	userMsg := Message{Role: "user", Content: input}
@@ -749,7 +749,7 @@ func removePromptCacheFiles() {
 	}
 }
 
-func parseImagineCommandArgs(raw string) (prompt, outPath string) {
+func parseImagineCommandArgs(raw string) (prompt, outPath string, guidanceScale float32) {
 	fields := strings.Fields(raw)
 	var promptParts []string
 	for i := 0; i < len(fields); i++ {
@@ -758,7 +758,15 @@ func parseImagineCommandArgs(raw string) (prompt, outPath string) {
 			i++
 			continue
 		}
+		if (fields[i] == "--guidance" || fields[i] == "-g" || fields[i] == "--guidance-scale") && i+1 < len(fields) {
+			var g float32
+			if _, err := fmt.Sscanf(fields[i+1], "%f", &g); err == nil {
+				guidanceScale = g
+			}
+			i++
+			continue
+		}
 		promptParts = append(promptParts, fields[i])
 	}
-	return strings.Join(promptParts, " "), outPath
+	return strings.Join(promptParts, " "), outPath, guidanceScale
 }

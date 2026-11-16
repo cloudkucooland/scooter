@@ -194,6 +194,36 @@ func (fi *FlexibleInt) UnmarshalJSON(data []byte) error {
 	return nil
 }
 
+type FlexibleFloat float64
+
+func (ff *FlexibleFloat) UnmarshalJSON(data []byte) error {
+	data = bytes.TrimSpace(data)
+	if len(data) == 0 || bytes.Equal(data, []byte("null")) {
+		*ff = 0
+		return nil
+	}
+	if data[0] == '"' {
+		var s string
+		if err := json.Unmarshal(data, &s); err != nil {
+			return err
+		}
+		s = strings.TrimSpace(s)
+		s = strings.TrimSuffix(s, "%")
+		var val float64
+		if _, err := fmt.Sscanf(s, "%f", &val); err != nil {
+			return fmt.Errorf("invalid float: %q", s)
+		}
+		*ff = FlexibleFloat(val)
+		return nil
+	}
+	var val float64
+	if err := json.Unmarshal(data, &val); err != nil {
+		return err
+	}
+	*ff = FlexibleFloat(val)
+	return nil
+}
+
 func validatePath(path string) (string, error) {
 	baseDir := workingDir
 	if baseDir == "" {
