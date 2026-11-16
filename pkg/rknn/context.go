@@ -7,7 +7,6 @@ import (
 	"unsafe"
 
 	"codeberg.org/indievisible/scooter/pkg/npu"
-	// "github.com/ebitengine/purego"
 )
 
 type RKNNContext struct {
@@ -112,14 +111,6 @@ func (c *RKNNContext) RunFloat32Indices(inputs []Input, outputIndices []int) ([]
 		if idx < 0 || idx >= len(outputAttrs) {
 			return nil, fmt.Errorf("output index %d out of range (0-%d)", idx, len(outputAttrs)-1)
 		}
-		attr := outputAttrs[idx]
-		nElems := int(attr.NElems)
-		if nElems == 0 {
-			nElems = int(attr.Size) / 4
-			if nElems == 0 {
-				nElems = 77 * 1280
-			}
-		}
 		out := &Output{
 			WantFloat:  1,
 			IsPrealloc: 0,
@@ -133,11 +124,17 @@ func (c *RKNNContext) RunFloat32Indices(inputs []Input, outputIndices []int) ([]
 			callRKNNOutputsRelease(c.handle, 1, out)
 			return nil, fmt.Errorf("rknn_outputs_get returned empty buffer for index %d", idx)
 		}
-		count := int(out.Size) / 4
+		if out.Size%4 != 0 {
+			callRKNNOutputsRelease(c.handle, 1, out)
+			return nil, fmt.Errorf("rknn_outputs_get returned %d bytes for index %d; float32 output size must be divisible by 4", out.Size, idx)
+		}
+		count := int(out.Size / 4)
 		src := unsafe.Slice((*float32)(out.Buf), count)
 		goSlice := make([]float32, count)
 		copy(goSlice, src)
-		callRKNNOutputsRelease(c.handle, 1, out)
+		if ret := callRKNNOutputsRelease(c.handle, 1, out); ret != 0 {
+			return nil, fmt.Errorf("rknn_outputs_release failed for index %d: %d", idx, ret)
+		}
 		results[i] = goSlice
 	}
 	return results, nil
@@ -216,30 +213,3 @@ func stringToBytePtr(s string) (*byte, []byte) {
 	b := append([]byte(s), 0)
 	return &b[0], b
 }
-
-/*
-//go:noinline
-func callRKNNOutputsGet(handle Context, nOutputs uint32, out *Output) int32 {
-	r1, _, _ := purego.SyscallN(
-		rknnOutputsGetSym,
-		uintptr(handle),
-		uintptr(nOutputs),
-		uintptr(unsafe.Pointer(out)),
-		0,
-	)
-	runtime.KeepAlive(out)
-	return int32(r1)
-}
-
-//go:noinline
-func callRKNNOutputsRelease(handle Context, nOutputs uint32, out *Output) int32 {
-	r1, _, _ := purego.SyscallN(
-		rknnOutputsReleaseSym,
-		uintptr(handle),
-		uintptr(nOutputs),
-		uintptr(unsafe.Pointer(out)),
-	)
-	runtime.KeepAlive(out)
-	return int32(r1)
-}
-*/

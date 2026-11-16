@@ -6,9 +6,10 @@ import (
 	"fmt"
 	"math"
 	"os"
-	"regexp"
 	"strings"
 	"sync"
+
+	"github.com/dlclark/regexp2/v2"
 )
 
 const (
@@ -17,8 +18,8 @@ const (
 	clipEOSID     int32 = 49407 // <|endoftext|>
 )
 
-// CLIP's pre-tokenization regex (equivalent to OpenAI's pat without negative lookahead)
-var clipTokenPat = regexp.MustCompile(`(?i)<\|startoftext\|>|<\|endoftext\|>|'s|'t|'re|'ve|'m|'ll|'d|[\p{L}]+|[\p{N}]|[^\s\p{L}\p{N}]+`)
+// clipTokenPat matches OpenAI CLIP's whitespace-aware pre-tokenization pattern.
+var clipTokenPat = regexp2.MustCompile(`(?i)<\|startoftext\|>|<\|endoftext\|>|'s|'t|'re|'ve|'m|'ll|'d| ?\p{L}+| ?\p{N}| ?[^\s\p{L}\p{N}]+|\s+(?!\S)|\s+`)
 
 type Tokenizer struct {
 	vocab       map[string]int32
@@ -86,18 +87,19 @@ func NewTokenizer(vocabPath, mergesPath string) (*Tokenizer, error) {
 }
 
 // Encode produces a 77-token slice padded with EOS (49407) for text_encoder 1.
-func (t *Tokenizer) Encode(text string) ([]int32, error) {
-	return t.encodeWithPad(text, clipEOSID), nil
+func (t *Tokenizer) Encode(text string) []int32 {
+	return t.encodeWithPad(text, clipEOSID)
 }
 
 // EncodeDual produces both 77-token inputs required by SDXL / LCM-SSD-1B:
 // ids1 pads with 49407 (CLIP-ViT-L), ids2 pads with 0 (OpenCLIP-ViT-bigG).
-func (t *Tokenizer) EncodeDual(text string) (ids1 []int32, ids2 []int32, err error) {
-	return t.encodeWithPad(text, clipEOSID), t.encodeWithPad(text, 0), nil
+func (t *Tokenizer) EncodeDual(text string) (ids1, ids2 []int32) {
+	return t.encodeWithPad(text, clipEOSID), t.encodeWithPad(text, 0)
 }
 
 func (t *Tokenizer) encodeWithPad(text string, padID int32) []int32 {
-	// Normalize whitespace and lowercase per CLIPTokenizer
+	// CLIP lowercases and collapses whitespace before pre-tokenization. The
+	// pre-tokenization pattern attaches interior spaces to the following token.
 	cleaned := strings.ToLower(strings.Join(strings.Fields(text), " "))
 
 	tokens := make([]int32, clipMaxLength)
@@ -107,8 +109,9 @@ func (t *Tokenizer) encodeWithPad(text string, padID int32) []int32 {
 	tokens[0] = clipBOSID
 
 	pos := 1
-	matches := clipTokenPat.FindAllString(cleaned, -1)
-	for _, m := range matches {
+	match, _ := clipTokenPat.FindStringMatch(cleaned)
+	for match != nil {
+		m := match.String()
 		if pos >= clipMaxLength-1 {
 			break
 		}
@@ -129,6 +132,7 @@ func (t *Tokenizer) encodeWithPad(text string, padID int32) []int32 {
 			}
 			pos++
 		}
+		match, _ = clipTokenPat.FindNextMatch(match)
 	}
 
 	// Place EOS token immediately after the last prompt token

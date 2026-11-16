@@ -50,10 +50,29 @@ func LoadPipeline(modelDir string, tok *Tokenizer, steps int) (*Pipeline, error)
 		VAEScale:      sdxlVAEScaleFactor,
 	}
 
-	// Detect SD 1.5 vs SDXL by checking for text_encoder_2/model.rknn
-	if _, err := os.Stat(filepath.Join(modelDir, "text_encoder_2", "model.rknn")); os.IsNotExist(err) {
+	// Detect SD 1.5 vs SDXL by checking for text_encoder_2/model.rknn.
+	textEncoder2Path := filepath.Join(modelDir, "text_encoder_2", "model.rknn")
+	if _, err := os.Stat(textEncoder2Path); err != nil {
+		if !os.IsNotExist(err) {
+			return nil, fmt.Errorf("stat SDXL text encoder model %s: %w", textEncoder2Path, err)
+		}
 		p.IsSD15 = true
 		p.VAEScale = sd15VAEScaleFactor
+	}
+
+	requiredSubmodels := []string{"text_encoder", "unet", "vae_decoder"}
+	if !p.IsSD15 {
+		requiredSubmodels = append(requiredSubmodels, "text_encoder_2")
+	}
+	for _, submodel := range requiredSubmodels {
+		path := filepath.Join(modelDir, submodel, "model.rknn")
+		info, err := os.Stat(path)
+		if err != nil {
+			return nil, fmt.Errorf("stat required %s model %s: %w", submodel, path, err)
+		}
+		if info.IsDir() {
+			return nil, fmt.Errorf("required %s model path is a directory: %s", submodel, path)
+		}
 	}
 
 	// Probe UNet input resolution, layout, and input/output counts
@@ -137,20 +156,14 @@ func (p *Pipeline) GenerateWithContext(ctx context.Context, prompt string, seed 
 
 func (p *Pipeline) GenerateWithNegative(ctx context.Context, prompt, negativePrompt string, seed int64, progressFn func(step, total int)) (*image.RGBA, error) {
 	if p.IsSD15 {
-		ids, _, err := p.Tok.EncodeDual(prompt)
-		if err != nil {
-			return nil, fmt.Errorf("tokenization failed: %w", err)
-		}
+		ids, _ := p.Tok.EncodeDual(prompt)
 		condEmbeds, err := p.encodeSingleText(ids)
 		if err != nil {
 			return nil, fmt.Errorf("text encoding failed: %w", err)
 		}
 		var uncondEmbeds []float32
 		if p.UseCFG {
-			uncondIDs, _, err := p.Tok.EncodeDual(negativePrompt)
-			if err != nil {
-				return nil, fmt.Errorf("uncond tokenization failed: %w", err)
-			}
+			uncondIDs, _ := p.Tok.EncodeDual(negativePrompt)
 			uncondEmbeds, err = p.encodeSingleText(uncondIDs)
 			if err != nil {
 				return nil, fmt.Errorf("uncond text encoding failed: %w", err)
@@ -167,10 +180,7 @@ func (p *Pipeline) GenerateWithNegative(ctx context.Context, prompt, negativePro
 		return img, nil
 	}
 
-	ids1, ids2, err := p.Tok.EncodeDual(prompt)
-	if err != nil {
-		return nil, fmt.Errorf("tokenization failed: %w", err)
-	}
+	ids1, ids2 := p.Tok.EncodeDual(prompt)
 
 	promptEmbeds, pooledEmbeds, err := p.encodeDualText(ids1, ids2)
 	if err != nil {
@@ -365,15 +375,6 @@ func (p *Pipeline) runDiffusionSD15(ctx context.Context, condEmbeds, uncondEmbed
 	runUNetStep := func(sample []float32, timestep int, embeds []float32) ([]float32, error) {
 		inputs := make([]Input, len(inputsAttr))
 
-		// Input 0: sample [1, 4, H/8, W/8] in NCHW float32 (librknnrt converts to NHWC/FP16 when PassThrough=0)
-		/* inputs[0] = Input{
-			Index:       0,
-			Buf:         unsafe.Pointer(&sample[0]),
-			Size:        uint32(len(sample) * 4),
-			PassThrough: 0,
-			Type:        RKNN_TENSOR_FLOAT32,
-			Fmt:         RKNN_TENSOR_NCHW,
-		} */
 		inSample := sample
 		inFmt := RKNN_TENSOR_NCHW
 		if p.UNetInIsNHWC {

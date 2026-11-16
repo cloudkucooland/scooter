@@ -72,20 +72,28 @@ func TestCLIPTokenizer(t *testing.T) {
 		t.Fatalf("NewTokenizer failed: %v", err)
 	}
 
-	ids1, ids2, err := tok.EncodeDual("a photo of a cat")
-	if err != nil {
-		t.Fatalf("EncodeDual failed: %v", err)
+	fixtures := []struct {
+		text string
+		want []int32
+	}{
+		{"a photo of a cat", []int32{49406, 320, 220, 1125, 220, 539, 220, 320, 220, 2368, 49407}},
+		{"I'm testing, isn't it?", []int32{49406, 328, 880, 220, 4967, 267, 220, 2923, 713, 220, 585, 286}},
+		{"Café — 東京!", []int32{49406, 15304, 220, 2005, 220, 48338, 21078, 361, 256, 49407}},
 	}
-
-	wantPrefix := []int32{49406, 320, 1125, 539, 320, 2368, 49407}
-	for i, want := range wantPrefix {
-		if ids1[i] != want {
-			t.Errorf("ids1[%d] = %d, want %d", i, ids1[i], want)
-		}
-		if ids2[i] != want {
-			t.Errorf("ids2[%d] = %d, want %d", i, ids2[i], want)
-		}
+	for _, fixture := range fixtures {
+		t.Run(fixture.text, func(t *testing.T) {
+			ids1, ids2 := tok.EncodeDual(fixture.text)
+			for i, want := range fixture.want {
+				if ids1[i] != want {
+					t.Errorf("ids1[%d] = %d, want %d", i, ids1[i], want)
+				}
+				if ids2[i] != want {
+					t.Errorf("ids2[%d] = %d, want %d", i, ids2[i], want)
+				}
+			}
+		})
 	}
+	ids1, ids2 := tok.EncodeDual("a photo of a cat")
 	if ids1[76] != 49407 {
 		t.Errorf("ids1[76] pad = %d, want 49407", ids1[76])
 	}
