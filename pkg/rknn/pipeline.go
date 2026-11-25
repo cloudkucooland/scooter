@@ -367,13 +367,8 @@ func (p *Pipeline) runDiffusionSD15(ctx context.Context, condEmbeds, uncondEmbed
 
 	guidanceScale := p.GuidanceScale
 	if guidanceScale == 0 {
-		if p.UseCFG {
-			guidanceScale = 7.5
-		} else {
-			guidanceScale = 1.5
-		}
+		guidanceScale = 7.5
 	}
-	timestepCond := getGuidanceScaleEmbedding(guidanceScale)
 
 	runUNetStep := func(sample []float32, timestep int, embeds []float32) ([]float32, error) {
 		inputs := make([]Input, len(inputsAttr))
@@ -444,18 +439,6 @@ func (p *Pipeline) runDiffusionSD15(ctx context.Context, condEmbeds, uncondEmbed
 			}
 		}
 
-		// Input 3 (LCM only): timestep_cond [1, 256]
-		if len(inputsAttr) > 3 && len(timestepCond) > 0 {
-			inputs[3] = Input{
-				Index:       3,
-				Buf:         unsafe.Pointer(&timestepCond[0]),
-				Size:        uint32(len(timestepCond) * 4),
-				PassThrough: 0,
-				Type:        RKNN_TENSOR_FLOAT32,
-				Fmt:         RKNN_TENSOR_UNDEFINED,
-			}
-		}
-
 		npu.Lock()
 		defer npu.Unlock()
 
@@ -465,7 +448,6 @@ func (p *Pipeline) runDiffusionSD15(ctx context.Context, condEmbeds, uncondEmbed
 		runtime.KeepAlive(inSample)
 		runtime.KeepAlive(sample)
 		runtime.KeepAlive(embeds)
-		runtime.KeepAlive(timestepCond)
 		runtime.KeepAlive(t64)
 		runtime.KeepAlive(t32)
 		runtime.KeepAlive(tf32)
@@ -507,26 +489,17 @@ func (p *Pipeline) runDiffusionSD15(ctx context.Context, condEmbeds, uncondEmbed
 		}
 		scaledLatents := p.Sched.ScaleModelInput(latents, timestep)
 
-		var noisePred []float32
-		if p.UseCFG {
-			noiseUncond, err := runUNetStep(scaledLatents, timestep, uncondEmbeds)
-			if err != nil {
-				return nil, fmt.Errorf("uncond step: %w", err)
-			}
-			noiseCond, err := runUNetStep(scaledLatents, timestep, condEmbeds)
-			if err != nil {
-				return nil, fmt.Errorf("cond step: %w", err)
-			}
-			noisePred = make([]float32, len(noiseCond))
-			for i := range noisePred {
-				noisePred[i] = noiseUncond[i] + guidanceScale*(noiseCond[i]-noiseUncond[i])
-			}
-		} else {
-			var err error
-			noisePred, err = runUNetStep(scaledLatents, timestep, condEmbeds)
-			if err != nil {
-				return nil, err
-			}
+		noiseUncond, err := runUNetStep(scaledLatents, timestep, uncondEmbeds)
+		if err != nil {
+			return nil, fmt.Errorf("uncond step: %w", err)
+		}
+		noiseCond, err := runUNetStep(scaledLatents, timestep, condEmbeds)
+		if err != nil {
+			return nil, fmt.Errorf("cond step: %w", err)
+		}
+		noisePred := make([]float32, len(noiseCond))
+		for i := range noisePred {
+			noisePred[i] = noiseUncond[i] + guidanceScale*(noiseCond[i]-noiseUncond[i])
 		}
 
 		latents = p.Sched.Step(noisePred, timestep, latents)
@@ -601,7 +574,12 @@ func (p *Pipeline) runDiffusionSD15LCM(ctx context.Context, unet *RKNNContext, i
 	for i := range latents {
 		latents[i] = float32(rng.NormFloat64()) * initSigma
 	}
-	timestepCond := getGuidanceScaleEmbedding(p.GuidanceScale)
+
+	guidanceScale := p.GuidanceScale
+	if guidanceScale == 0 {
+		guidanceScale = 1.5
+	}
+	timestepCond := getGuidanceScaleEmbedding(guidanceScale)
 
 	for {
 		if err := ctx.Err(); err != nil {
@@ -645,6 +623,9 @@ func (p *Pipeline) runDiffusionSD15LCM(ctx context.Context, unet *RKNNContext, i
 		}
 		if err != nil {
 			return nil, err
+		}
+		if outputsAttr[0].Fmt == RKNN_TENSOR_NHWC {
+			modelOutput = nhwcToNCHW4(modelOutput, latentH, latentW)
 		}
 		latents = p.Sched.Step(modelOutput, timestep, latents)
 	}
@@ -805,6 +786,9 @@ func (p *Pipeline) runDiffusionSDXL(ctx context.Context, promptEmbeds, pooledEmb
 			cSlice := unsafe.Slice((*float32)(outputMems[0].VirtAddr), nElems)
 			outData = make([]float32, nElems)
 			copy(outData, cSlice)
+		}
+		if outputsAttr[0].Fmt == RKNN_TENSOR_NHWC {
+			outData = nhwcToNCHW4(outData, latentH, latentW)
 		}
 
 		latents = p.Sched.Step(outData, timestep, latents)
@@ -1049,6 +1033,22 @@ func nchwToNHWC4(nchw []float32, h, w int) []float32 {
 	return nhwc
 }
 
+func nhwcToNCHW4(nhwc []float32, h, w int) []float32 {
+	nchw := make([]float32, len(nhwc))
+	plane := h * w
+	for y := 0; y < h; y++ {
+		for x := 0; x < w; x++ {
+			hw := y*w + x
+			src := hw * 4
+			nchw[0*plane+hw] = nhwc[src+0]
+			nchw[1*plane+hw] = nhwc[src+1]
+			nchw[2*plane+hw] = nhwc[src+2]
+			nchw[3*plane+hw] = nhwc[src+3]
+		}
+	}
+	return nchw
+}
+
 func copyTensorFloat32ToMem(mem *TensorMem, attr TensorAttr, src []float32) {
 	if len(src) == 0 || mem.VirtAddr == nil {
 		return
@@ -1085,3 +1085,4 @@ func float32ToFloat16(f float32) uint16 {
 	}
 	return sign | uint16(exp<<10) | uint16((mant+0x1000)>>13)
 }
+

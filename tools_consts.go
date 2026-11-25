@@ -717,6 +717,7 @@ func getImageTools() []Tool {
 
 type GenerateImageArgs struct {
 	Prompt        string        `json:"prompt"`
+	Model         string        `json:"model,omitempty"`
 	OutputPath    string        `json:"output_path,omitempty"`
 	Steps         FlexibleInt   `json:"steps,omitempty"`
 	Seed          int64         `json:"seed,omitempty"`

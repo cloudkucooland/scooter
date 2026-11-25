@@ -623,7 +623,7 @@ func dispatchToolCall(name string, rawArgs json.RawMessage) string {
 		if strings.TrimSpace(args.Prompt) == "" {
 			return "System Error: prompt is required"
 		}
-		summary, elapsed, err := generateImageFile(args.Prompt, "", args.OutputPath, int(args.Steps), args.Seed, float32(args.GuidanceScale))
+		summary, elapsed, err := generateImageFileForModel(args.Model, args.Prompt, "", args.OutputPath, int(args.Steps), args.Seed, float32(args.GuidanceScale))
 		if err != nil {
 			return fmt.Sprintf("Image Generation Error: %v", err)
 		}

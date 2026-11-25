@@ -23,6 +23,9 @@ func TestConfigDefaults(t *testing.T) {
 	if cfg.DefaultModel != "qwen3-4b" {
 		t.Fatalf("expected DefaultModel 'qwen3-4b', got %q", cfg.DefaultModel)
 	}
+	if cfg.DefaultRKNNModel != "lcm-ssd-1b-rknn" {
+		t.Fatalf("expected DefaultRKNNModel 'lcm-ssd-1b-rknn', got %q", cfg.DefaultRKNNModel)
+	}
 }
 
 func TestConfigCustomFile(t *testing.T) {

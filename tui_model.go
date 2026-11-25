@@ -30,6 +30,7 @@ type model struct {
 	viewport            viewport.Model
 	textarea            textarea.Model
 	modelName           string
+	rknnModel           string
 	contextLen          int
 	chatHistory         []Message
 	isStreaming         bool
@@ -105,6 +106,7 @@ func initialModel() model {
 		textarea:      ta,
 		viewport:      vp,
 		modelName:     modelName,
+		rknnModel:     getActiveRKNNModelPath(),
 		contextLen:    initialCtx,
 		chatHistory:   chatHist,
 		currentBuffer: &strings.Builder{},

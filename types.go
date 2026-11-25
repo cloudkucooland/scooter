@@ -22,6 +22,11 @@ type ModelsMessage struct {
 	Err    error
 }
 
+type RKNNModelsMessage struct {
+	Models []string
+	Err    error
+}
+
 type ToolsetsMessage struct {
 	Toolsets []string
 	Err      error

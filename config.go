@@ -7,6 +7,8 @@ import (
 	"strings"
 	"sync"
 	"time"
+
+	"codeberg.org/indievisible/scooter/pkg/rknn"
 )
 
 type Config struct {
@@ -21,6 +23,7 @@ type Config struct {
 	RKLLMLib             string `json:"rkllm_lib"`
 	RKLLMCacheEnabled    bool   `json:"rkllm_cache_enabled"`
 	RKLLMCachePath       string `json:"rkllm_cache_path"`
+	DefaultRKNNModel     string `json:"default_rknn_model"`
 	RKNNModelsDir        string `json:"rknn_models_dir"`
 	RKNNLib              string `json:"rknn_lib"`
 	MaxGrepFileSize      int64  `json:"max_grep_file_size"`
@@ -41,6 +44,7 @@ var (
 		DefaultModel:         "qwen3-4b",
 		RKLLMLib:             "librkllmrt.so",
 		RKLLMCacheEnabled:    true,
+		DefaultRKNNModel:     "lcm-ssd-1b-rknn",
 		RKNNLib:              "/usr/lib/librknnrt.so",
 		MaxGrepFileSize:      2 * 1024 * 1024,
 		MaxShellOutputSize:   64 * 1024,
@@ -220,6 +224,45 @@ func saveConfig(cfg Config) error {
 		cachedModTime = info.ModTime()
 	}
 	return nil
+}
+
+func init() {
+	rknn.GetConfigRKNNModelsDir = func() string {
+		return loadConfig().RKNNModelsDir
+	}
+}
+
+var (
+	activeRKNNModelMu sync.RWMutex
+	activeRKNNModel   string
+)
+
+func getActiveRKNNModel() string {
+	activeRKNNModelMu.RLock()
+	defer activeRKNNModelMu.RUnlock()
+	if activeRKNNModel != "" {
+		return activeRKNNModel
+	}
+	if env := strings.TrimSpace(os.Getenv("SCOOTER_RKNN_MODEL")); env != "" {
+		return env
+	}
+	if env := strings.TrimSpace(os.Getenv("RKNN_MODEL")); env != "" {
+		return env
+	}
+	if def := strings.TrimSpace(loadConfig().DefaultRKNNModel); def != "" {
+		return def
+	}
+	return "lcm-ssd-1b-rknn"
+}
+
+func setActiveRKNNModel(m string) {
+	activeRKNNModelMu.Lock()
+	defer activeRKNNModelMu.Unlock()
+	activeRKNNModel = m
+}
+
+func getActiveRKNNModelPath() string {
+	return rknn.GetRKNNModelPath(getActiveRKNNModel())
 }
 
 func getRKNNModelsDir() string {

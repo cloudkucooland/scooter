@@ -45,7 +45,21 @@ func generateImageFile(prompt, negativePrompt, outputPath string, steps int, see
 	return generateImageFileWithContext(context.Background(), prompt, negativePrompt, outputPath, steps, seed, guidanceScale, nil)
 }
 
+func generateImageFileForModel(modelName, prompt, negativePrompt, outputPath string, steps int, seed int64, guidanceScale float32) (string, time.Duration, error) {
+	targetModel := strings.TrimSpace(modelName)
+	if targetModel == "" {
+		targetModel = getActiveRKNNModelPath()
+	} else {
+		targetModel = rknn.GetRKNNModelPath(targetModel)
+	}
+	return generateImageFileWithModelAndContext(context.Background(), targetModel, prompt, negativePrompt, outputPath, steps, seed, guidanceScale, nil)
+}
+
 func generateImageFileWithContext(ctx context.Context, prompt, negativePrompt, outputPath string, steps int, seed int64, guidanceScale float32, progressFn func(step, total int)) (string, time.Duration, error) {
+	return generateImageFileWithModelAndContext(ctx, getActiveRKNNModelPath(), prompt, negativePrompt, outputPath, steps, seed, guidanceScale, progressFn)
+}
+
+func generateImageFileWithModelAndContext(ctx context.Context, modelDir, prompt, negativePrompt, outputPath string, steps int, seed int64, guidanceScale float32, progressFn func(step, total int)) (string, time.Duration, error) {
 	prompt = strings.TrimSpace(prompt)
 	if prompt == "" {
 		return "", 0, fmt.Errorf("prompt is required")
@@ -75,7 +89,11 @@ func generateImageFileWithContext(ctx context.Context, prompt, negativePrompt, o
 	}
 
 	syncRKNNEnv()
-	modelDir := getRKNNModelsDir()
+	if strings.TrimSpace(modelDir) == "" {
+		modelDir = getActiveRKNNModelPath()
+	} else {
+		modelDir = rknn.GetRKNNModelPath(modelDir)
+	}
 	tok, err := getCLIPTokenizer(modelDir)
 	if err != nil {
 		return "", 0, fmt.Errorf("load CLIP tokenizer from %s: %w", modelDir, err)

@@ -6,11 +6,13 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"time"
 
 	"codeberg.org/indievisible/scooter/pkg/knowledge"
 	"codeberg.org/indievisible/scooter/pkg/rkllm"
+	"codeberg.org/indievisible/scooter/pkg/rknn"
 	"github.com/charmbracelet/bubbles/textarea"
 	tea "github.com/charmbracelet/bubbletea"
 )
@@ -112,8 +114,32 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				}
 				models := rkllm.ListRKLLMModels()
 				for _, mdl := range models {
+					if strings.HasPrefix(mdl, "No ") {
+						continue
+					}
 					if query == "" || strings.Contains(strings.ToLower(mdl), strings.ToLower(query)) {
 						m.textarea.SetValue("/model " + mdl)
+						m.textarea.CursorEnd()
+						return m, nil
+					}
+				}
+			} else if (strings.HasPrefix(lowerVal, "/rknnmodel") || strings.HasPrefix(lowerVal, "/rknn-model")) &&
+				!strings.HasPrefix(lowerVal, "/rknnmodels") && !strings.HasPrefix(lowerVal, "/rknn-models") {
+				query := ""
+				prefix := "/rknnmodel "
+				if strings.HasPrefix(lowerVal, "/rknn-model ") {
+					prefix = "/rknn-model "
+					query = strings.TrimSpace(val[len("/rknn-model "):])
+				} else if strings.HasPrefix(lowerVal, "/rknnmodel ") {
+					query = strings.TrimSpace(val[len("/rknnmodel "):])
+				}
+				models := rknn.ListRKNNModels()
+				for _, mdl := range models {
+					if strings.HasPrefix(mdl, "No ") {
+						continue
+					}
+					if query == "" || strings.Contains(strings.ToLower(mdl), strings.ToLower(query)) {
+						m.textarea.SetValue(prefix + mdl)
 						m.textarea.CursorEnd()
 						return m, nil
 					}
@@ -297,6 +323,15 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.refreshViewport()
 		return m, nil
 
+	case RKNNModelsMessage:
+		if msg.Err != nil {
+			m.chatHistory = append(m.chatHistory, Message{Role: "system", Content: "RKNN Models Error: " + msg.Err.Error()})
+		} else {
+			m.chatHistory = append(m.chatHistory, Message{Role: "system", Content: "Available RKNN Models:\n" + strings.Join(msg.Models, "\n")})
+		}
+		m.refreshViewport()
+		return m, nil
+
 	case ToolsetsMessage:
 		if msg.Err != nil {
 			m.chatHistory = append(m.chatHistory, Message{Role: "system", Content: "Toolsets Error: " + msg.Err.Error()})
@@ -370,6 +405,8 @@ func (m *model) handleCommand(input string) tea.Cmd {
 - /help: Show this help message
 - /models: List available RKLLM models
 - /model <name>: Switch active RKLLM model
+- /rknnmodels: List available RKNN models
+- /rknnmodel <name>: Switch active RKNN model
 - /toolsets: List available toolsets
 - /toolset <name>: Switch active toolset (development, research, web, image, all)
 - /context [size]: View or change context limit (e.g. /context 8k, /context 16384)
@@ -380,7 +417,7 @@ func (m *model) handleCommand(input string) tea.Cmd {
 - /enablecache: Enable prompt caching for the next request
 - /file <path>: Load a local file into the conversation
 - /status: Check RKLLM backend status
-- /imagine: Generate an image locally (--out <file.png>)
+- /imagine [--out FILE.png] [--steps N] [--seed N] [--guidance SCALE] [--negative "TEXT|none"] <prompt>
 - /quit: Exit Scooter
 - !<command>: Execute a shell command directly (e.g. !ls, !/bin/ls)
 - [Esc]: Abort generation or cancel pending tool confirmation`
@@ -425,6 +462,10 @@ func (m *model) handleCommand(input string) tea.Cmd {
 		return listModelsCmd()
 	}
 
+	if strings.HasPrefix(input, "/rknnmodels") || strings.HasPrefix(input, "/rknn-models") {
+		return listRKNNModelsCmd()
+	}
+
 	if strings.HasPrefix(input, "/toolsets") {
 		return listToolsetsCmd()
 	}
@@ -446,6 +487,27 @@ func (m *model) handleCommand(input string) tea.Cmd {
 		})
 		m.refreshViewport()
 		return nil
+	}
+
+	if strings.HasPrefix(input, "/rknnmodel ") || strings.HasPrefix(input, "/rknn-model ") {
+		prefix := "/rknnmodel "
+		if strings.HasPrefix(input, "/rknn-model ") {
+			prefix = "/rknn-model "
+		}
+		newModel := strings.TrimSpace(strings.TrimPrefix(input, prefix))
+		resolved := rknn.GetRKNNModelPath(newModel)
+		m.rknnModel = resolved
+		setActiveRKNNModel(resolved)
+		m.chatHistory = append(m.chatHistory, Message{
+			Role:    "system",
+			Content: fmt.Sprintf("Switched RKNN model to %s", resolved),
+		})
+		m.refreshViewport()
+		return nil
+	}
+
+	if input == "/rknnmodel" || input == "/rknn-model" {
+		return listRKNNModelsCmd()
 	}
 
 	if strings.HasPrefix(input, "/toolset ") {
@@ -609,11 +671,16 @@ func (m *model) handleCommand(input string) tea.Cmd {
 		if raw == input {
 			raw = strings.TrimPrefix(input, "/image")
 		}
-		prompt, outPath, guidanceScale := parseImagineCommandArgs(strings.TrimSpace(raw))
+		prompt, outPath, steps, seed, guidanceScale, negativePrompt, parseErr := parseImagineCommandArgs(strings.TrimSpace(raw))
+		if parseErr != nil {
+			m.chatHistory = append(m.chatHistory, Message{Role: "system", Content: parseErr.Error()})
+			m.refreshViewport()
+			return nil
+		}
 		if prompt == "" {
 			m.chatHistory = append(m.chatHistory, Message{
 				Role:    "system",
-				Content: "Usage: /imagine [--out filename.png] [--guidance 1.5] <prompt>",
+				Content: "Usage: /imagine [--out FILE.png] [--steps 4] [--seed 123] [--guidance 1.5] [--negative \"TEXT|none\"] <prompt>",
 			})
 			m.refreshViewport()
 			return nil
@@ -623,7 +690,7 @@ func (m *model) handleCommand(input string) tea.Cmd {
 		m.saveMessage(userMsg)
 		m.isGeneratingImage = true
 		m.refreshViewport()
-		return imagineCmd(prompt, "", outPath, 4, 0, guidanceScale)
+		return imagineCmd(prompt, negativePrompt, outPath, steps, seed, guidanceScale)
 	}
 
 	userMsg := Message{Role: "user", Content: input}
@@ -749,24 +816,92 @@ func removePromptCacheFiles() {
 	}
 }
 
-func parseImagineCommandArgs(raw string) (prompt, outPath string, guidanceScale float32) {
-	fields := strings.Fields(raw)
+func parseImagineCommandArgs(raw string) (prompt, outPath string, steps int, seed int64, guidanceScale float32, negativePrompt string, err error) {
+	steps = 4
 	var promptParts []string
-	for i := 0; i < len(fields); i++ {
-		if (fields[i] == "--out" || fields[i] == "-o") && i+1 < len(fields) {
-			outPath = fields[i+1]
-			i++
-			continue
+	for len(raw) > 0 {
+		raw = strings.TrimSpace(raw)
+		if raw == "" {
+			break
 		}
-		if (fields[i] == "--guidance" || fields[i] == "-g" || fields[i] == "--guidance-scale") && i+1 < len(fields) {
-			var g float32
-			if _, err := fmt.Sscanf(fields[i+1], "%f", &g); err == nil {
-				guidanceScale = g
+		if raw[0] == '\'' || raw[0] == '"' {
+			value, rest, ok := consumeQuotedArg(raw)
+			if !ok {
+				return "", "", 4, 0, 0, "", fmt.Errorf("unterminated quote in /imagine arguments")
 			}
-			i++
+			promptParts = append(promptParts, value)
+			raw = rest
 			continue
 		}
-		promptParts = append(promptParts, fields[i])
+		field, rest := splitFirstField(raw)
+		raw = rest
+		switch field {
+		case "--out", "-o", "--steps", "-s", "--seed", "--guidance", "-g", "--guidance-scale", "--negative", "-n":
+			value, next, valueErr := consumeOptionValue(raw)
+			if valueErr != nil {
+				return "", "", 4, 0, 0, "", fmt.Errorf("%s", valueErr)
+			}
+			raw = next
+			switch field {
+			case "--out", "-o":
+				outPath = value
+			case "--steps", "-s":
+				steps, err = strconv.Atoi(value)
+				if err != nil {
+					return "", "", 4, 0, 0, "", fmt.Errorf("invalid --steps value %q", value)
+				}
+			case "--seed":
+				seed, err = strconv.ParseInt(value, 10, 64)
+				if err != nil {
+					return "", "", 4, 0, 0, "", fmt.Errorf("invalid --seed value %q", value)
+				}
+			case "--guidance", "-g", "--guidance-scale":
+				var parsed float64
+				parsed, err = strconv.ParseFloat(value, 32)
+				if err != nil {
+					return "", "", 4, 0, 0, "", fmt.Errorf("invalid --guidance value %q", value)
+				}
+				guidanceScale = float32(parsed)
+			case "--negative", "-n":
+				negativePrompt = value
+			}
+		default:
+			promptParts = append(promptParts, field)
+		}
 	}
-	return strings.Join(promptParts, " "), outPath, guidanceScale
+	return strings.Join(promptParts, " "), outPath, steps, seed, guidanceScale, negativePrompt, nil
+}
+
+func splitFirstField(raw string) (field, rest string) {
+	i := strings.IndexAny(raw, " \t\n\r")
+	if i < 0 {
+		return raw, ""
+	}
+	return raw[:i], raw[i:]
+}
+
+func consumeQuotedArg(raw string) (value, rest string, ok bool) {
+	quote := raw[0]
+	for i := 1; i < len(raw); i++ {
+		if raw[i] == quote && (i == 1 || raw[i-1] != '\\') {
+			return strings.ReplaceAll(raw[1:i], "\\"+string(quote), string(quote)), raw[i+1:], true
+		}
+	}
+	return "", "", false
+}
+
+func consumeOptionValue(raw string) (value, rest string, err error) {
+	raw = strings.TrimSpace(raw)
+	if raw == "" {
+		return "", "", fmt.Errorf("option requires a value")
+	}
+	if raw[0] == '\'' || raw[0] == '"' {
+		value, rest, ok := consumeQuotedArg(raw)
+		if !ok {
+			return "", "", fmt.Errorf("unterminated quoted option value")
+		}
+		return value, rest, nil
+	}
+	value, rest = splitFirstField(raw)
+	return value, rest, nil
 }

@@ -212,7 +212,10 @@ func TestImagineCommandInAvailableCommands(t *testing.T) {
 }
 
 func TestParseImagineCommandArgs(t *testing.T) {
-	prompt, outPath, guidance := parseImagineCommandArgs("a red scooter --out test.png --guidance 1.8")
+	prompt, outPath, steps, seed, guidance, negative, err := parseImagineCommandArgs(`a red scooter --out test.png --steps 7 --seed 42 --guidance 1.8 --negative "extra wheels"`)
+	if err != nil {
+		t.Fatal(err)
+	}
 	if prompt != "a red scooter" {
 		t.Errorf("expected prompt 'a red scooter', got %q", prompt)
 	}
@@ -221,5 +224,96 @@ func TestParseImagineCommandArgs(t *testing.T) {
 	}
 	if guidance != 1.8 {
 		t.Errorf("expected guidance 1.8, got %f", guidance)
+	}
+	if steps != 7 || seed != 42 || negative != "extra wheels" {
+		t.Errorf("expected steps=7 seed=42 negative='extra wheels', got steps=%d seed=%d negative=%q", steps, seed, negative)
+	}
+}
+
+func TestParseImagineNegativePromptAndPromptOrdering(t *testing.T) {
+	prompt, _, _, _, _, negative, err := parseImagineCommandArgs(`--negative "no text, no watermark" a red scooter --guidance 1.5`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if prompt != "a red scooter" || negative != "no text, no watermark" {
+		t.Fatalf("got prompt=%q negative=%q", prompt, negative)
+	}
+	prompt, _, _, _, _, negative, err = parseImagineCommandArgs(`--negative none a red scooter`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if prompt != "a red scooter" || negative != "none" {
+		t.Fatalf("got prompt=%q negative=%q", prompt, negative)
+	}
+}
+
+func TestParseImagineRejectsUnterminatedNegativePrompt(t *testing.T) {
+	_, _, _, _, _, _, err := parseImagineCommandArgs(`a red scooter --negative "no text`)
+	if err == nil {
+		t.Fatal("expected unterminated quote error")
+	}
+}
+
+func TestRKNNCommandsInAvailableCommands(t *testing.T) {
+	foundModels := false
+	foundModel := false
+	for _, c := range availableCommands {
+		if c.cmd == "/rknnmodels" {
+			foundModels = true
+		}
+		if c.cmd == "/rknnmodel" {
+			foundModel = true
+		}
+	}
+	if !foundModels {
+		t.Errorf("expected /rknnmodels in availableCommands")
+	}
+	if !foundModel {
+		t.Errorf("expected /rknnmodel in availableCommands")
+	}
+}
+
+func TestRKNNModelSwitchCommand(t *testing.T) {
+	m := model{
+		textarea:      textarea.New(),
+		viewport:      viewport.New(80, 24),
+		currentBuffer: &strings.Builder{},
+	}
+
+	cmd := m.handleCommand("/rknnmodel test-custom-rknn")
+	if cmd != nil {
+		t.Errorf("expected nil cmd for switching model, got %v", cmd)
+	}
+	if m.rknnModel != "test-custom-rknn" {
+		t.Errorf("expected m.rknnModel 'test-custom-rknn', got %q", m.rknnModel)
+	}
+	if getActiveRKNNModel() != "test-custom-rknn" {
+		t.Errorf("expected getActiveRKNNModel() 'test-custom-rknn', got %q", getActiveRKNNModel())
+	}
+	if len(m.chatHistory) == 0 {
+		t.Fatalf("expected system message in chatHistory after switching model")
+	}
+	lastMsg := m.chatHistory[len(m.chatHistory)-1]
+	if !strings.Contains(lastMsg.Content, "Switched RKNN model to test-custom-rknn") {
+		t.Errorf("unexpected system message content: %q", lastMsg.Content)
+	}
+
+	// Test /rknnmodels command returns a tea.Cmd
+	cmdModels := m.handleCommand("/rknnmodels")
+	if cmdModels == nil {
+		t.Errorf("expected non-nil cmd for /rknnmodels")
+	}
+}
+
+func TestRKNNModelAutocomplete(t *testing.T) {
+	m := model{
+		textarea: textarea.New(),
+		viewport: viewport.New(80, 24),
+	}
+
+	m.textarea.SetValue("/rknnmodel")
+	popup := m.renderAutocompletePopup()
+	if !strings.Contains(popup, "RKNN Models") {
+		t.Errorf("expected popup to contain 'RKNN Models', got %q", popup)
 	}
 }

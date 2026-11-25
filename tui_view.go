@@ -6,6 +6,7 @@ import (
 	"strings"
 
 	"codeberg.org/indievisible/scooter/pkg/rkllm"
+	"codeberg.org/indievisible/scooter/pkg/rknn"
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/charmbracelet/glamour"
 	"github.com/charmbracelet/lipgloss"
@@ -72,9 +73,11 @@ var availableCommands = []struct {
 	{"/help", "Show help message"},
 	{"/models", "List available RKLLM models"},
 	{"/model", "Switch active RKLLM model"},
+	{"/rknnmodels", "List available RKNN models"},
+	{"/rknnmodel", "Switch active RKNN model"},
 	{"/toolsets", "List available toolsets"},
 	{"/toolset", "Switch active toolset (dev, web, image, all)"},
-	{"/imagine", "Generate an image locally (--out <file.png>)"},
+	{"/imagine", "Generate an image (--out, --steps, --seed, --guidance, --negative)"},
 	{"/context", "View or change context size"},
 	{"/compress", "Manually compress conversation history"},
 	{"/clear", "Clear conversation history and cache"},
@@ -142,6 +145,78 @@ func (m model) renderAutocompletePopup() string {
 
 		var popupLines []string
 		popupLines = append(popupLines, lipgloss.NewStyle().Foreground(lipgloss.Color("205")).Bold(true).Render(" ── RKLLM Models ── "))
+		for _, match := range matches {
+			displayMatch := match
+			if filepath.IsAbs(match) {
+				displayMatch = filepath.Base(match) + " (" + match + ")"
+			}
+			line := fmt.Sprintf(" %s ", displayMatch)
+			popupLines = append(popupLines, lipgloss.NewStyle().Foreground(lipgloss.Color("252")).Render(line))
+		}
+
+		popupBoxStyle := lipgloss.NewStyle().
+			Border(lipgloss.RoundedBorder()).
+			BorderForeground(lipgloss.Color("63")).
+			Background(lipgloss.Color("235")).
+			Padding(0, 1)
+
+		return popupBoxStyle.Render(strings.Join(popupLines, "\n"))
+	}
+
+	if strings.HasPrefix(lowerVal, "/rknnmodels") || strings.HasPrefix(lowerVal, "/rknn-models") {
+		var matches []struct{ cmd, desc string }
+		for _, c := range availableCommands {
+			if strings.HasPrefix(strings.ToLower(c.cmd), lowerVal) {
+				matches = append(matches, c)
+			}
+		}
+		if len(matches) == 0 {
+			return ""
+		}
+		var popupLines []string
+		popupLines = append(popupLines, lipgloss.NewStyle().Foreground(lipgloss.Color("205")).Bold(true).Render(" ── Suggestions ── "))
+		for _, match := range matches {
+			line := fmt.Sprintf(" %-12s - %s ", match.cmd, match.desc)
+			popupLines = append(popupLines, lipgloss.NewStyle().Foreground(lipgloss.Color("252")).Render(line))
+		}
+		popupBoxStyle := lipgloss.NewStyle().
+			Border(lipgloss.RoundedBorder()).
+			BorderForeground(lipgloss.Color("63")).
+			Background(lipgloss.Color("235")).
+			Padding(0, 1)
+		return popupBoxStyle.Render(strings.Join(popupLines, "\n"))
+	}
+
+	if (strings.HasPrefix(lowerVal, "/rknnmodel") || strings.HasPrefix(lowerVal, "/rknn-model")) &&
+		!strings.HasPrefix(lowerVal, "/rknnmodels") && !strings.HasPrefix(lowerVal, "/rknn-models") {
+		query := ""
+		if strings.HasPrefix(lowerVal, "/rknnmodel ") {
+			query = strings.TrimSpace(val[len("/rknnmodel "):])
+		} else if strings.HasPrefix(lowerVal, "/rknn-model ") {
+			query = strings.TrimSpace(val[len("/rknn-model "):])
+		} else if strings.HasPrefix(lowerVal, "/rknn-model") && len(val) > len("/rknn-model") {
+			query = strings.TrimSpace(val[len("/rknn-model"):])
+		} else if len(val) > len("/rknnmodel") {
+			query = strings.TrimSpace(val[len("/rknnmodel"):])
+		}
+
+		models := rknn.ListRKNNModels()
+		var matches []string
+		for _, mdl := range models {
+			if strings.HasPrefix(mdl, "No ") {
+				continue
+			}
+			if query == "" || strings.Contains(strings.ToLower(mdl), strings.ToLower(query)) {
+				matches = append(matches, mdl)
+			}
+		}
+
+		if len(matches) == 0 {
+			matches = models
+		}
+
+		var popupLines []string
+		popupLines = append(popupLines, lipgloss.NewStyle().Foreground(lipgloss.Color("205")).Bold(true).Render(" ── RKNN Models ── "))
 		for _, match := range matches {
 			displayMatch := match
 			if filepath.IsAbs(match) {

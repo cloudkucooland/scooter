@@ -5,6 +5,7 @@ import (
 	"time"
 
 	"codeberg.org/indievisible/scooter/pkg/rkllm"
+	"codeberg.org/indievisible/scooter/pkg/rknn"
 	tea "github.com/charmbracelet/bubbletea"
 )
 
@@ -42,6 +43,13 @@ func listModelsCmd() tea.Cmd {
 	}
 }
 
+func listRKNNModelsCmd() tea.Cmd {
+	return func() tea.Msg {
+		models := rknn.ListRKNNModels()
+		return RKNNModelsMessage{Models: models}
+	}
+}
+
 func listToolsetsCmd() tea.Cmd {
 	return func() tea.Msg {
 		toolsets := listToolsetsNames()
@@ -51,8 +59,9 @@ func listToolsetsCmd() tea.Cmd {
 
 func statusCmd(modelName string) tea.Cmd {
 	return func() tea.Msg {
-		status := rkllm.CheckRKLLMStatus(modelName)
-		return StatusMessage{Status: status}
+		llmStatus := rkllm.CheckRKLLMStatus(modelName)
+		rknnStatus := rknn.CheckRKNNStatus(getActiveRKNNModel())
+		return StatusMessage{Status: llmStatus + "\n" + rknnStatus}
 	}
 }
 

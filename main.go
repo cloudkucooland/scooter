@@ -261,6 +261,11 @@ func main() {
 				Usage:   "RKLLM model path or name",
 			},
 			&cli.StringFlag{
+				Name:    "rknn-model",
+				Aliases: []string{"rknn"},
+				Usage:   "RKNN model path or directory",
+			},
+			&cli.StringFlag{
 				Name:    "prompt",
 				Aliases: []string{"p"},
 				Usage:   "Run a single prompt non-interactively and exit",
@@ -282,7 +287,7 @@ func main() {
 			},
 			&cli.StringFlag{
 				Name:    "imagine",
-				Aliases: []string{"g"},
+				Aliases: []string{"image", "g"},
 				Usage:   "Generate an image locally on the NPU from a text prompt and exit",
 			},
 			&cli.StringFlag{
@@ -293,7 +298,7 @@ func main() {
 			&cli.IntFlag{
 				Name:  "steps",
 				Value: 4,
-				Usage: "Number of LCM denoising steps for --imagine (1-12)",
+				Usage: "Number of denoising steps for --imagine (default 4, range 1-30)",
 			},
 			&cli.IntFlag{
 				Name:  "seed",
@@ -303,7 +308,7 @@ func main() {
 			&cli.Float64Flag{
 				Name:  "guidance",
 				Value: 0.0,
-				Usage: "Guidance scale for --imagine (1.0-2.0 for LCM, 1.0-15.0 for CFG/Euler, 0 = model default)",
+				Usage: "Guidance scale (default model value; LCM clamps to 1-2, CFG/Euler to 1-15)",
 			},
 			&cli.StringFlag{
 				Name:    "negative",
@@ -324,6 +329,11 @@ func main() {
 			toolset := resolveToolset(cmd.String("toolset"))
 			if err := SetActiveToolset(toolset); err != nil {
 				return err
+			}
+
+			rknnModel := cmd.String("rknn-model")
+			if rknnModel != "" {
+				setActiveRKNNModel(rknnModel)
 			}
 
 			ingestPath := cmd.String("ingest")
