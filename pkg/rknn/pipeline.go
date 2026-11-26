@@ -1085,4 +1085,3 @@ func float32ToFloat16(f float32) uint16 {
 	}
 	return sign | uint16(exp<<10) | uint16((mant+0x1000)>>13)
 }
-

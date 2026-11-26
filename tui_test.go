@@ -317,3 +317,84 @@ func TestRKNNModelAutocomplete(t *testing.T) {
 		t.Errorf("expected popup to contain 'RKNN Models', got %q", popup)
 	}
 }
+
+func TestVisionModelCommandsInAvailableCommands(t *testing.T) {
+	foundModels := false
+	foundModel := false
+	for _, c := range availableCommands {
+		if c.cmd == "/visionmodels" {
+			foundModels = true
+		}
+		if c.cmd == "/visionmodel" {
+			foundModel = true
+		}
+	}
+	if !foundModels {
+		t.Errorf("expected /visionmodels in availableCommands")
+	}
+	if !foundModel {
+		t.Errorf("expected /visionmodel in availableCommands")
+	}
+}
+
+func TestVisionModelSwitchCommand(t *testing.T) {
+	m := model{
+		textarea:      textarea.New(),
+		viewport:      viewport.New(80, 24),
+		currentBuffer: &strings.Builder{},
+	}
+
+	cmd := m.handleCommand("/visionmodel test-vision-model.rknn")
+	if cmd != nil {
+		t.Errorf("expected nil cmd for switching vision model, got %v", cmd)
+	}
+	if !strings.Contains(m.visionModel, "test-vision-model") {
+		t.Errorf("expected m.visionModel to contain 'test-vision-model', got %q", m.visionModel)
+	}
+	if len(m.chatHistory) == 0 {
+		t.Fatalf("expected system message in chatHistory after switching vision model")
+	}
+	lastMsg := m.chatHistory[len(m.chatHistory)-1]
+	if !strings.Contains(lastMsg.Content, "Switched vision model to") {
+		t.Errorf("unexpected system message content: %q", lastMsg.Content)
+	}
+}
+
+func TestVisionModelBareCommandListsModels(t *testing.T) {
+	m := model{
+		textarea:      textarea.New(),
+		viewport:      viewport.New(80, 24),
+		currentBuffer: &strings.Builder{},
+	}
+
+	cmd := m.handleCommand("/visionmodel")
+	if cmd == nil {
+		t.Errorf("expected non-nil cmd for /visionmodel (bare), should list vision models")
+	}
+}
+
+func TestVisionModelsCommandListsModels(t *testing.T) {
+	m := model{
+		textarea:      textarea.New(),
+		viewport:      viewport.New(80, 24),
+		currentBuffer: &strings.Builder{},
+	}
+
+	cmd := m.handleCommand("/visionmodels")
+	if cmd == nil {
+		t.Errorf("expected non-nil cmd for /visionmodels")
+	}
+}
+
+func TestVisionModelAutocompletePopup(t *testing.T) {
+	m := model{
+		textarea: textarea.New(),
+		viewport: viewport.New(80, 24),
+	}
+
+	m.textarea.SetValue("/visionmodel")
+	popup := m.renderAutocompletePopup()
+	if !strings.Contains(popup, "Vision Models") {
+		t.Errorf("expected popup to contain 'Vision Models', got %q", popup)
+	}
+}

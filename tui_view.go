@@ -75,6 +75,8 @@ var availableCommands = []struct {
 	{"/model", "Switch active RKLLM model"},
 	{"/rknnmodels", "List available RKNN models"},
 	{"/rknnmodel", "Switch active RKNN model"},
+	{"/visionmodels", "List available vision models"},
+	{"/visionmodel", "Switch active vision model"},
 	{"/toolsets", "List available toolsets"},
 	{"/toolset", "Switch active toolset (dev, web, image, all)"},
 	{"/imagine", "Generate an image (--out, --steps, --seed, --guidance, --negative)"},
@@ -217,6 +219,70 @@ func (m model) renderAutocompletePopup() string {
 
 		var popupLines []string
 		popupLines = append(popupLines, lipgloss.NewStyle().Foreground(lipgloss.Color("205")).Bold(true).Render(" ── RKNN Models ── "))
+		for _, match := range matches {
+			displayMatch := match
+			if filepath.IsAbs(match) {
+				displayMatch = filepath.Base(match) + " (" + match + ")"
+			}
+			line := fmt.Sprintf(" %s ", displayMatch)
+			popupLines = append(popupLines, lipgloss.NewStyle().Foreground(lipgloss.Color("252")).Render(line))
+		}
+
+		popupBoxStyle := lipgloss.NewStyle().
+			Border(lipgloss.RoundedBorder()).
+			BorderForeground(lipgloss.Color("63")).
+			Background(lipgloss.Color("235")).
+			Padding(0, 1)
+
+		return popupBoxStyle.Render(strings.Join(popupLines, "\n"))
+	}
+
+	if strings.HasPrefix(lowerVal, "/visionmodels") {
+		var matches []struct{ cmd, desc string }
+		for _, c := range availableCommands {
+			if strings.HasPrefix(strings.ToLower(c.cmd), lowerVal) {
+				matches = append(matches, c)
+			}
+		}
+		if len(matches) == 0 {
+			return ""
+		}
+		var popupLines []string
+		popupLines = append(popupLines, lipgloss.NewStyle().Foreground(lipgloss.Color("205")).Bold(true).Render(" ── Suggestions ── "))
+		for _, match := range matches {
+			line := fmt.Sprintf(" %-14s - %s ", match.cmd, match.desc)
+			popupLines = append(popupLines, lipgloss.NewStyle().Foreground(lipgloss.Color("252")).Render(line))
+		}
+		popupBoxStyle := lipgloss.NewStyle().
+			Border(lipgloss.RoundedBorder()).
+			BorderForeground(lipgloss.Color("63")).
+			Background(lipgloss.Color("235")).
+			Padding(0, 1)
+		return popupBoxStyle.Render(strings.Join(popupLines, "\n"))
+	}
+
+	if strings.HasPrefix(lowerVal, "/visionmodel") && !strings.HasPrefix(lowerVal, "/visionmodels") {
+		query := ""
+		if strings.HasPrefix(lowerVal, "/visionmodel ") {
+			query = strings.TrimSpace(val[len("/visionmodel "):])
+		} else if len(val) > len("/visionmodel") {
+			query = strings.TrimSpace(val[len("/visionmodel"):])
+		}
+
+		models := rknn.ListRKNNVisionModels()
+		var matches []string
+		for _, mdl := range models {
+			if query == "" || strings.Contains(strings.ToLower(mdl), strings.ToLower(query)) {
+				matches = append(matches, mdl)
+			}
+		}
+
+		if len(matches) == 0 {
+			matches = models
+		}
+
+		var popupLines []string
+		popupLines = append(popupLines, lipgloss.NewStyle().Foreground(lipgloss.Color("205")).Bold(true).Render(" ── Vision Models ── "))
 		for _, match := range matches {
 			displayMatch := match
 			if filepath.IsAbs(match) {

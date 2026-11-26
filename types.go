@@ -27,6 +27,11 @@ type RKNNModelsMessage struct {
 	Err    error
 }
 
+type RKNNVisionModelsMessage struct {
+	Models []string
+	Err    error
+}
+
 type ToolsetsMessage struct {
 	Toolsets []string
 	Err      error
@@ -43,6 +48,12 @@ type ToolExecutionResult struct {
 }
 
 type ImageGeneratedMessage struct {
+	Summary  string
+	Duration time.Duration
+	Err      error
+}
+
+type ImageDescribedMessage struct {
 	Summary  string
 	Duration time.Duration
 	Err      error

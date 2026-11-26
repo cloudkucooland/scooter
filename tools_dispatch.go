@@ -629,6 +629,20 @@ func dispatchToolCall(name string, rawArgs json.RawMessage) string {
 		}
 		return fmt.Sprintf("Success: Generated image %s in %.1fs", summary, elapsed.Seconds())
 
+	case "describe_image":
+		var args DescribeImageArgs
+		if err := json.Unmarshal(rawArgs, &args); err != nil {
+			return fmt.Sprintf("System Error parsing arguments: %v", err)
+		}
+		if strings.TrimSpace(args.ImagePath) == "" {
+			return "System Error: image_path is required"
+		}
+		summary, elapsed, err := describeImageFile(args.ImagePath, args.Model)
+		if err != nil {
+			return fmt.Sprintf("Image Description Error: %v", err)
+		}
+		return fmt.Sprintf("Success: %s (in %.2fs)", summary, elapsed.Seconds())
+
 	}
 
 	logDebug("dispatchToolCall failed for: %s", name)

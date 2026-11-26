@@ -144,6 +144,19 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 						return m, nil
 					}
 				}
+			} else if strings.HasPrefix(lowerVal, "/visionmodel") && !strings.HasPrefix(lowerVal, "/visionmodels") {
+				query := ""
+				if strings.HasPrefix(lowerVal, "/visionmodel ") {
+					query = strings.TrimSpace(val[len("/visionmodel "):])
+				}
+				models := rknn.ListRKNNVisionModels()
+				for _, mdl := range models {
+					if query == "" || strings.Contains(strings.ToLower(mdl), strings.ToLower(query)) {
+						m.textarea.SetValue("/visionmodel " + mdl)
+						m.textarea.CursorEnd()
+						return m, nil
+					}
+				}
 			} else if strings.HasPrefix(lowerVal, "/") {
 				var matches []string
 				for _, c := range availableCommands {
@@ -332,6 +345,15 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.refreshViewport()
 		return m, nil
 
+	case RKNNVisionModelsMessage:
+		if msg.Err != nil {
+			m.chatHistory = append(m.chatHistory, Message{Role: "system", Content: "Vision Models Error: " + msg.Err.Error()})
+		} else {
+			m.chatHistory = append(m.chatHistory, Message{Role: "system", Content: "Available Vision Models:\n" + strings.Join(msg.Models, "\n")})
+		}
+		m.refreshViewport()
+		return m, nil
+
 	case ToolsetsMessage:
 		if msg.Err != nil {
 			m.chatHistory = append(m.chatHistory, Message{Role: "system", Content: "Toolsets Error: " + msg.Err.Error()})
@@ -407,6 +429,8 @@ func (m *model) handleCommand(input string) tea.Cmd {
 - /model <name>: Switch active RKLLM model
 - /rknnmodels: List available RKNN models
 - /rknnmodel <name>: Switch active RKNN model
+- /visionmodels: List available vision models
+- /visionmodel <name>: Switch active vision model
 - /toolsets: List available toolsets
 - /toolset <name>: Switch active toolset (development, research, web, image, all)
 - /context [size]: View or change context limit (e.g. /context 8k, /context 16384)
@@ -466,6 +490,10 @@ func (m *model) handleCommand(input string) tea.Cmd {
 		return listRKNNModelsCmd()
 	}
 
+	if strings.HasPrefix(input, "/visionmodels") {
+		return listRKNNVisionModelsCmd()
+	}
+
 	if strings.HasPrefix(input, "/toolsets") {
 		return listToolsetsCmd()
 	}
@@ -508,6 +536,23 @@ func (m *model) handleCommand(input string) tea.Cmd {
 
 	if input == "/rknnmodel" || input == "/rknn-model" {
 		return listRKNNModelsCmd()
+	}
+
+	if strings.HasPrefix(input, "/visionmodel ") {
+		newModel := strings.TrimSpace(strings.TrimPrefix(input, "/visionmodel "))
+		resolved := rknn.GetRKNNVisionModelPath(newModel)
+		m.visionModel = resolved
+		setActiveRKNNVisionModel(resolved)
+		m.chatHistory = append(m.chatHistory, Message{
+			Role:    "system",
+			Content: fmt.Sprintf("Switched vision model to %s", resolved),
+		})
+		m.refreshViewport()
+		return nil
+	}
+
+	if input == "/visionmodel" {
+		return listRKNNVisionModelsCmd()
 	}
 
 	if strings.HasPrefix(input, "/toolset ") {

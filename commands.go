@@ -50,6 +50,13 @@ func listRKNNModelsCmd() tea.Cmd {
 	}
 }
 
+func listRKNNVisionModelsCmd() tea.Cmd {
+	return func() tea.Msg {
+		models := rknn.ListRKNNVisionModels()
+		return RKNNVisionModelsMessage{Models: models}
+	}
+}
+
 func listToolsetsCmd() tea.Cmd {
 	return func() tea.Msg {
 		toolsets := listToolsetsNames()
@@ -69,6 +76,17 @@ func imagineCmd(prompt, negativePrompt, outputPath string, steps int, seed int64
 	return func() tea.Msg {
 		summary, elapsed, err := generateImageFile(prompt, negativePrompt, outputPath, steps, seed, guidanceScale)
 		return ImageGeneratedMessage{
+			Summary:  summary,
+			Duration: elapsed,
+			Err:      err,
+		}
+	}
+}
+
+func describeImageCmd(imagePath, modelName string) tea.Cmd {
+	return func() tea.Msg {
+		summary, elapsed, err := describeImageFile(imagePath, modelName)
+		return ImageDescribedMessage{
 			Summary:  summary,
 			Duration: elapsed,
 			Err:      err,

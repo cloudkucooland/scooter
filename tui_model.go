@@ -31,6 +31,7 @@ type model struct {
 	textarea            textarea.Model
 	modelName           string
 	rknnModel           string
+	visionModel         string
 	contextLen          int
 	chatHistory         []Message
 	isStreaming         bool
@@ -44,6 +45,7 @@ type model struct {
 	streamRenderPending bool
 	isProcessingTool    bool
 	isGeneratingImage   bool
+	isDescribingImage   bool
 	imageCancel         context.CancelFunc
 	imageChan           chan ImageProgressMessage
 	imageProgressText   string
@@ -107,6 +109,7 @@ func initialModel() model {
 		viewport:      vp,
 		modelName:     modelName,
 		rknnModel:     getActiveRKNNModelPath(),
+		visionModel:   getActiveRKNNVisionModel(),
 		contextLen:    initialCtx,
 		chatHistory:   chatHist,
 		currentBuffer: &strings.Builder{},

@@ -12,44 +12,46 @@ import (
 )
 
 type Config struct {
-	DefaultContextTokens int    `json:"default_context_tokens"`
-	MinContextTokens     int    `json:"min_context_tokens"`
-	MaxContextTokens     int    `json:"max_context_tokens"`
-	ContextSafetyTokens  int    `json:"context_safety_tokens"`
-	SummaryReserveTokens int    `json:"summary_reserve_tokens"`
-	HydrationTokenLimit  int    `json:"hydration_token_limit"`
-	DefaultModel         string `json:"default_model"`
-	RKLLMModelsDir       string `json:"rkllm_models_dir"`
-	RKLLMLib             string `json:"rkllm_lib"`
-	RKLLMCacheEnabled    bool   `json:"rkllm_cache_enabled"`
-	RKLLMCachePath       string `json:"rkllm_cache_path"`
-	DefaultRKNNModel     string `json:"default_rknn_model"`
-	RKNNModelsDir        string `json:"rknn_models_dir"`
-	RKNNLib              string `json:"rknn_lib"`
-	MaxGrepFileSize      int64  `json:"max_grep_file_size"`
-	MaxShellOutputSize   int    `json:"max_shell_output_size"`
-	DefaultToolset       string `json:"default_toolset"`
-	GoogleAPIKey         string `json:"google_api_key"`
-	GoogleGenAIModel     string `json:"google_genai_model"`
+	DefaultContextTokens   int    `json:"default_context_tokens"`
+	MinContextTokens       int    `json:"min_context_tokens"`
+	MaxContextTokens       int    `json:"max_context_tokens"`
+	ContextSafetyTokens    int    `json:"context_safety_tokens"`
+	SummaryReserveTokens   int    `json:"summary_reserve_tokens"`
+	HydrationTokenLimit    int    `json:"hydration_token_limit"`
+	DefaultModel           string `json:"default_model"`
+	RKLLMModelsDir         string `json:"rkllm_models_dir"`
+	RKLLMLib               string `json:"rkllm_lib"`
+	RKLLMCacheEnabled      bool   `json:"rkllm_cache_enabled"`
+	RKLLMCachePath         string `json:"rkllm_cache_path"`
+	DefaultRKNNModel       string `json:"default_rknn_model"`
+	DefaultRKNNVisionModel string `json:"default_rknn_vision_model"`
+	RKNNModelsDir          string `json:"rknn_models_dir"`
+	RKNNLib                string `json:"rknn_lib"`
+	MaxGrepFileSize        int64  `json:"max_grep_file_size"`
+	MaxShellOutputSize     int    `json:"max_shell_output_size"`
+	DefaultToolset         string `json:"default_toolset"`
+	GoogleAPIKey           string `json:"google_api_key"`
+	GoogleGenAIModel       string `json:"google_genai_model"`
 }
 
 var (
 	defaultConfig = Config{
-		DefaultContextTokens: 4096,
-		MinContextTokens:     1024,
-		MaxContextTokens:     128 * 1024,
-		ContextSafetyTokens:  256,
-		SummaryReserveTokens: 512,
-		HydrationTokenLimit:  1000,
-		DefaultModel:         "qwen3-4b",
-		RKLLMLib:             "librkllmrt.so",
-		RKLLMCacheEnabled:    true,
-		DefaultRKNNModel:     "lcm-ssd-1b-rknn",
-		RKNNLib:              "/usr/lib/librknnrt.so",
-		MaxGrepFileSize:      2 * 1024 * 1024,
-		MaxShellOutputSize:   64 * 1024,
-		DefaultToolset:       "all",
-		GoogleGenAIModel:     "gemini-2.5-flash",
+		DefaultContextTokens:   4096,
+		MinContextTokens:       1024,
+		MaxContextTokens:       128 * 1024,
+		ContextSafetyTokens:    256,
+		SummaryReserveTokens:   512,
+		HydrationTokenLimit:    1000,
+		DefaultModel:           "qwen3-4b",
+		RKLLMLib:               "librkllmrt.so",
+		RKLLMCacheEnabled:      true,
+		DefaultRKNNModel:       "lcm-ssd-1b-rknn",
+		DefaultRKNNVisionModel: "mobilenet_v1.rknn",
+		RKNNLib:                "/usr/lib/librknnrt.so",
+		MaxGrepFileSize:        2 * 1024 * 1024,
+		MaxShellOutputSize:     64 * 1024,
+		DefaultToolset:         "all",
+		GoogleGenAIModel:       "gemini-2.5-flash",
 	}
 
 	configMu      sync.RWMutex
@@ -263,6 +265,39 @@ func setActiveRKNNModel(m string) {
 
 func getActiveRKNNModelPath() string {
 	return rknn.GetRKNNModelPath(getActiveRKNNModel())
+}
+
+var (
+	activeRKNNVisionModelMu sync.RWMutex
+	activeRKNNVisionModel   string
+)
+
+func getActiveRKNNVisionModel() string {
+	activeRKNNVisionModelMu.RLock()
+	defer activeRKNNVisionModelMu.RUnlock()
+	if activeRKNNVisionModel != "" {
+		return activeRKNNVisionModel
+	}
+	if env := strings.TrimSpace(os.Getenv("SCOOTER_RKNN_VISION_MODEL")); env != "" {
+		return env
+	}
+	if env := strings.TrimSpace(os.Getenv("RKNN_VISION_MODEL")); env != "" {
+		return env
+	}
+	if def := strings.TrimSpace(loadConfig().DefaultRKNNVisionModel); def != "" {
+		return def
+	}
+	return "mobilenet_v1.rknn"
+}
+
+func setActiveRKNNVisionModel(m string) {
+	activeRKNNVisionModelMu.Lock()
+	defer activeRKNNVisionModelMu.Unlock()
+	activeRKNNVisionModel = m
+}
+
+func getActiveRKNNVisionModelPath() string {
+	return rknn.GetRKNNVisionModelPath(getActiveRKNNVisionModel())
 }
 
 func getRKNNModelsDir() string {

@@ -266,6 +266,11 @@ func main() {
 				Usage:   "RKNN model path or directory",
 			},
 			&cli.StringFlag{
+				Name:    "vision-model",
+				Aliases: []string{"vision"},
+				Usage:   "RKNN vision model path or name",
+			},
+			&cli.StringFlag{
 				Name:    "prompt",
 				Aliases: []string{"p"},
 				Usage:   "Run a single prompt non-interactively and exit",
@@ -334,6 +339,11 @@ func main() {
 			rknnModel := cmd.String("rknn-model")
 			if rknnModel != "" {
 				setActiveRKNNModel(rknnModel)
+			}
+
+			visionModel := cmd.String("vision-model")
+			if visionModel != "" {
+				setActiveRKNNVisionModel(visionModel)
 			}
 
 			ingestPath := cmd.String("ingest")

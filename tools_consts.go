@@ -712,6 +712,27 @@ func getImageTools() []Tool {
 				},
 			},
 		},
+		{
+			Type: "function",
+			Function: FunctionDefinition{
+				Name:        "describe_image",
+				Description: "Reads an image file from disk and generates a text description of its content using the local RKNN framework on the NPU.",
+				Parameters: Parameters{
+					Type: "object",
+					Properties: map[string]Property{
+						"image_path": {
+							Type:        "string",
+							Description: "Path to the image file to read and describe (PNG, JPEG, GIF, etc.).",
+						},
+						"model": {
+							Type:        "string",
+							Description: "Optional RKNN vision model name or path.",
+						},
+					},
+					Required: []string{"image_path"},
+				},
+			},
+		},
 	}
 }
 
@@ -722,4 +743,9 @@ type GenerateImageArgs struct {
 	Steps         FlexibleInt   `json:"steps,omitempty"`
 	Seed          int64         `json:"seed,omitempty"`
 	GuidanceScale FlexibleFloat `json:"guidance_scale,omitempty"`
+}
+
+type DescribeImageArgs struct {
+	ImagePath string `json:"image_path"`
+	Model     string `json:"model,omitempty"`
 }
