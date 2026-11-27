@@ -211,6 +211,18 @@ func TestImagineCommandInAvailableCommands(t *testing.T) {
 	}
 }
 
+func TestDescribeCommandInAvailableCommands(t *testing.T) {
+	foundDescribe := false
+	for _, c := range availableCommands {
+		if c.cmd == "/describe" {
+			foundDescribe = true
+		}
+	}
+	if !foundDescribe {
+		t.Errorf("expected /describe in availableCommands")
+	}
+}
+
 func TestParseImagineCommandArgs(t *testing.T) {
 	prompt, outPath, steps, seed, guidance, negative, err := parseImagineCommandArgs(`a red scooter --out test.png --steps 7 --seed 42 --guidance 1.8 --negative "extra wheels"`)
 	if err != nil {

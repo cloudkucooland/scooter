@@ -302,8 +302,8 @@ func main() {
 			},
 			&cli.IntFlag{
 				Name:  "steps",
-				Value: 4,
-				Usage: "Number of denoising steps for --imagine (default 4, range 1-30)",
+				Value: 0,
+				Usage: "Number of denoising steps for --imagine (default 0 [model default], range 1-30)",
 			},
 			&cli.IntFlag{
 				Name:  "seed",

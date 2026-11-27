@@ -80,6 +80,7 @@ var availableCommands = []struct {
 	{"/toolsets", "List available toolsets"},
 	{"/toolset", "Switch active toolset (dev, web, image, all)"},
 	{"/imagine", "Generate an image (--out, --steps, --seed, --guidance, --negative)"},
+	{"/describe", "Describe an image file using RKNN vision model (<path>)"},
 	{"/context", "View or change context size"},
 	{"/compress", "Manually compress conversation history"},
 	{"/clear", "Clear conversation history and cache"},

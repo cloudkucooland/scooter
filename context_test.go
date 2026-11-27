@@ -6,6 +6,10 @@ import (
 )
 
 func TestPlanCompressionRetainsNewestConversationSuffix(t *testing.T) {
+	origLimit := getActiveContextLimit()
+	defer setActiveContextLimit(origLimit)
+	setActiveContextLimit(32768)
+
 	history := []Message{{Role: "system", Content: "project instructions"}}
 	for i := 0; i < 12; i++ {
 		history = append(history, Message{Role: "user", Content: strings.Repeat("older context ", 250)})

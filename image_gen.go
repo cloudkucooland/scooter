@@ -65,13 +65,6 @@ func generateImageFileWithModelAndContext(ctx context.Context, modelDir, prompt,
 		return "", 0, fmt.Errorf("prompt is required")
 	}
 
-	if steps <= 0 {
-		steps = 4
-	}
-	if steps > 30 {
-		steps = 30
-	}
-
 	if seed == 0 {
 		rng := rand.New(rand.NewSource(time.Now().UnixNano()))
 		seed = rng.Int63n(1<<31 - 1)
@@ -110,31 +103,8 @@ func generateImageFileWithModelAndContext(ctx context.Context, modelDir, prompt,
 	}
 	defer pipe.Close()
 
-	if guidanceScale > 0 {
-		if pipe.UseCFG {
-			if guidanceScale < 1.0 {
-				guidanceScale = 1.0
-			} else if guidanceScale > 15.0 {
-				guidanceScale = 15.0
-			}
-		} else {
-			if guidanceScale < 1.0 {
-				guidanceScale = 1.0
-			} else if guidanceScale > 2.0 {
-				guidanceScale = 2.0
-			}
-		}
-		pipe.GuidanceScale = guidanceScale
-	}
-
-	effectiveGuidance := pipe.GuidanceScale
-	if effectiveGuidance == 0 {
-		if pipe.UseCFG {
-			effectiveGuidance = 7.5
-		} else {
-			effectiveGuidance = 1.5
-		}
-	}
+	steps = pipe.EffectiveSteps(steps)
+	guidanceScale = pipe.EffectiveGuidance(guidanceScale)
 
 	neg := strings.TrimSpace(negativePrompt)
 	if strings.EqualFold(neg, "none") {
@@ -180,5 +150,5 @@ func generateImageFileWithModelAndContext(ctx context.Context, modelDir, prompt,
 			relOut = rel
 		}
 	}
-	return fmt.Sprintf("%s (%dx%d, %d steps, guidance %.1f, seed %d)", relOut, img.Bounds().Dx(), img.Bounds().Dy(), steps, effectiveGuidance, seed), elapsed, nil
+	return fmt.Sprintf("%s (%dx%d, %d steps, guidance %.1f, seed %d)", relOut, img.Bounds().Dx(), img.Bounds().Dy(), steps, guidanceScale, seed), elapsed, nil
 }

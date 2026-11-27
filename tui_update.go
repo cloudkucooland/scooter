@@ -389,6 +389,24 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		}
 		m.refreshViewport()
 		return m, nil
+
+	case ImageDescribedMessage:
+		m.isGeneratingImage = false
+		if msg.Err != nil {
+			m.chatHistory = append(m.chatHistory, Message{
+				Role:    "system",
+				Content: fmt.Sprintf("Image Description Error: %v", msg.Err),
+			})
+		} else {
+			sysMsg := Message{
+				Role:    "system",
+				Content: fmt.Sprintf("Image Description (%.1fs):\n%s", msg.Duration.Seconds(), msg.Summary),
+			}
+			m.chatHistory = append(m.chatHistory, sysMsg)
+			m.saveMessage(sysMsg)
+		}
+		m.refreshViewport()
+		return m, nil
 	}
 
 	m.textarea, tiCmd = m.textarea.Update(msg)
@@ -711,6 +729,24 @@ func (m *model) handleCommand(input string) tea.Cmd {
 		return compressHistoryCmd(m.modelName, m.chatHistory, true, m.historyGeneration)
 	}
 
+	if strings.HasPrefix(input, "/describe") {
+		imagePath := strings.TrimSpace(strings.TrimPrefix(input, "/describe"))
+		if imagePath == "" {
+			m.chatHistory = append(m.chatHistory, Message{
+				Role:    "system",
+				Content: "Usage: /describe <image_path>",
+			})
+			m.refreshViewport()
+			return nil
+		}
+		userMsg := Message{Role: "user", Content: input}
+		m.chatHistory = append(m.chatHistory, userMsg)
+		m.saveMessage(userMsg)
+		m.isGeneratingImage = true
+		m.refreshViewport()
+		return describeImageCmd(imagePath, "")
+	}
+
 	if strings.HasPrefix(input, "/imagine") || strings.HasPrefix(input, "/image ") || input == "/image" {
 		raw := strings.TrimPrefix(input, "/imagine")
 		if raw == input {
@@ -862,7 +898,7 @@ func removePromptCacheFiles() {
 }
 
 func parseImagineCommandArgs(raw string) (prompt, outPath string, steps int, seed int64, guidanceScale float32, negativePrompt string, err error) {
-	steps = 4
+	steps = 0 // use model's default
 	var promptParts []string
 	for len(raw) > 0 {
 		raw = strings.TrimSpace(raw)
@@ -872,7 +908,7 @@ func parseImagineCommandArgs(raw string) (prompt, outPath string, steps int, see
 		if raw[0] == '\'' || raw[0] == '"' {
 			value, rest, ok := consumeQuotedArg(raw)
 			if !ok {
-				return "", "", 4, 0, 0, "", fmt.Errorf("unterminated quote in /imagine arguments")
+				return "", "", steps, 0, 0, "", fmt.Errorf("unterminated quote in /imagine arguments")
 			}
 			promptParts = append(promptParts, value)
 			raw = rest
@@ -884,7 +920,7 @@ func parseImagineCommandArgs(raw string) (prompt, outPath string, steps int, see
 		case "--out", "-o", "--steps", "-s", "--seed", "--guidance", "-g", "--guidance-scale", "--negative", "-n":
 			value, next, valueErr := consumeOptionValue(raw)
 			if valueErr != nil {
-				return "", "", 4, 0, 0, "", fmt.Errorf("%s", valueErr)
+				return "", "", steps, 0, 0, "", fmt.Errorf("%s", valueErr)
 			}
 			raw = next
 			switch field {
@@ -893,18 +929,18 @@ func parseImagineCommandArgs(raw string) (prompt, outPath string, steps int, see
 			case "--steps", "-s":
 				steps, err = strconv.Atoi(value)
 				if err != nil {
-					return "", "", 4, 0, 0, "", fmt.Errorf("invalid --steps value %q", value)
+					return "", "", steps, 0, 0, "", fmt.Errorf("invalid --steps value %q", value)
 				}
 			case "--seed":
 				seed, err = strconv.ParseInt(value, 10, 64)
 				if err != nil {
-					return "", "", 4, 0, 0, "", fmt.Errorf("invalid --seed value %q", value)
+					return "", "", steps, 0, 0, "", fmt.Errorf("invalid --seed value %q", value)
 				}
 			case "--guidance", "-g", "--guidance-scale":
 				var parsed float64
 				parsed, err = strconv.ParseFloat(value, 32)
 				if err != nil {
-					return "", "", 4, 0, 0, "", fmt.Errorf("invalid --guidance value %q", value)
+					return "", "", steps, 0, 0, "", fmt.Errorf("invalid --guidance value %q", value)
 				}
 				guidanceScale = float32(parsed)
 			case "--negative", "-n":
