@@ -39,7 +39,7 @@ func TestCABIStructLayouts(t *testing.T) {
 
 func TestSchedulerMath(t *testing.T) {
 	lcm := NewScheduler(4, "lcm")
-	wantSteps := []int{999, 749, 499, 249}
+	wantSteps := []int{999, 679, 339, 19}
 	for i, want := range wantSteps {
 		got, ok := lcm.NextTimestep()
 		if !ok || got != want {

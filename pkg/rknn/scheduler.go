@@ -64,15 +64,35 @@ func (s *Scheduler) Reset(seed int64) {
 }
 
 func (s *Scheduler) initLCM() {
-	// Leading timestep spacing across 1000 training steps (e.g. 999, 749, 499, 249 for 4 steps)
-	stepRatio := numTrainTimesteps / s.Steps
-	s.Timesteps = make([]int, s.Steps)
-	for i := 0; i < s.Steps; i++ {
-		t := (s.Steps-1-i)*stepRatio + stepRatio - 1
-		if t >= numTrainTimesteps {
-			t = numTrainTimesteps - 1
+	const originalInferenceSteps = 50
+	stepRatio := numTrainTimesteps / originalInferenceSteps // 20
+
+	// Build the 50-step schedule: [19, 39, ..., 999]
+	lcmOriginTimesteps := make([]int, originalInferenceSteps)
+	for i := 0; i < originalInferenceSteps; i++ {
+		lcmOriginTimesteps[i] = (i+1)*stepRatio - 1
+	}
+
+	// Subsample s.Steps evenly from the 50-step schedule in reverse order
+	steps := s.Steps
+	if steps > originalInferenceSteps {
+		steps = originalInferenceSteps
+	}
+	s.Timesteps = make([]int, steps)
+	if steps == 1 {
+		s.Timesteps[0] = lcmOriginTimesteps[originalInferenceSteps-1]
+		return
+	}
+	for i := 0; i < steps; i++ {
+		pos := float64(i) * float64(originalInferenceSteps-1) / float64(steps-1)
+		idx := originalInferenceSteps - 1 - int(math.Round(pos))
+		if idx < 0 {
+			idx = 0
 		}
-		s.Timesteps[i] = t
+		if idx >= originalInferenceSteps {
+			idx = originalInferenceSteps - 1
+		}
+		s.Timesteps[i] = lcmOriginTimesteps[idx]
 	}
 }
 

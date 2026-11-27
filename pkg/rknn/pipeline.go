@@ -44,10 +44,9 @@ type Pipeline struct {
 // resident in NPU/CMA memory simultaneously.
 func LoadPipeline(modelDir string, tok *Tokenizer, steps int) (*Pipeline, error) {
 	p := &Pipeline{
-		ModelDir:      modelDir,
-		Tok:           tok,
-		GuidanceScale: 1.5,
-		VAEScale:      sdxlVAEScaleFactor,
+		ModelDir: modelDir,
+		Tok:      tok,
+		VAEScale: sdxlVAEScaleFactor,
 	}
 
 	// Detect SD 1.5 vs SDXL by checking for text_encoder_2/model.rknn.
@@ -106,8 +105,8 @@ func LoadPipeline(modelDir string, tok *Tokenizer, steps int) (*Pipeline, error)
 	if p.IsSD15 && p.UNetInCount == 3 {
 		schedMode = "euler"
 		p.UseCFG = true
-		p.GuidanceScale = 7.5
 	}
+	steps = p.EffectiveSteps(steps)
 	p.Sched = NewScheduler(steps, schedMode)
 
 	// Probe VAE input and output layouts (NHWC vs NCHW)
@@ -346,12 +345,16 @@ func (p *Pipeline) runDiffusionSD15(ctx context.Context, condEmbeds, uncondEmbed
 	}
 	defer func() { _ = unet.Close() }()
 
-	inputsAttr, _, err := unet.QueryIO()
+	inputsAttr, outputsAttr, err := unet.QueryIO()
 	if err != nil {
 		return nil, err
 	}
+
 	if !p.UseCFG && len(inputsAttr) == 4 {
 		return p.runDiffusionSD15LCM(ctx, unet, inputsAttr, condEmbeds, seed, progressFn)
+	}
+	if len(outputsAttr) == 0 {
+		return nil, fmt.Errorf("SD 1.5 UNet has no outputs")
 	}
 
 	p.Sched.Reset(seed)
@@ -367,112 +370,101 @@ func (p *Pipeline) runDiffusionSD15(ctx context.Context, condEmbeds, uncondEmbed
 
 	guidanceScale := p.GuidanceScale
 	if guidanceScale == 0 {
-		guidanceScale = 7.5
+		guidanceScale = p.DefaultGuidance()
 	}
 
+	inputMems := make([]*TensorMem, len(inputsAttr))
+	for i, attr := range inputsAttr {
+		mem, err := unet.CreateMem(attr.Size)
+		if err != nil {
+			for j := 0; j < i; j++ {
+				_ = unet.DestroyMem(inputMems[j])
+			}
+			return nil, fmt.Errorf("create SD15 input mem %d: %w", i, err)
+		}
+		inputMems[i] = mem
+		if err := unet.SetIOMem(mem, &attr); err != nil {
+			for j := 0; j <= i; j++ {
+				_ = unet.DestroyMem(inputMems[j])
+			}
+			return nil, fmt.Errorf("set SD15 input io mem %d: %w", i, err)
+		}
+	}
+	defer func() {
+		for _, mem := range inputMems {
+			_ = unet.DestroyMem(mem)
+		}
+	}()
+
+	outputMems := make([]*TensorMem, len(outputsAttr))
+	for i, attr := range outputsAttr {
+		mem, err := unet.CreateMem(attr.Size)
+		if err != nil {
+			for j := 0; j < i; j++ {
+				_ = unet.DestroyMem(outputMems[j])
+			}
+			return nil, fmt.Errorf("create SD15 output mem %d: %w", i, err)
+		}
+		outputMems[i] = mem
+		if err := unet.SetIOMem(mem, &attr); err != nil {
+			for j := 0; j <= i; j++ {
+				_ = unet.DestroyMem(outputMems[j])
+			}
+			return nil, fmt.Errorf("set SD15 output io mem %d: %w", i, err)
+		}
+	}
+	defer func() {
+		for _, mem := range outputMems {
+			_ = unet.DestroyMem(mem)
+		}
+	}()
+
 	runUNetStep := func(sample []float32, timestep int, embeds []float32) ([]float32, error) {
-		inputs := make([]Input, len(inputsAttr))
-
 		inSample := sample
-		inFmt := RKNN_TENSOR_NCHW
-		if p.UNetInIsNHWC {
+		if p.UNetInIsNHWC || inputsAttr[0].Fmt == RKNN_TENSOR_NHWC {
 			inSample = nchwToNHWC4(sample, latentH, latentW)
-			inFmt = RKNN_TENSOR_NHWC
+		}
+		if len(inputsAttr) > 0 {
+			copyTensorFloat32ToMem(inputMems[0], inputsAttr[0], inSample)
 		}
 
-		// Input 0: sample [1, H/8, W/8, 4] in NHWC (or [1, 4, H/8, W/8] NCHW)
-		inputs[0] = Input{
-			Index:       0,
-			Buf:         unsafe.Pointer(&inSample[0]),
-			Size:        uint32(len(inSample) * 4),
-			PassThrough: 0,
-			Type:        RKNN_TENSOR_FLOAT32,
-			Fmt:         inFmt,
-		}
-
-		// Input 1: timestep [1]
-		var t64 int64
-		var t32 int32
-		var tf32 float32
-		switch inputsAttr[1].Type {
-		case RKNN_TENSOR_INT64:
-			t64 = int64(timestep)
-			inputs[1] = Input{
-				Index:       1,
-				Buf:         unsafe.Pointer(&t64),
-				Size:        8,
-				PassThrough: 0,
-				Type:        RKNN_TENSOR_INT64,
-				Fmt:         RKNN_TENSOR_UNDEFINED,
-			}
-		case RKNN_TENSOR_INT32:
-			t32 = int32(timestep)
-			inputs[1] = Input{
-				Index:       1,
-				Buf:         unsafe.Pointer(&t32),
-				Size:        4,
-				PassThrough: 0,
-				Type:        RKNN_TENSOR_INT32,
-				Fmt:         RKNN_TENSOR_UNDEFINED,
-			}
-		default:
-			tf32 = float32(timestep)
-			inputs[1] = Input{
-				Index:       1,
-				Buf:         unsafe.Pointer(&tf32),
-				Size:        4,
-				PassThrough: 0,
-				Type:        RKNN_TENSOR_FLOAT32,
-				Fmt:         RKNN_TENSOR_UNDEFINED,
+		if len(inputsAttr) > 1 {
+			switch inputsAttr[1].Type {
+			case RKNN_TENSOR_INT64:
+				copyInt64ToMem(inputMems[1], []int64{int64(timestep)})
+			case RKNN_TENSOR_INT32:
+				copyInt32ToMem(inputMems[1], []int32{int32(timestep)})
+			case RKNN_TENSOR_FLOAT32, RKNN_TENSOR_FLOAT16:
+				copyTensorFloat32ToMem(inputMems[1], inputsAttr[1], []float32{float32(timestep)})
+			default:
+				return nil, fmt.Errorf("unsupported SD15 timestep tensor type %d", inputsAttr[1].Type)
 			}
 		}
 
-		// Input 2: encoder_hidden_states [1, 77, 768]
 		if len(inputsAttr) > 2 && len(embeds) > 0 {
-			inputs[2] = Input{
-				Index:       2,
-				Buf:         unsafe.Pointer(&embeds[0]),
-				Size:        uint32(len(embeds) * 4),
-				PassThrough: 0,
-				Type:        RKNN_TENSOR_FLOAT32,
-				Fmt:         RKNN_TENSOR_UNDEFINED,
-			}
+			copyTensorFloat32ToMem(inputMems[2], inputsAttr[2], embeds)
 		}
 
-		npu.Lock()
-		defer npu.Unlock()
-
-		if ret := rknnInputsSet(unet.handle, uint32(len(inputs)), &inputs[0]); ret != 0 {
-			return nil, fmt.Errorf("rknn_inputs_set failed: %d", ret)
-		}
 		runtime.KeepAlive(inSample)
 		runtime.KeepAlive(sample)
 		runtime.KeepAlive(embeds)
-		runtime.KeepAlive(t64)
-		runtime.KeepAlive(t32)
-		runtime.KeepAlive(tf32)
 
-		if ret := rknnRun(unet.handle, nil); ret != 0 {
-			return nil, fmt.Errorf("rknn_run failed: %d", ret)
+		npu.Lock()
+		ret := rknnRun(unet.handle, nil)
+		var noisePred []float32
+		if ret == 0 {
+			noisePred, err = tensorMemToFloat32(outputMems[0], outputsAttr[0])
 		}
-
-		out := &Output{
-			WantFloat:  1,
-			IsPrealloc: 0,
-			Index:      0,
+		npu.Unlock()
+		if ret != 0 {
+			return nil, fmt.Errorf("SD15 unet rknn_run failed: %d", ret)
 		}
-		if ret := callRKNNOutputsGet(unet.handle, 1, out); ret != 0 {
-			return nil, fmt.Errorf("rknn_outputs_get failed: %d", ret)
+		if err != nil {
+			return nil, err
 		}
-		if out.Buf == nil || out.Size == 0 {
-			callRKNNOutputsRelease(unet.handle, 1, out)
-			return nil, fmt.Errorf("rknn_outputs_get returned empty buffer")
+		if outputsAttr[0].Fmt == RKNN_TENSOR_NHWC {
+			noisePred = nhwcToNCHW4(noisePred, latentH, latentW)
 		}
-		count := int(out.Size) / 4
-		src := unsafe.Slice((*float32)(out.Buf), count)
-		noisePred := make([]float32, count)
-		copy(noisePred, src)
-		callRKNNOutputsRelease(unet.handle, 1, out)
 		return noisePred, nil
 	}
 
@@ -489,17 +481,25 @@ func (p *Pipeline) runDiffusionSD15(ctx context.Context, condEmbeds, uncondEmbed
 		}
 		scaledLatents := p.Sched.ScaleModelInput(latents, timestep)
 
-		noiseUncond, err := runUNetStep(scaledLatents, timestep, uncondEmbeds)
-		if err != nil {
-			return nil, fmt.Errorf("uncond step: %w", err)
-		}
-		noiseCond, err := runUNetStep(scaledLatents, timestep, condEmbeds)
-		if err != nil {
-			return nil, fmt.Errorf("cond step: %w", err)
-		}
-		noisePred := make([]float32, len(noiseCond))
-		for i := range noisePred {
-			noisePred[i] = noiseUncond[i] + guidanceScale*(noiseCond[i]-noiseUncond[i])
+		var noisePred []float32
+		if len(uncondEmbeds) > 0 && guidanceScale != 1.0 {
+			noiseUncond, err := runUNetStep(scaledLatents, timestep, uncondEmbeds)
+			if err != nil {
+				return nil, fmt.Errorf("uncond step: %w", err)
+			}
+			noiseCond, err := runUNetStep(scaledLatents, timestep, condEmbeds)
+			if err != nil {
+				return nil, fmt.Errorf("cond step: %w", err)
+			}
+			noisePred = make([]float32, len(noiseCond))
+			for i := range noisePred {
+				noisePred[i] = noiseUncond[i] + guidanceScale*(noiseCond[i]-noiseUncond[i])
+			}
+		} else {
+			noisePred, err = runUNetStep(scaledLatents, timestep, condEmbeds)
+			if err != nil {
+				return nil, fmt.Errorf("cond step: %w", err)
+			}
 		}
 
 		latents = p.Sched.Step(noisePred, timestep, latents)
@@ -577,7 +577,7 @@ func (p *Pipeline) runDiffusionSD15LCM(ctx context.Context, unet *RKNNContext, i
 
 	guidanceScale := p.GuidanceScale
 	if guidanceScale == 0 {
-		guidanceScale = 1.5
+		guidanceScale = p.DefaultGuidance()
 	}
 	timestepCond := getGuidanceScaleEmbedding(guidanceScale)
 
@@ -657,7 +657,7 @@ func (p *Pipeline) runDiffusionSDXL(ctx context.Context, promptEmbeds, pooledEmb
 
 	guidanceScale := p.GuidanceScale
 	if guidanceScale == 0 {
-		guidanceScale = 1.5
+		guidanceScale = p.DefaultGuidance()
 	}
 	timestepCond := getGuidanceScaleEmbedding(guidanceScale)
 
@@ -667,7 +667,6 @@ func (p *Pipeline) runDiffusionSDXL(ctx context.Context, promptEmbeds, pooledEmb
 		float32(p.Height), float32(p.Width),
 	}
 
-	// Allocate zero-copy input and output tensor memories
 	inputMems := make([]*TensorMem, len(inputsAttr))
 	for i, attr := range inputsAttr {
 		size := attr.Size
@@ -729,7 +728,6 @@ func (p *Pipeline) runDiffusionSDXL(ctx context.Context, promptEmbeds, pooledEmb
 		}
 	}()
 
-	// Copy invariant inputs once
 	if len(inputsAttr) > 2 {
 		copyTensorFloat32ToMem(inputMems[2], inputsAttr[2], promptEmbeds)
 	}
@@ -1084,4 +1082,41 @@ func float32ToFloat16(f float32) uint16 {
 		return sign | 0x7c00
 	}
 	return sign | uint16(exp<<10) | uint16((mant+0x1000)>>13)
+}
+
+func (p *Pipeline) DefaultSteps() int {
+	if p.UseCFG {
+		return 15
+	}
+	return 5
+}
+
+func (p *Pipeline) EffectiveSteps(s int) int {
+	if s <= 0 || s > 30 {
+		return p.DefaultSteps()
+	}
+	return s
+}
+
+func (p *Pipeline) DefaultGuidance() float32 {
+	if p.UseCFG {
+		return 7.5
+	}
+	return 1.5
+}
+
+func (p *Pipeline) EffectiveGuidance(g float32) float32 {
+	if g == 0 {
+		return p.DefaultGuidance()
+	}
+	if g < 1.0 {
+		return 1.0
+	}
+	if p.UseCFG && g > 15.0 {
+		return 15.0
+	}
+	if g > 2.0 {
+		return 2.0
+	}
+	return g
 }
