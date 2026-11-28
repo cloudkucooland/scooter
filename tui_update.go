@@ -689,7 +689,13 @@ func (m *model) handleCommand(input string) tea.Cmd {
 			m.chatHistory = append(m.chatHistory, Message{Role: "system", Content: "Error opening knowledge db: " + err.Error()})
 		} else {
 			defer kdb.Close()
-			docID, err := kdb.IngestFile(filePath, "main")
+			embedder, embedderErr := getKnowledgeEmbedder()
+			if embedderErr != nil {
+				m.chatHistory = append(m.chatHistory, Message{Role: "system", Content: "Error initializing knowledge embedder: " + embedderErr.Error()})
+				m.refreshViewport()
+				return nil
+			}
+			docID, err := kdb.IngestFileWithEmbedder(context.Background(), filePath, "main", embedder)
 			if err != nil {
 				m.chatHistory = append(m.chatHistory, Message{Role: "system", Content: "Error ingesting file " + filePath + ": " + err.Error()})
 			} else {
@@ -707,7 +713,13 @@ func (m *model) handleCommand(input string) tea.Cmd {
 			m.chatHistory = append(m.chatHistory, Message{Role: "system", Content: "Error opening knowledge db: " + err.Error()})
 		} else {
 			defer kdb.Close()
-			results, err := kdb.Search(query, "", 5)
+			embedder, embedderErr := getKnowledgeEmbedder()
+			if embedderErr != nil {
+				m.chatHistory = append(m.chatHistory, Message{Role: "system", Content: "Knowledge search embedder error: " + embedderErr.Error()})
+				m.refreshViewport()
+				return nil
+			}
+			results, err := kdb.SearchWithEmbedder(context.Background(), query, "", 5, embedder)
 			if err != nil {
 				m.chatHistory = append(m.chatHistory, Message{Role: "system", Content: "Knowledge search error: " + err.Error()})
 			} else if len(results) == 0 {

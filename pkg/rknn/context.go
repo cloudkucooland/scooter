@@ -76,6 +76,11 @@ func (c *RKNNContext) QueryIO() (inputs []TensorAttr, outputs []TensorAttr, err 
 	return inputs, outputs, nil
 }
 
+// SetInputShapes selects dynamic input dimensions for this context.
+func (c *RKNNContext) SetInputShapes(attrs []TensorAttr) error {
+	return setInputShapes(c.handle, attrs)
+}
+
 // RunFloat32 executes a forward pass and copies all outputs as []float32 slices
 // before releasing the C runtime buffers.
 func (c *RKNNContext) RunFloat32(inputs []Input, nOutputs int) ([][]float32, error) {

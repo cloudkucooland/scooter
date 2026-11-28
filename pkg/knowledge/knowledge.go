@@ -1,10 +1,14 @@
 package knowledge
 
 import (
+	"context"
 	"database/sql"
+	"encoding/binary"
 	"fmt"
+	"math"
 	"os"
 	"path/filepath"
+	"sort"
 	"strings"
 	"time"
 
@@ -28,6 +32,16 @@ type Chunk struct {
 	Content    string `json:"content"`
 }
 
+// ChunkEmbedding identifies a vector by the model and model version that
+// produced it. Multiple versions can coexist for the same chunk.
+type ChunkEmbedding struct {
+	ChunkID      string    `json:"chunk_id"`
+	Model        string    `json:"model"`
+	ModelVersion string    `json:"model_version"`
+	Dimensions   int       `json:"dimensions"`
+	Vector       []float32 `json:"vector"`
+}
+
 type SearchResult struct {
 	ChunkID    string  `json:"chunk_id"`
 	DocumentID string  `json:"document_id"`
@@ -39,6 +53,13 @@ type SearchResult struct {
 
 type KnowledgeDB struct {
 	db *sql.DB
+}
+
+// Embedder produces a vector and identifies the model revision that produced it.
+type Embedder interface {
+	Embed(context.Context, string) ([]float32, error)
+	Model() string
+	ModelVersion() string
 }
 
 func GetDBPath() string {
@@ -99,6 +120,19 @@ func (k *KnowledgeDB) initSchema() error {
 		FOREIGN KEY(document_id) REFERENCES documents(id) ON DELETE CASCADE
 	);
 
+	CREATE TABLE IF NOT EXISTS chunk_embeddings (
+		chunk_id TEXT NOT NULL,
+		model TEXT NOT NULL,
+		model_version TEXT NOT NULL,
+		dimensions INTEGER NOT NULL CHECK (dimensions > 0),
+		vector BLOB NOT NULL,
+		created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+		PRIMARY KEY (chunk_id, model, model_version),
+		FOREIGN KEY(chunk_id) REFERENCES chunks(id) ON DELETE CASCADE
+	);
+	CREATE INDEX IF NOT EXISTS chunk_embeddings_model_version_idx
+		ON chunk_embeddings(model, model_version, chunk_id);
+
 	CREATE VIRTUAL TABLE IF NOT EXISTS chunks_fts USING fts5(
 		content,
 		chunk_id UNINDEXED,
@@ -123,6 +157,60 @@ func (k *KnowledgeDB) initSchema() error {
 		return err
 	}
 	return nil
+}
+
+// StoreChunkEmbedding inserts or replaces a vector for the given chunk and
+// embedding model version. Vectors are stored as little-endian float32 BLOBs.
+func (k *KnowledgeDB) StoreChunkEmbedding(chunkID, model, modelVersion string, vector []float32) error {
+	return storeChunkEmbedding(k.db, chunkID, model, modelVersion, vector)
+}
+
+type embeddingExecer interface {
+	Exec(query string, args ...any) (sql.Result, error)
+}
+
+func storeChunkEmbedding(exec embeddingExecer, chunkID, model, modelVersion string, vector []float32) error {
+	if strings.TrimSpace(chunkID) == "" || strings.TrimSpace(model) == "" || strings.TrimSpace(modelVersion) == "" {
+		return fmt.Errorf("chunk ID, model, and model version are required")
+	}
+	if len(vector) == 0 {
+		return fmt.Errorf("embedding vector must not be empty")
+	}
+	blob := make([]byte, len(vector)*4)
+	for i, value := range vector {
+		if math.IsNaN(float64(value)) || math.IsInf(float64(value), 0) {
+			return fmt.Errorf("embedding vector contains non-finite value at index %d", i)
+		}
+		binary.LittleEndian.PutUint32(blob[i*4:], math.Float32bits(value))
+	}
+	_, err := exec.Exec(`
+		INSERT INTO chunk_embeddings (chunk_id, model, model_version, dimensions, vector)
+		VALUES (?, ?, ?, ?, ?)
+		ON CONFLICT(chunk_id, model, model_version) DO UPDATE SET
+			dimensions = excluded.dimensions, vector = excluded.vector, created_at = CURRENT_TIMESTAMP
+	`, chunkID, model, modelVersion, len(vector), blob)
+	return err
+}
+
+// GetChunkEmbedding fetches an exact model/version vector for a chunk.
+func (k *KnowledgeDB) GetChunkEmbedding(chunkID, model, modelVersion string) (ChunkEmbedding, error) {
+	var embedding ChunkEmbedding
+	var blob []byte
+	err := k.db.QueryRow(`
+		SELECT chunk_id, model, model_version, dimensions, vector
+		FROM chunk_embeddings WHERE chunk_id = ? AND model = ? AND model_version = ?
+	`, chunkID, model, modelVersion).Scan(&embedding.ChunkID, &embedding.Model, &embedding.ModelVersion, &embedding.Dimensions, &blob)
+	if err != nil {
+		return ChunkEmbedding{}, err
+	}
+	if embedding.Dimensions <= 0 || len(blob) != embedding.Dimensions*4 {
+		return ChunkEmbedding{}, fmt.Errorf("invalid stored embedding dimensions %d for %d-byte vector", embedding.Dimensions, len(blob))
+	}
+	embedding.Vector = make([]float32, embedding.Dimensions)
+	for i := range embedding.Vector {
+		embedding.Vector[i] = math.Float32frombits(binary.LittleEndian.Uint32(blob[i*4:]))
+	}
+	return embedding, nil
 }
 
 func splitIntoChunks(content string, maxChars int) []string {
@@ -194,14 +282,54 @@ func (k *KnowledgeDB) ListCollections() ([]string, error) {
 }
 
 func (k *KnowledgeDB) IngestText(title, content, collection, sourcePath string) (string, error) {
-	docID := fmt.Sprintf("doc_%d", time.Now().UnixNano())
-	now := time.Now().Format(time.RFC3339)
+	return k.IngestTextWithEmbedder(context.Background(), title, content, collection, sourcePath, nil)
+}
 
+// IngestTextWithEmbedder stores chunks and, when configured, their embeddings.
+// It computes vectors before opening the write transaction so NPU inference does
+// not hold SQLite's write lock; chunk and vector rows then commit atomically.
+func (k *KnowledgeDB) IngestTextWithEmbedder(ctx context.Context, title, content, collection, sourcePath string, embedder Embedder) (string, error) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	chunks := splitIntoChunks(content, 1000)
+	embeddings := make([][]float32, len(chunks))
+	if embedder != nil {
+		for i, chunk := range chunks {
+			vector, err := embedder.Embed(ctx, chunk)
+			if err != nil {
+				return "", fmt.Errorf("embed chunk %d: %w", i, err)
+			}
+			embeddings[i] = vector
+		}
+	}
+	return k.ingestChunks(title, content, collection, sourcePath, chunks, embeddings, embedder)
+}
+
+func (k *KnowledgeDB) ingestChunks(title, content, collection, sourcePath string, chunks []string, embeddings [][]float32, embedder Embedder) (string, error) {
 	tx, err := k.db.Begin()
 	if err != nil {
 		return "", err
 	}
 	defer tx.Rollback()
+
+	// FTS5 rows do not have a foreign key to documents, so remove them before
+	// deleting existing documents. Chunk embeddings are removed by the chunks'
+	// ON DELETE CASCADE foreign keys.
+	if strings.TrimSpace(sourcePath) != "" {
+		if _, err := tx.Exec(`
+			DELETE FROM chunks_fts
+			WHERE document_id IN (SELECT id FROM documents WHERE source_path = ?)
+		`, sourcePath); err != nil {
+			return "", fmt.Errorf("remove old full-text entries: %w", err)
+		}
+		if _, err := tx.Exec(`DELETE FROM documents WHERE source_path = ?`, sourcePath); err != nil {
+			return "", fmt.Errorf("replace existing source document: %w", err)
+		}
+	}
+
+	docID := fmt.Sprintf("doc_%d", time.Now().UnixNano())
+	now := time.Now().Format(time.RFC3339)
 
 	_, err = tx.Exec(
 		`INSERT INTO documents (id, title, source_path, collection, content, metadata, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?)`,
@@ -211,7 +339,6 @@ func (k *KnowledgeDB) IngestText(title, content, collection, sourcePath string) 
 		return "", err
 	}
 
-	chunks := splitIntoChunks(content, 1000)
 	for i, chunkContent := range chunks {
 		chunkID := fmt.Sprintf("%s_chunk_%d", docID, i)
 		_, err = tx.Exec(
@@ -229,18 +356,33 @@ func (k *KnowledgeDB) IngestText(title, content, collection, sourcePath string) 
 		if err != nil {
 			return "", err
 		}
+		if embedder != nil {
+			if err := storeChunkEmbedding(tx, chunkID, embedder.Model(), embedder.ModelVersion(), embeddings[i]); err != nil {
+				return "", fmt.Errorf("store embedding for chunk %d: %w", i, err)
+			}
+		}
 	}
 
 	return docID, tx.Commit()
 }
 
 func (k *KnowledgeDB) IngestFile(filePath, collection string) (string, error) {
+	return k.IngestFileWithEmbedder(context.Background(), filePath, collection, nil)
+}
+
+// IngestFileWithEmbedder reads a file and stores chunk vectors when embedder is non-nil.
+func (k *KnowledgeDB) IngestFileWithEmbedder(ctx context.Context, filePath, collection string, embedder Embedder) (string, error) {
 	data, err := os.ReadFile(filePath)
 	if err != nil {
 		return "", err
 	}
+	sourcePath, err := filepath.Abs(filePath)
+	if err != nil {
+		return "", fmt.Errorf("resolve ingestion source path: %w", err)
+	}
+	sourcePath = filepath.Clean(sourcePath)
 	title := filepath.Base(filePath)
-	return k.IngestText(title, string(data), collection, filePath)
+	return k.IngestTextWithEmbedder(ctx, title, string(data), collection, sourcePath, embedder)
 }
 
 func (k *KnowledgeDB) Search(query string, collection string, limit int) ([]SearchResult, error) {
@@ -294,6 +436,152 @@ func (k *KnowledgeDB) Search(query string, collection string, limit int) ([]Sear
 		return k.searchLike(query, collection, limit)
 	}
 	return results, nil
+}
+
+// SearchWithEmbedder combines lexical and vector rankings with reciprocal rank
+// fusion. Vector candidates are restricted to the embedder's exact model
+// version so incompatible dimensions or revisions are never mixed.
+func (k *KnowledgeDB) SearchWithEmbedder(ctx context.Context, query, collection string, limit int, embedder Embedder) ([]SearchResult, error) {
+	if limit <= 0 {
+		limit = 5
+	}
+	if embedder == nil {
+		return k.Search(query, collection, limit)
+	}
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	queryVector, err := embedder.Embed(ctx, query)
+	if err != nil {
+		return nil, fmt.Errorf("embed knowledge search query: %w", err)
+	}
+	candidateLimit := limit * 4
+	if candidateLimit < 20 {
+		candidateLimit = 20
+	}
+	if candidateLimit > 200 {
+		candidateLimit = 200
+	}
+	lexical, err := k.Search(query, collection, candidateLimit)
+	if err != nil {
+		return nil, err
+	}
+	dense, err := k.searchVectors(queryVector, collection, embedder.Model(), embedder.ModelVersion(), candidateLimit)
+	if err != nil {
+		return nil, err
+	}
+	return reciprocalRankFusion(lexical, dense, limit), nil
+}
+
+func (k *KnowledgeDB) searchVectors(queryVector []float32, collection, model, modelVersion string, limit int) ([]SearchResult, error) {
+	if len(queryVector) == 0 {
+		return nil, fmt.Errorf("query embedding must not be empty")
+	}
+	queryNorm := vectorNorm(queryVector)
+	if queryNorm == 0 || math.IsNaN(queryNorm) || math.IsInf(queryNorm, 0) {
+		return nil, fmt.Errorf("query embedding has invalid norm")
+	}
+	query := `
+		SELECT c.id, d.id, d.title, d.collection, c.content, e.dimensions, e.vector
+		FROM chunk_embeddings e
+		JOIN chunks c ON c.id = e.chunk_id
+		JOIN documents d ON d.id = c.document_id
+		WHERE e.model = ? AND e.model_version = ?`
+	args := []any{model, modelVersion}
+	if collection != "" {
+		query += ` AND d.collection = ?`
+		args = append(args, collection)
+	}
+	rows, err := k.db.Query(query, args...)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	results := make([]SearchResult, 0)
+	for rows.Next() {
+		var result SearchResult
+		var dimensions int
+		var blob []byte
+		if err := rows.Scan(&result.ChunkID, &result.DocumentID, &result.Title, &result.Collection, &result.Content, &dimensions, &blob); err != nil {
+			return nil, err
+		}
+		if dimensions != len(queryVector) || len(blob) != dimensions*4 {
+			return nil, fmt.Errorf("invalid stored embedding for chunk %s: dimensions %d, bytes %d, query dimensions %d", result.ChunkID, dimensions, len(blob), len(queryVector))
+		}
+		var dot, storedNormSquared float64
+		for i, queryValue := range queryVector {
+			storedValue := math.Float32frombits(binary.LittleEndian.Uint32(blob[i*4:]))
+			dot += float64(queryValue) * float64(storedValue)
+			storedNormSquared += float64(storedValue) * float64(storedValue)
+		}
+		if storedNormSquared == 0 || math.IsNaN(storedNormSquared) || math.IsInf(storedNormSquared, 0) {
+			return nil, fmt.Errorf("stored embedding for chunk %s has invalid norm", result.ChunkID)
+		}
+		result.Score = dot / (queryNorm * math.Sqrt(storedNormSquared))
+		results = append(results, result)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	sort.Slice(results, func(i, j int) bool {
+		if results[i].Score == results[j].Score {
+			return results[i].ChunkID < results[j].ChunkID
+		}
+		return results[i].Score > results[j].Score
+	})
+	if len(results) > limit {
+		results = results[:limit]
+	}
+	return results, nil
+}
+
+func vectorNorm(vector []float32) float64 {
+	var normSquared float64
+	for _, value := range vector {
+		normSquared += float64(value) * float64(value)
+	}
+	return math.Sqrt(normSquared)
+}
+
+func reciprocalRankFusion(lexical, dense []SearchResult, limit int) []SearchResult {
+	const rankConstant = 60.0
+	type fusedResult struct {
+		result SearchResult
+		score  float64
+	}
+	fused := make(map[string]*fusedResult, len(lexical)+len(dense))
+	addRanked := func(results []SearchResult) {
+		for rank, result := range results {
+			entry, ok := fused[result.ChunkID]
+			if !ok {
+				entry = &fusedResult{result: result}
+				fused[result.ChunkID] = entry
+			}
+			entry.score += 1 / (rankConstant + float64(rank+1))
+		}
+	}
+	addRanked(lexical)
+	addRanked(dense)
+	results := make([]fusedResult, 0, len(fused))
+	for _, entry := range fused {
+		entry.result.Score = entry.score
+		results = append(results, *entry)
+	}
+	sort.Slice(results, func(i, j int) bool {
+		if results[i].score == results[j].score {
+			return results[i].result.ChunkID < results[j].result.ChunkID
+		}
+		return results[i].score > results[j].score
+	})
+	if len(results) > limit {
+		results = results[:limit]
+	}
+	merged := make([]SearchResult, len(results))
+	for i, result := range results {
+		merged[i] = result.result
+	}
+	return merged
 }
 
 func (k *KnowledgeDB) searchLike(query string, collection string, limit int) ([]SearchResult, error) {

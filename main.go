@@ -511,6 +511,11 @@ func runDirectIngest(ingestVal string, extraArgs []string, collection string) er
 	}
 	defer kdb.Close()
 
+	embedder, err := getKnowledgeEmbedder()
+	if err != nil {
+		return fmt.Errorf("initialize knowledge embedder: %w", err)
+	}
+
 	count := 0
 	var errors []string
 	for _, file := range allFiles {
@@ -519,7 +524,7 @@ func runDirectIngest(ingestVal string, extraArgs []string, collection string) er
 			errors = append(errors, fmt.Sprintf("%s: %v", filepath.Base(file), valErr))
 			continue
 		}
-		docID, ingestErr := kdb.IngestFile(absPath, collection)
+		docID, ingestErr := kdb.IngestFileWithEmbedder(context.Background(), absPath, collection, embedder)
 		if ingestErr != nil {
 			errors = append(errors, fmt.Sprintf("%s: %v", filepath.Base(file), ingestErr))
 		} else {

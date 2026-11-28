@@ -58,7 +58,11 @@ func dispatchToolCall(name string, rawArgs json.RawMessage) string {
 		if err != nil {
 			return fmt.Sprintf("System Error opening knowledge base: %v", err)
 		}
-		results, err := kdb.Search(args.Query, args.Collection, args.Limit)
+		embedder, err := getKnowledgeEmbedder()
+		if err != nil {
+			return fmt.Sprintf("Search Error initializing knowledge embedder: %v", err)
+		}
+		results, err := kdb.SearchWithEmbedder(context.Background(), args.Query, args.Collection, args.Limit, embedder)
 		if err != nil {
 			return fmt.Sprintf("Search Error: %v", err)
 		}
@@ -107,13 +111,17 @@ func dispatchToolCall(name string, rawArgs json.RawMessage) string {
 		count := 0
 		var errors []string
 		var lastDocID string
+		embedder, embedderErr := getKnowledgeEmbedder()
+		if embedderErr != nil {
+			return fmt.Sprintf("Ingest Error initializing knowledge embedder: %v", embedderErr)
+		}
 		for _, file := range matches {
 			absPath, valErr := validatePath(file)
 			if valErr != nil {
 				errors = append(errors, fmt.Sprintf("%s: %v", filepath.Base(file), valErr))
 				continue
 			}
-			docID, ingestErr := kdb.IngestFile(absPath, coll)
+			docID, ingestErr := kdb.IngestFileWithEmbedder(context.Background(), absPath, coll, embedder)
 			if ingestErr != nil {
 				errors = append(errors, fmt.Sprintf("%s: %v", filepath.Base(file), ingestErr))
 			} else {

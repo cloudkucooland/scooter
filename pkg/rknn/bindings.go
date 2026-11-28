@@ -119,6 +119,9 @@ var (
 	rknnCreateMem         func(ctx Context, size uint32) *TensorMem
 	rknnDestroyMem        func(ctx Context, mem *TensorMem) int32
 	rknnSetIOMem          func(ctx Context, mem *TensorMem, attr *TensorAttr) int32
+	rknnSetInputShapesSym uintptr
+	rknnSetInputShapesFn  func(ctx Context, nInputs uint32, attrs *TensorAttr) int32
+	rknnSetInputShapesMu  sync.Mutex
 )
 
 func getRKNNLibPath() string {
@@ -156,6 +159,30 @@ func LoadLibrary() error {
 		purego.RegisterLibFunc(&rknnCreateMem, lib, "rknn_create_mem")
 		purego.RegisterLibFunc(&rknnDestroyMem, lib, "rknn_destroy_mem")
 		purego.RegisterLibFunc(&rknnSetIOMem, lib, "rknn_set_io_mem")
+		// This symbol is only required by dynamic-shape models. Keep it optional
+		// so older RKNN runtimes can still load for non-dynamic models.
+		rknnSetInputShapesSym, _ = purego.Dlsym(lib, "rknn_set_input_shapes")
 	})
 	return libErr
+}
+
+func setInputShapes(ctx Context, attrs []TensorAttr) error {
+	if len(attrs) == 0 {
+		return fmt.Errorf("no input shapes provided")
+	}
+	rknnSetInputShapesMu.Lock()
+	defer rknnSetInputShapesMu.Unlock()
+	if rknnSetInputShapesSym == 0 {
+		return fmt.Errorf("RKNN runtime does not expose rknn_set_input_shapes")
+	}
+	if rknnSetInputShapesFn == nil {
+		purego.RegisterFunc(&rknnSetInputShapesFn, rknnSetInputShapesSym)
+	}
+	npu.Lock()
+	ret := rknnSetInputShapesFn(ctx, uint32(len(attrs)), &attrs[0])
+	npu.Unlock()
+	if ret != 0 {
+		return fmt.Errorf("rknn_set_input_shapes failed: %d", ret)
+	}
+	return nil
 }

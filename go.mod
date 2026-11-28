@@ -8,6 +8,7 @@ require (
 	github.com/charmbracelet/glamour v1.0.0
 	github.com/charmbracelet/lipgloss v1.1.1-0.20250404203927-76690c660834
 	github.com/ebitengine/purego v0.11.2
+	github.com/tggo/goSentencePiece v1.1.0
 	github.com/urfave/cli/v3 v3.14.0
 	google.golang.org/genai v1.77.0
 	modernc.org/sqlite v1.61.0

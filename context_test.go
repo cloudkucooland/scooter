@@ -12,7 +12,7 @@ func TestPlanCompressionRetainsNewestConversationSuffix(t *testing.T) {
 
 	history := []Message{{Role: "system", Content: "project instructions"}}
 	for i := 0; i < 12; i++ {
-		history = append(history, Message{Role: "user", Content: strings.Repeat("older context ", 250)})
+		history = append(history, Message{Role: "user", Content: strings.Repeat("older context ", 600)})
 	}
 	history = append(history, Message{Role: "user", Content: "latest request"})
 

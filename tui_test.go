@@ -2,6 +2,8 @@ package main
 
 import (
 	"encoding/json"
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 
@@ -257,12 +259,34 @@ func TestParseImagineNegativePromptAndPromptOrdering(t *testing.T) {
 	if prompt != "a red scooter" || negative != "none" {
 		t.Fatalf("got prompt=%q negative=%q", prompt, negative)
 	}
+
+	prompt, _, _, _, _, negative, err = parseImagineCommandArgs(`-n "no logos, no text" a blue scooter`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if prompt != "a blue scooter" || negative != "no logos, no text" {
+		t.Fatalf("short alias got prompt=%q negative=%q", prompt, negative)
+	}
 }
 
-func TestParseImagineRejectsUnterminatedNegativePrompt(t *testing.T) {
-	_, _, _, _, _, _, err := parseImagineCommandArgs(`a red scooter --negative "no text`)
-	if err == nil {
-		t.Fatal("expected unterminated quote error")
+func TestParseImagineRejectsInvalidOptions(t *testing.T) {
+	tests := []struct {
+		name string
+		args string
+	}{
+		{name: "unterminated negative quote", args: `a red scooter --negative "no text`},
+		{name: "missing negative value", args: `a red scooter --negative`},
+		{name: "missing output value", args: `a red scooter --out`},
+		{name: "invalid steps", args: `a red scooter --steps many`},
+		{name: "invalid seed", args: `a red scooter --seed many`},
+		{name: "invalid guidance", args: `a red scooter --guidance many`},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if _, _, _, _, _, _, err := parseImagineCommandArgs(tt.args); err == nil {
+				t.Fatalf("expected error parsing %q", tt.args)
+			}
+		})
 	}
 }
 
@@ -286,27 +310,40 @@ func TestRKNNCommandsInAvailableCommands(t *testing.T) {
 }
 
 func TestRKNNModelSwitchCommand(t *testing.T) {
+	modelDir := t.TempDir()
+	modelPath := filepath.Join(modelDir, "test-custom-rknn")
+	if err := os.MkdirAll(filepath.Join(modelPath, "unet"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(modelPath, "unet", "model.rknn"), []byte("test"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("SCOOTER_RKNN_MODELS_DIR", modelDir)
+	t.Setenv("RKNN_MODELS_DIR", "")
+	t.Setenv("RKNN_MODEL_DIR", "")
+	t.Setenv("SCOOTER_RKNN_MODEL", "")
+	t.Setenv("RKNN_MODEL", "")
 	m := model{
 		textarea:      textarea.New(),
 		viewport:      viewport.New(80, 24),
 		currentBuffer: &strings.Builder{},
 	}
 
-	cmd := m.handleCommand("/rknnmodel test-custom-rknn")
+	cmd := m.handleCommand("/rknnmodel " + modelPath)
 	if cmd != nil {
 		t.Errorf("expected nil cmd for switching model, got %v", cmd)
 	}
-	if m.rknnModel != "test-custom-rknn" {
-		t.Errorf("expected m.rknnModel 'test-custom-rknn', got %q", m.rknnModel)
+	if m.rknnModel != modelPath {
+		t.Errorf("expected m.rknnModel %q, got %q", modelPath, m.rknnModel)
 	}
-	if getActiveRKNNModel() != "test-custom-rknn" {
-		t.Errorf("expected getActiveRKNNModel() 'test-custom-rknn', got %q", getActiveRKNNModel())
+	if getActiveRKNNModel() != m.rknnModel {
+		t.Errorf("expected active RKNN model %q, got %q", m.rknnModel, getActiveRKNNModel())
 	}
 	if len(m.chatHistory) == 0 {
 		t.Fatalf("expected system message in chatHistory after switching model")
 	}
 	lastMsg := m.chatHistory[len(m.chatHistory)-1]
-	if !strings.Contains(lastMsg.Content, "Switched RKNN model to test-custom-rknn") {
+	if !strings.Contains(lastMsg.Content, "Switched RKNN model to "+modelPath) {
 		t.Errorf("unexpected system message content: %q", lastMsg.Content)
 	}
 
@@ -350,18 +387,28 @@ func TestVisionModelCommandsInAvailableCommands(t *testing.T) {
 }
 
 func TestVisionModelSwitchCommand(t *testing.T) {
+	modelDir := t.TempDir()
+	modelPath := filepath.Join(modelDir, "test-vision-model.rknn")
+	if err := os.WriteFile(modelPath, []byte("test"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("SCOOTER_RKNN_VISION_MODEL", "")
+	t.Setenv("RKNN_VISION_MODEL", "")
+	t.Setenv("SCOOTER_RKNN_MODELS_DIR", modelDir)
+	t.Setenv("RKNN_MODELS_DIR", "")
+	t.Setenv("RKNN_MODEL_DIR", "")
 	m := model{
 		textarea:      textarea.New(),
 		viewport:      viewport.New(80, 24),
 		currentBuffer: &strings.Builder{},
 	}
 
-	cmd := m.handleCommand("/visionmodel test-vision-model.rknn")
+	cmd := m.handleCommand("/visionmodel " + modelPath)
 	if cmd != nil {
 		t.Errorf("expected nil cmd for switching vision model, got %v", cmd)
 	}
-	if !strings.Contains(m.visionModel, "test-vision-model") {
-		t.Errorf("expected m.visionModel to contain 'test-vision-model', got %q", m.visionModel)
+	if m.visionModel != modelPath {
+		t.Errorf("expected m.visionModel %q, got %q", modelPath, m.visionModel)
 	}
 	if len(m.chatHistory) == 0 {
 		t.Fatalf("expected system message in chatHistory after switching vision model")
