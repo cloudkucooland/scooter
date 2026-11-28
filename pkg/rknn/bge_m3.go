@@ -27,14 +27,18 @@ const (
 // BGEEmbedder runs Firefly's BGE-M3 RKNN2 model directly on the RK3588 NPU.
 // It keeps one model context and tokenizer open for repeated chunk/query calls.
 type BGEEmbedder struct {
-	mu         sync.Mutex
-	ctx        RKNNContext
-	tokenizer  *sp.Tokenizer
-	inputAttrs []TensorAttr
-	inputIDs   map[string]uint32
-	outputID   int
-	modelPath  string
-	closed     bool
+	mu          sync.Mutex
+	ctx         RKNNContext
+	tokenizer   *sp.Tokenizer
+	inputAttrs  []TensorAttr
+	inputIDs    map[string]uint32
+	inputValues map[string][]int64
+	shapes      []TensorAttr
+	inputs      []Input
+	outputIDs   []int
+	outputID    int
+	modelPath   string
+	closed      bool
 }
 
 // NewBGEEmbedder loads Firefly's bge-m3_dynamic.rknn and tokenizer.json from
@@ -75,6 +79,10 @@ func NewBGEEmbedder(modelDir string) (*BGEEmbedder, error) {
 	embedder := &BGEEmbedder{
 		tokenizer: tokenizer,
 		inputIDs:  make(map[string]uint32, 3),
+		inputValues: map[string][]int64{
+			"input_ids": {}, "attention_mask": {}, "position_ids": {},
+		},
+		outputIDs: []int{-1},
 		outputID:  -1,
 		modelPath: modelPath,
 	}
@@ -125,6 +133,9 @@ func (e *BGEEmbedder) ModelVersion() string { return BGEModelVersion }
 
 // Embed encodes text into a normalized 1024-dimensional BGE-M3 vector.
 func (e *BGEEmbedder) Embed(ctx context.Context, text string) ([]float32, error) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
 	if strings.TrimSpace(text) == "" {
 		return nil, fmt.Errorf("text to embed must not be empty")
 	}
@@ -143,19 +154,6 @@ func (e *BGEEmbedder) Embed(ctx context.Context, text string) ([]float32, error)
 	ids = e.tokenizer.AddSpecialTokens(ids)
 	sequenceLength := bgeSequenceLength(len(ids))
 
-	inputIDs := make([]int64, sequenceLength)
-	attentionMask := make([]int64, sequenceLength)
-	positionIDs := make([]int64, sequenceLength)
-	for i := range inputIDs {
-		inputIDs[i] = bgeModelPadTokenID
-		positionIDs[i] = bgeModelPadTokenID
-	}
-	for i, id := range ids {
-		inputIDs[i] = int64(id)
-		attentionMask[i] = 1
-		positionIDs[i] = int64(i) + bgeModelPadTokenID + 1
-	}
-
 	e.mu.Lock()
 	defer e.mu.Unlock()
 	if e.closed {
@@ -164,7 +162,23 @@ func (e *BGEEmbedder) Embed(ctx context.Context, text string) ([]float32, error)
 	if err := ctx.Err(); err != nil {
 		return nil, err
 	}
-	shapes := append([]TensorAttr(nil), e.inputAttrs...)
+	for name, values := range e.inputValues {
+		values = values[:sequenceLength]
+		for i := range values {
+			values[i] = bgeModelPadTokenID
+		}
+		e.inputValues[name] = values
+	}
+	inputIDs := e.inputValues["input_ids"]
+	attentionMask := e.inputValues["attention_mask"]
+	positionIDs := e.inputValues["position_ids"]
+	for i, id := range ids {
+		inputIDs[i] = int64(id)
+		attentionMask[i] = 1
+		positionIDs[i] = int64(i) + bgeModelPadTokenID + 1
+	}
+	e.shapes = append(e.shapes[:0], e.inputAttrs...)
+	shapes := e.shapes
 	for i := range shapes {
 		shapes[i].NDims = 2
 		shapes[i].Dims[0] = 1
@@ -176,19 +190,14 @@ func (e *BGEEmbedder) Embed(ctx context.Context, text string) ([]float32, error)
 		return nil, fmt.Errorf("set BGE-M3 sequence length %d: %w", sequenceLength, err)
 	}
 
-	valuesByName := map[string][]int64{
-		"input_ids":      inputIDs,
-		"attention_mask": attentionMask,
-		"position_ids":   positionIDs,
-	}
-	inputs := make([]Input, 0, len(shapes))
+	e.inputs = e.inputs[:0]
 	for _, attr := range shapes {
 		name := tensorAttrName(attr)
-		values, ok := valuesByName[name]
+		values, ok := e.inputValues[name]
 		if !ok {
 			return nil, fmt.Errorf("unsupported BGE-M3 input tensor %q", name)
 		}
-		inputs = append(inputs, Input{
+		e.inputs = append(e.inputs, Input{
 			Index: attr.Index,
 			Buf:   unsafe.Pointer(&values[0]),
 			Size:  uint32(len(values) * 8),
@@ -196,7 +205,8 @@ func (e *BGEEmbedder) Embed(ctx context.Context, text string) ([]float32, error)
 			Fmt:   attr.Fmt,
 		})
 	}
-	outputs, err := e.ctx.RunFloat32Indices(inputs, []int{e.outputID})
+	e.outputIDs[0] = e.outputID
+	outputs, err := e.ctx.RunFloat32Indices(e.inputs, e.outputIDs)
 	runtime.KeepAlive(inputIDs)
 	runtime.KeepAlive(attentionMask)
 	runtime.KeepAlive(positionIDs)

@@ -326,6 +326,18 @@ func (k *KnowledgeDB) ingestChunks(title, content, collection, sourcePath string
 		if _, err := tx.Exec(`DELETE FROM documents WHERE source_path = ?`, sourcePath); err != nil {
 			return "", fmt.Errorf("replace existing source document: %w", err)
 		}
+	} else {
+		// Text-only ingestion has no stable path. Treat title within a collection
+		// as its identity so re-ingestion also removes stale chunks and vectors.
+		if _, err := tx.Exec(`
+			DELETE FROM chunks_fts
+			WHERE document_id IN (SELECT id FROM documents WHERE source_path = '' AND collection = ? AND title = ?)
+		`, collection, title); err != nil {
+			return "", fmt.Errorf("remove old full-text entries: %w", err)
+		}
+		if _, err := tx.Exec(`DELETE FROM documents WHERE source_path = '' AND collection = ? AND title = ?`, collection, title); err != nil {
+			return "", fmt.Errorf("replace existing text document: %w", err)
+		}
 	}
 
 	docID := fmt.Sprintf("doc_%d", time.Now().UnixNano())
@@ -392,6 +404,7 @@ func (k *KnowledgeDB) Search(query string, collection string, limit int) ([]Sear
 
 	var rows *sql.Rows
 	var err error
+	ftsQuery := quoteFTSQuery(query)
 	if collection != "" {
 		rows, err = k.db.Query(`
 			SELECT c.id, d.id, d.title, d.collection, c.content, f.rank
@@ -401,7 +414,7 @@ func (k *KnowledgeDB) Search(query string, collection string, limit int) ([]Sear
 			WHERE chunks_fts MATCH ? AND d.collection = ?
 			ORDER BY f.rank
 			LIMIT ?
-		`, query, collection, limit)
+		`, ftsQuery, collection, limit)
 	} else {
 		rows, err = k.db.Query(`
 			SELECT c.id, d.id, d.title, d.collection, c.content, f.rank
@@ -411,12 +424,9 @@ func (k *KnowledgeDB) Search(query string, collection string, limit int) ([]Sear
 			WHERE chunks_fts MATCH ?
 			ORDER BY f.rank
 			LIMIT ?
-		`, query, limit)
+		`, ftsQuery, limit)
 	}
 	if err != nil {
-		if !strings.Contains(strings.ToLower(err.Error()), "fts5:") {
-			return nil, err
-		}
 		return k.searchLike(query, collection, limit)
 	}
 	defer rows.Close()
@@ -436,6 +446,12 @@ func (k *KnowledgeDB) Search(query string, collection string, limit int) ([]Sear
 		return k.searchLike(query, collection, limit)
 	}
 	return results, nil
+}
+
+// quoteFTSQuery turns user text into a literal phrase, avoiding FTS5 operator
+// and punctuation parsing errors while retaining ordinary lexical matching.
+func quoteFTSQuery(query string) string {
+	return `"` + strings.ReplaceAll(strings.TrimSpace(query), `"`, `""`) + `"`
 }
 
 // SearchWithEmbedder combines lexical and vector rankings with reciprocal rank

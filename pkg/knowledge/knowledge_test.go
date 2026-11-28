@@ -42,6 +42,68 @@ func TestKnowledgeIngestAndSearch(t *testing.T) {
 	}
 }
 
+func TestIngestTextWithoutSourceReplacesSameTitleInCollection(t *testing.T) {
+	tmpDir, err := os.MkdirTemp("", "scooter_knowledge_replace")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer os.RemoveAll(tmpDir)
+	t.Setenv("SCOOTER_DB_PATH", filepath.Join(tmpDir, "knowledge.sqlite"))
+	kdb, err := Open()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer kdb.Close()
+
+	first, err := kdb.IngestText("Notes", "oldword", "notes", "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	second, err := kdb.IngestText("Notes", "newword", "notes", "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if first == second {
+		t.Fatal("expected replacement to create a new document ID")
+	}
+	var count int
+	if err := kdb.db.QueryRow(`SELECT COUNT(*) FROM documents WHERE collection = 'notes' AND title = 'Notes'`).Scan(&count); err != nil {
+		t.Fatal(err)
+	}
+	if count != 1 {
+		t.Fatalf("document count = %d, want 1", count)
+	}
+	oldResults, err := kdb.Search("oldword", "notes", 5)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(oldResults) != 0 {
+		t.Fatalf("stale chunks remain searchable: %+v", oldResults)
+	}
+}
+
+func TestSearchQuotesFTSOperatorsAndFallsBack(t *testing.T) {
+	tmpDir, err := os.MkdirTemp("", "scooter_knowledge_fts")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer os.RemoveAll(tmpDir)
+	t.Setenv("SCOOTER_DB_PATH", filepath.Join(tmpDir, "knowledge.sqlite"))
+	kdb, err := Open()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer kdb.Close()
+	if _, err := kdb.IngestText("Operators", "alpha-beta AND gamma:delta", "notes", "operators.md"); err != nil {
+		t.Fatal(err)
+	}
+	for _, query := range []string{"alpha-beta", "alpha AND beta", "gamma:delta", `"unclosed`, "alpha*"} {
+		if _, err := kdb.Search(query, "notes", 5); err != nil {
+			t.Errorf("Search(%q) error = %v", query, err)
+		}
+	}
+}
+
 func TestSplitIntoChunksUTF8(t *testing.T) {
 	text := "你好世界 🌍\n\n测试多字节字符的中文分块是否正确无误。"
 	chunks := splitIntoChunks(text, 10)

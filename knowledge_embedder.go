@@ -1,6 +1,7 @@
 package main
 
 import (
+	"log"
 	"os"
 	"path/filepath"
 	"strings"
@@ -30,6 +31,7 @@ func getKnowledgeEmbedder() (knowledge.Embedder, error) {
 			}
 			modelDir = filepath.Join(home, "3588-stuff", "rknn-models", "bge-m3-rknn2-rk3588")
 			if _, err := os.Stat(filepath.Join(modelDir, "bge-m3_dynamic.rknn")); err != nil {
+				log.Printf("BGE-M3 model not found at %s; using lexical-only knowledge search", modelDir)
 				return
 			}
 		}
