@@ -27,18 +27,20 @@ const (
 // BGEEmbedder runs Firefly's BGE-M3 RKNN2 model directly on the RK3588 NPU.
 // It keeps one model context and tokenizer open for repeated chunk/query calls.
 type BGEEmbedder struct {
-	mu          sync.Mutex
-	ctx         RKNNContext
-	tokenizer   *sp.Tokenizer
-	inputAttrs  []TensorAttr
-	inputIDs    map[string]uint32
-	inputValues map[string][]int64
-	shapes      []TensorAttr
-	inputs      []Input
-	outputIDs   []int
-	outputID    int
-	modelPath   string
-	closed      bool
+	mu                    sync.Mutex
+	ctx                   RKNNContext
+	tokenizer             *sp.Tokenizer
+	inputAttrs            []TensorAttr
+	inputIDs              map[string]uint32
+	inputKeys             []string
+	inputValues           map[string][]int64
+	shapes                []TensorAttr
+	inputs                []Input
+	outputIDs             []int
+	outputID              int
+	outputTokenEmbeddings bool
+	modelPath             string
+	closed                bool
 }
 
 // NewBGEEmbedder loads Firefly's bge-m3_dynamic.rknn and tokenizer.json from
@@ -77,14 +79,12 @@ func NewBGEEmbedder(modelDir string) (*BGEEmbedder, error) {
 		return nil, err
 	}
 	embedder := &BGEEmbedder{
-		tokenizer: tokenizer,
-		inputIDs:  make(map[string]uint32, 3),
-		inputValues: map[string][]int64{
-			"input_ids": {}, "attention_mask": {}, "position_ids": {},
-		},
-		outputIDs: []int{-1},
-		outputID:  -1,
-		modelPath: modelPath,
+		tokenizer:   tokenizer,
+		inputIDs:    make(map[string]uint32, 3),
+		inputValues: make(map[string][]int64, 3),
+		outputIDs:   []int{-1},
+		outputID:    -1,
+		modelPath:   modelPath,
 	}
 	if err := embedder.ctx.Init(modelPath); err != nil {
 		return nil, fmt.Errorf("initialize BGE-M3 RKNN model: %w", err)
@@ -96,33 +96,80 @@ func NewBGEEmbedder(modelDir string) (*BGEEmbedder, error) {
 	}
 	for _, attr := range inputs {
 		name := tensorAttrName(attr)
-		switch name {
-		case "input_ids", "attention_mask", "position_ids":
-			embedder.inputIDs[name] = attr.Index
-			if attr.Type != RKNN_TENSOR_INT64 {
-				_ = embedder.ctx.Close()
-				return nil, fmt.Errorf("BGE-M3 input %q has tensor type %d; expected int64", name, attr.Type)
-			}
-		}
-	}
-	for _, name := range []string{"input_ids", "attention_mask", "position_ids"} {
-		if _, ok := embedder.inputIDs[name]; !ok {
+		key := canonicalBGEInputName(name)
+		if key == "" {
 			_ = embedder.ctx.Close()
-			return nil, fmt.Errorf("BGE-M3 model is missing input tensor %q", name)
+			return nil, fmt.Errorf("unsupported BGE-M3 input tensor %q", name)
+		}
+		embedder.inputIDs[key] = attr.Index
+		embedder.inputKeys = append(embedder.inputKeys, key)
+		embedder.inputValues[key] = nil
+		if attr.Type != RKNN_TENSOR_INT64 {
+			_ = embedder.ctx.Close()
+			return nil, fmt.Errorf("BGE-M3 input %q has tensor type %d; expected int64", name, attr.Type)
 		}
 	}
-	for _, attr := range outputs {
-		if tensorAttrName(attr) == "sentence_embedding" {
-			embedder.outputID = int(attr.Index)
+	if _, ok := embedder.inputIDs["input_ids"]; !ok {
+		names := make([]string, 0, len(inputs))
+		for _, attr := range inputs {
+			names = append(names, tensorAttrName(attr))
+		}
+		_ = embedder.ctx.Close()
+		return nil, fmt.Errorf("BGE-M3 model is missing input_ids tensor (found %s)", strings.Join(names, ", "))
+	}
+	for i, attr := range outputs {
+		name := strings.ToLower(strings.TrimSpace(tensorAttrName(attr)))
+		if strings.Contains(name, "sentence_embedding") || strings.Contains(name, "sentence-embedding") {
+			// Output indices passed to rknn_outputs_get are positions in the
+			// model's output array. Some runtime/model combinations populate
+			// TensorAttr.Index inconsistently, so use the queried position.
+			embedder.outputID = i
 			break
 		}
 	}
 	if embedder.outputID < 0 {
+		for i, attr := range outputs {
+			if strings.Contains(strings.ToLower(tensorAttrName(attr)), "token_embeddings") && tensorElementCount(attr) >= BGEEmbeddingSize {
+				embedder.outputID = i
+				embedder.outputTokenEmbeddings = true
+				break
+			}
+		}
+	}
+	if embedder.outputID < 0 {
+		// Some RKNN exporters rename graph outputs. Identify the sentence
+		// embedding by its 1024 float32 values when the friendly name is lost.
+		for i, attr := range outputs {
+			if (attr.Type == RKNN_TENSOR_FLOAT32 || attr.Type == RKNN_TENSOR_FLOAT16) && tensorElementCount(attr) == BGEEmbeddingSize {
+				if embedder.outputID >= 0 {
+					embedder.outputID = -1 // Ambiguous; do not guess.
+					break
+				}
+				embedder.outputID = i
+			}
+		}
+	}
+	if embedder.outputID < 0 {
+		details := make([]string, 0, len(outputs))
+		for _, attr := range outputs {
+			details = append(details, fmt.Sprintf("%q(type=%d dims=%v size=%d)", tensorAttrName(attr), attr.Type, attr.Dims[:attr.NDims], attr.Size))
+		}
 		_ = embedder.ctx.Close()
-		return nil, fmt.Errorf("BGE-M3 model is missing sentence_embedding output")
+		return nil, fmt.Errorf("BGE-M3 sentence embedding output not found among model outputs: %s", strings.Join(details, ", "))
 	}
 	embedder.inputAttrs = inputs
 	return embedder, nil
+}
+
+func tensorElementCount(attr TensorAttr) int {
+	if attr.NDims == 0 || attr.NDims > uint32(len(attr.Dims)) {
+		return int(attr.NElems)
+	}
+	count := 1
+	for _, dim := range attr.Dims[:attr.NDims] {
+		count *= int(dim)
+	}
+	return count
 }
 
 // Model returns the stable model identifier used with stored vectors.
@@ -163,7 +210,11 @@ func (e *BGEEmbedder) Embed(ctx context.Context, text string) ([]float32, error)
 		return nil, err
 	}
 	for name, values := range e.inputValues {
-		values = values[:sequenceLength]
+		if cap(values) < sequenceLength {
+			values = make([]int64, sequenceLength)
+		} else {
+			values = values[:sequenceLength]
+		}
 		for i := range values {
 			values[i] = bgeModelPadTokenID
 		}
@@ -172,10 +223,17 @@ func (e *BGEEmbedder) Embed(ctx context.Context, text string) ([]float32, error)
 	inputIDs := e.inputValues["input_ids"]
 	attentionMask := e.inputValues["attention_mask"]
 	positionIDs := e.inputValues["position_ids"]
+	if len(inputIDs) < sequenceLength {
+		return nil, fmt.Errorf("BGE-M3 input_ids buffer has length %d; expected at least %d", len(inputIDs), sequenceLength)
+	}
 	for i, id := range ids {
 		inputIDs[i] = int64(id)
-		attentionMask[i] = 1
-		positionIDs[i] = int64(i) + bgeModelPadTokenID + 1
+		if len(attentionMask) != 0 {
+			attentionMask[i] = 1
+		}
+		if len(positionIDs) != 0 {
+			positionIDs[i] = int64(i) + bgeModelPadTokenID + 1
+		}
 	}
 	e.shapes = append(e.shapes[:0], e.inputAttrs...)
 	shapes := e.shapes
@@ -191,8 +249,8 @@ func (e *BGEEmbedder) Embed(ctx context.Context, text string) ([]float32, error)
 	}
 
 	e.inputs = e.inputs[:0]
-	for _, attr := range shapes {
-		name := tensorAttrName(attr)
+	for i, attr := range shapes {
+		name := e.inputKeys[i]
 		values, ok := e.inputValues[name]
 		if !ok {
 			return nil, fmt.Errorf("unsupported BGE-M3 input tensor %q", name)
@@ -213,14 +271,41 @@ func (e *BGEEmbedder) Embed(ctx context.Context, text string) ([]float32, error)
 	if err != nil {
 		return nil, fmt.Errorf("run BGE-M3 inference: %w", err)
 	}
-	if len(outputs) != 1 || len(outputs[0]) != BGEEmbeddingSize {
+	if len(outputs) != 1 {
+		return nil, fmt.Errorf("BGE-M3 returned %d output tensors; expected 1", len(outputs))
+	}
+	vector := outputs[0]
+	if e.outputTokenEmbeddings && len(vector) >= BGEEmbeddingSize && len(vector)%BGEEmbeddingSize == 0 {
+		// BGE-M3's dense sentence vector is the final hidden state at the
+		// leading CLS token. Some RKNN exports expose token_embeddings only.
+		vector = vector[:BGEEmbeddingSize]
+	}
+	if len(vector) != BGEEmbeddingSize {
 		got := 0
-		if len(outputs) > 0 {
-			got = len(outputs[0])
-		}
+		got = len(outputs[0])
 		return nil, fmt.Errorf("BGE-M3 returned %d embedding values; expected %d", got, BGEEmbeddingSize)
 	}
-	return normalizeEmbedding(outputs[0])
+	return normalizeEmbedding(vector)
+}
+
+func canonicalBGEInputName(name string) string {
+	name = strings.ToLower(strings.TrimSpace(name))
+	if i := strings.LastIndex(name, ":"); i >= 0 {
+		name = name[:i]
+	}
+	if i := strings.LastIndex(name, "/"); i >= 0 {
+		name = name[i+1:]
+	}
+	switch name {
+	case "input_ids", "input_id", "ids":
+		return "input_ids"
+	case "attention_mask", "attention_masks", "mask":
+		return "attention_mask"
+	case "position_ids", "positions":
+		return "position_ids"
+	default:
+		return ""
+	}
 }
 
 // Close releases the model context and its NPU memory.

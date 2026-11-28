@@ -114,8 +114,8 @@ var (
 	rknnQuery             func(ctx Context, cmd uint32, info unsafe.Pointer, size uint32) int32
 	rknnInputsSet         func(ctx Context, nInputs uint32, inputs *Input) int32
 	rknnRun               func(ctx Context, extend unsafe.Pointer) int32
-	rknnOutputsGetSym     uintptr
-	rknnOutputsReleaseSym uintptr
+	rknnOutputsGet        func(ctx Context, nOutputs uint32, outputs *Output, extend unsafe.Pointer) int32
+	rknnOutputsRelease    func(ctx Context, nOutputs uint32, outputs *Output) int32
 	rknnCreateMem         func(ctx Context, size uint32) *TensorMem
 	rknnDestroyMem        func(ctx Context, mem *TensorMem) int32
 	rknnSetIOMem          func(ctx Context, mem *TensorMem, attr *TensorAttr) int32
@@ -148,14 +148,8 @@ func LoadLibrary() error {
 		purego.RegisterLibFunc(&rknnQuery, lib, "rknn_query")
 		purego.RegisterLibFunc(&rknnInputsSet, lib, "rknn_inputs_set")
 		purego.RegisterLibFunc(&rknnRun, lib, "rknn_run")
-		rknnOutputsGetSym, libErr = purego.Dlsym(lib, "rknn_outputs_get")
-		if libErr != nil {
-			return
-		}
-		rknnOutputsReleaseSym, libErr = purego.Dlsym(lib, "rknn_outputs_release")
-		if libErr != nil {
-			return
-		}
+		purego.RegisterLibFunc(&rknnOutputsGet, lib, "rknn_outputs_get")
+		purego.RegisterLibFunc(&rknnOutputsRelease, lib, "rknn_outputs_release")
 		purego.RegisterLibFunc(&rknnCreateMem, lib, "rknn_create_mem")
 		purego.RegisterLibFunc(&rknnDestroyMem, lib, "rknn_destroy_mem")
 		purego.RegisterLibFunc(&rknnSetIOMem, lib, "rknn_set_io_mem")
@@ -164,6 +158,14 @@ func LoadLibrary() error {
 		rknnSetInputShapesSym, _ = purego.Dlsym(lib, "rknn_set_input_shapes")
 	})
 	return libErr
+}
+
+func callRKNNOutputsGet(handle Context, nOutputs uint32, out *Output) int32 {
+	return rknnOutputsGet(handle, nOutputs, out, nil)
+}
+
+func callRKNNOutputsRelease(handle Context, nOutputs uint32, out *Output) int32 {
+	return rknnOutputsRelease(handle, nOutputs, out)
 }
 
 func setInputShapes(ctx Context, attrs []TensorAttr) error {

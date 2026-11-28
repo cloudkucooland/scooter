@@ -60,18 +60,22 @@ func (c *RKNNContext) QueryIO() (inputs []TensorAttr, outputs []TensorAttr, err 
 
 	inputs = make([]TensorAttr, ioNum.NInput)
 	for i := uint32(0); i < ioNum.NInput; i++ {
-		inputs[i].Index = i
 		if ret := rknnQuery(c.handle, RKNN_QUERY_INPUT_ATTR, unsafe.Pointer(&inputs[i]), uint32(unsafe.Sizeof(inputs[i]))); ret != 0 {
 			return nil, nil, fmt.Errorf("rknn_query INPUT_ATTR[%d] failed: %d", i, ret)
 		}
+		// The output struct is populated by the runtime, so restore the
+		// positional index used by rknn_inputs_set after querying it.
+		inputs[i].Index = i
 	}
 
 	outputs = make([]TensorAttr, ioNum.NOutput)
 	for i := uint32(0); i < ioNum.NOutput; i++ {
-		outputs[i].Index = i
 		if ret := rknnQuery(c.handle, RKNN_QUERY_OUTPUT_ATTR, unsafe.Pointer(&outputs[i]), uint32(unsafe.Sizeof(outputs[i]))); ret != 0 {
 			return nil, nil, fmt.Errorf("rknn_query OUTPUT_ATTR[%d] failed: %d", i, ret)
 		}
+		// RKNN may overwrite Index with an invalid tensor id (for example
+		// 127); output APIs address outputs by their array position.
+		outputs[i].Index = i
 	}
 	return inputs, outputs, nil
 }
@@ -111,36 +115,38 @@ func (c *RKNNContext) RunFloat32Indices(inputs []Input, outputIndices []int) ([]
 		return nil, err
 	}
 
-	results := make([][]float32, len(outputIndices))
-	for i, idx := range outputIndices {
+	for _, idx := range outputIndices {
 		if idx < 0 || idx >= len(outputAttrs) {
 			return nil, fmt.Errorf("output index %d out of range (0-%d)", idx, len(outputAttrs)-1)
 		}
-		out := &Output{
-			WantFloat:  1,
-			IsPrealloc: 0,
-			Index:      uint32(idx),
-		}
+	}
+	if len(outputIndices) == 0 {
+		return [][]float32{}, nil
+	}
 
-		if ret := callRKNNOutputsGet(c.handle, 1, out); ret != 0 {
-			return nil, fmt.Errorf("rknn_outputs_get failed for index %d: %d", idx, ret)
-		}
+	// RKNN runtimes expect one rknn_output entry per model output. Sparse
+	// single-output requests can cause some versions to read beyond the array.
+	allOutputs := make([]Output, len(outputAttrs))
+	for i := range allOutputs {
+		allOutputs[i] = Output{WantFloat: 1, Index: uint32(i)}
+	}
+	if ret := rknnOutputsGet(c.handle, uint32(len(allOutputs)), &allOutputs[0], nil); ret != 0 {
+		return nil, fmt.Errorf("rknn_outputs_get failed for %d outputs: %d", len(allOutputs), ret)
+	}
+	defer rknnOutputsRelease(c.handle, uint32(len(allOutputs)), &allOutputs[0])
+
+	results := make([][]float32, len(outputIndices))
+	for i, idx := range outputIndices {
+		out := &allOutputs[idx]
 		if out.Buf == nil || out.Size == 0 {
-			callRKNNOutputsRelease(c.handle, 1, out)
 			return nil, fmt.Errorf("rknn_outputs_get returned empty buffer for index %d", idx)
 		}
 		if out.Size%4 != 0 {
-			callRKNNOutputsRelease(c.handle, 1, out)
 			return nil, fmt.Errorf("rknn_outputs_get returned %d bytes for index %d; float32 output size must be divisible by 4", out.Size, idx)
 		}
 		count := int(out.Size / 4)
 		src := unsafe.Slice((*float32)(out.Buf), count)
-		goSlice := make([]float32, count)
-		copy(goSlice, src)
-		if ret := callRKNNOutputsRelease(c.handle, 1, out); ret != 0 {
-			return nil, fmt.Errorf("rknn_outputs_release failed for index %d: %d", idx, ret)
-		}
-		results[i] = goSlice
+		results[i] = append([]float32(nil), src...)
 	}
 	return results, nil
 }
@@ -153,18 +159,18 @@ func (c *RKNNContext) queryIOUnlocked() (inputs []TensorAttr, outputs []TensorAt
 
 	inputs = make([]TensorAttr, ioNum.NInput)
 	for i := uint32(0); i < ioNum.NInput; i++ {
-		inputs[i].Index = i
 		if ret := rknnQuery(c.handle, RKNN_QUERY_INPUT_ATTR, unsafe.Pointer(&inputs[i]), uint32(unsafe.Sizeof(inputs[i]))); ret != 0 {
 			return nil, nil, fmt.Errorf("rknn_query INPUT_ATTR[%d] failed: %d", i, ret)
 		}
+		inputs[i].Index = i
 	}
 
 	outputs = make([]TensorAttr, ioNum.NOutput)
 	for i := uint32(0); i < ioNum.NOutput; i++ {
-		outputs[i].Index = i
 		if ret := rknnQuery(c.handle, RKNN_QUERY_OUTPUT_ATTR, unsafe.Pointer(&outputs[i]), uint32(unsafe.Sizeof(outputs[i]))); ret != 0 {
 			return nil, nil, fmt.Errorf("rknn_query OUTPUT_ATTR[%d] failed: %d", i, ret)
 		}
+		outputs[i].Index = i
 	}
 	return inputs, outputs, nil
 }
